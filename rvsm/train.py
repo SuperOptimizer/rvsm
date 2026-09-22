@@ -396,6 +396,41 @@ def _prepared(grid, dev, layout, cascade=None):
         yield x.to(memory_format=M.memfmt()), t, w, _rungs_of(b)[0]
 
 
+class _Phases:
+    """Per-phase milliseconds of a training step, for `RVSM_PROFILE=1` only: every mark synchronises the
+    device, which costs throughput, so it is off in production. `mark(name)` closes the phase that
+    started at the previous mark; `take()` returns the per-step means since the last take."""
+
+    def __init__(self, dev, on):
+        self.on = bool(on)
+        self.dev, self.acc, self.n, self.t = dev, {}, 0, None
+
+    def start(self):
+        if self.on:
+            if self.dev.type == "cuda":
+                torch.cuda.synchronize(self.dev)
+            self.t = time.perf_counter()
+
+    def mark(self, name):
+        if not self.on or self.t is None:
+            return
+        if self.dev.type == "cuda":
+            torch.cuda.synchronize(self.dev)
+        now = time.perf_counter()
+        self.acc[name] = self.acc.get(name, 0.0) + (now - self.t) * 1e3
+        self.t = now
+
+    def step(self):
+        self.n += 1
+
+    def take(self):
+        if not self.on or not self.n:
+            return {}
+        out = {"ms": {k: round(v / self.n, 1) for k, v in self.acc.items()}}
+        self.acc, self.n = {}, 0
+        return out
+
+
 def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=None, val_items=None,
           steps=None, accum=1, hook=None, ckpt=None):
     """Train the student. Returns the checkpoint path.
@@ -490,24 +525,30 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         if not grid:
             return
         evnet.load_state_dict(ema)
-        _log(str(out / "logs" / "eval.jsonl"),
-             {"step": step, **evaluate(evnet, grid, dev, layout, cascade=casval)})
+        te = time.time()
+        rec = {"step": step, **evaluate(evnet, grid, dev, layout, cascade=casval)}
+        t_ev = time.time() - te
         try:
             (out / "eval").mkdir(parents=True, exist_ok=True)
             val_png(out / "eval" / f"val_{step:06d}.png", evnet, grid, dev, layout, cascade=casval)
         except Exception as e:   # noqa: BLE001  -- a missing PIL must never stop a run
             print("[train] val_png:", repr(e), flush=True)
+        t_png = time.time() - te - t_ev
         if cfg.calibrate:
             from rvsm import calib
             temps = {str(k): v for k, v in
                      calib.run(evnet, _prepared(grid, dev, layout, cascade=casval),
                                layout=layout).get("temps", {}).items()}
+        rec["eval_s"] = {"evaluate": round(t_ev, 1), "val_png": round(t_png, 1),
+                         "calibrate": round(time.time() - te - t_ev - t_png, 1)}
+        _log(str(out / "logs" / "eval.jsonl"), rec)
 
     _log(str(out / "logs" / "train.jsonl"),
          {"step": step, "size": cfg.size, "patch": cfg.patch, "batch": cfg.batch, "aug": cfg.aug,
           "cin": layout.cin, "cout": layout.cout, "steps": nsteps, "ema": decay,
           "fingerprint": cfg.fingerprint()})
 
+    ph = _Phases(dev, os.environ.get("RVSM_PROFILE", "") not in ("", "0"))
     t0, micro, rung_n, wait_s = time.time(), 0, {}, 0.0
     src = patches_factory() if patches_factory is not None else iter(())
     loss = bce = dice = None
@@ -518,6 +559,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         if step >= nsteps:
             break
         wait_s += time.time() - tw
+        ph.start()
         b = _batch(item)
         ks = _rungs_of(b)
         for r in ks:
@@ -527,12 +569,14 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             a0, a1 = float(cfg.self_p_lo), float(cfg.self_p_hi)
             cas.self_p = a0 + (a1 - a0) * min(step / max(nsteps, 1), 1.0)
         ct, tg, wt = prep.prepare(b, dev, cascade=cas, layout=layout)
+        ph.mark("prepare+cascade")
         casch = ct[:, layout.i_cas:layout.i_cas + 1].detach().clone() if cas.on else None
         # the weights ride along as extra target channels, so the geometric augs transform them
         # identically to the fields they weigh
         ct, tgw = A.apply(ct, torch.cat([tg, wt], 1), acfg, nimg=layout.i_cas, rung=ks)
         tg, wt = tgw[:, :layout.cout_t], tgw[:, layout.cout_t:]
         ct = ct.to(memory_format=M.memfmt())
+        ph.mark("aug")
         nvox += int(np.prod(ct.shape[2:])) * ct.shape[0]
 
         with prep.autocast(dev):
@@ -542,6 +586,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         loss = bce + dice
         y0 = outs[0]
         reg_log = {}
+        ph.mark("forward+deep_losses")
 
         # ---- PHASE B: the signed midline distance, the thickness, the Eikonal regulariser
         d = y0[:, layout.i_mid:layout.i_mid + 1]
@@ -565,6 +610,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             loss = loss + v_
         reg_log = {k_: float(v_.detach()) for k_, v_ in r.items()}
 
+        ph.mark("sdist+eikonal+thick+pair")
         # ---- the topology pilot, at ONE rung, on interior sub-blocks only
         if cfg.loss_ect:
             sel = [i for i, k in enumerate(ks) if k == int(cfg.ect_rung)]
@@ -576,6 +622,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                 loss = loss + cfg.loss_ect * e
                 reg_log["ect"] = float(e.detach())
 
+        ph.mark("ect")
         # ---- PHASE A auxiliaries: every term is computed from tensors this step already holds
         aux_log = {}
         if aux_on:
@@ -589,7 +636,9 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                 loss = loss + ax["aux"].float()
             aux_log = {k: float(v.detach()) for k, v in ax.items()}
 
+        ph.mark("aux(excl,selfcons,skel,affinity)")
         (loss / max(int(accum), 1)).backward()
+        ph.mark("backward")
         micro += 1
         tw = time.time()
         if micro < int(accum):
@@ -600,6 +649,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         opt.zero_grad(set_to_none=True)
         sched.step()
         ema_update(ema, net, decay)
+        ph.mark("clip+adamw+ema")
+        ph.step()
         step += 1
 
         if step % 20 == 0:
@@ -610,7 +661,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                   "lr": sched.get_last_lr()[0], "vox_s": round(nvox / dt),
                   "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0,
                   "rung": {str(k): rung_n[k] for k in sorted(rung_n)},
-                  "train_wait_s": round(wait_s, 3)})
+                  "train_wait_s": round(wait_s, 3), **ph.take()})
             rung_n, wait_s, nvox, t0 = {}, 0.0, 0, time.time()
         if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:
             do_eval()

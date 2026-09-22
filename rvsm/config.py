@@ -151,7 +151,7 @@ RUNG_ITEM_KEYS = ("ct", "tgt", "w", "lo", "cyx", "sym", "rung", "norm", "cm", "c
 
 # Fields a resume is allowed to differ in: a longer run, a different eval cadence, different hardware.
 FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_seed", "ckpt_act", "compile",
-                       "vram_train_gb", "vram_produce_gb")
+                       "vram_train_gb", "vram_produce_gb", "pin_memory")
 
 
 @dataclass
@@ -172,6 +172,7 @@ class Config:
     tifxyz: str = ""                   # optional directory of human tifxyz meshes, for eval only
     teacher_ckpts: dict = field(default_factory=dict)  # {"recto": path, "m7": path} local teacher weights
     cache_gb: float = 64.0             # CT shard cache budget on disk/RAM
+    pin_memory: bool = True            # the trainer's loader pins its batches (a suspect on virtualised GPUs)
     vram_train_gb: float = 46.0        # the resident budget table (GB on an 80 GB card): the trainer ...
     vram_produce_gb: float = 30.0      # ... and the producer; each becomes a per-process memory fraction
     ct_seed: str = ""                  # a local, possibly partial mirror of a URL `ct`: shards it has are

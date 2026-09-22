@@ -504,11 +504,11 @@ class DiskGrid:
                 yield cur
 
 
-def loader(patches, workers=0, batch=1):
+def loader(patches, workers=0, batch=1, pin_memory=True):
     """Workers start as fresh processes (forkserver), never forks: the parent has usually opened zarr
     already, and its asyncio loop thread does not survive a fork -- which breaks streamed reads in a way
     that only shows up minutes later."""
     return torch.utils.data.DataLoader(patches, batch_size=batch, num_workers=int(workers),
-                                       pin_memory=True, persistent_workers=workers > 0,
+                                       pin_memory=bool(pin_memory), persistent_workers=workers > 0,
                                        prefetch_factor=2 if workers else None,
                                        multiprocessing_context="forkserver" if workers else None)

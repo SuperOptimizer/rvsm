@@ -1289,7 +1289,7 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                             heldout=ctx["heldout"], meta=ctx["meta5"],
                             region_records=walk_records(ctx["records"], ctx["heldout"]),
                             lookahead_n=lookahead(cfg, out, k_active))
-        return sample.loader(ds, workers=cfg.workers, batch=cfg.batch)
+        return sample.loader(ds, workers=cfg.workers, batch=cfg.batch, pin_memory=cfg.pin_memory)
 
     ck = ckpt
     try:
