@@ -176,3 +176,9 @@ def small_cfg(tmp_path, ct_origin, umbilicus):
                   size="1m", patch=32, batch=1, region=64, ctx=(1, 2, 3), rungs=(2, 3),
                   aff_offsets=(4, 8), ect_block=8, steps=20, workers=0, compile=False,
                   heldout=1, windows_per_region=4, eval_every=10)
+
+
+# --- teachers (commit 2) -------------------------------------------------------------------------
+# The tiny `fake` teacher lives in tests/teachers_fixture.py; imported here so `fake_teacher` is a
+# fixture of the whole suite. Keep this block at the END of the file: other commits append their own.
+from tests.teachers_fixture import fake_teacher  # noqa: E402,F401
