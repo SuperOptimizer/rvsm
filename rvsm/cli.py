@@ -23,8 +23,20 @@ COMMANDS = ("run", "produce", "train", "eval", "export", "calibrate", "pretrain"
             "status", "stop", "ledger", "umbilicus", "teachers")
 
 
+def _stack_dumps():
+    """`kill -USR1 <pid>` prints every thread's Python stack to stderr (the run log). Some hosts (the
+    Thunder containers) forbid ptrace, so py-spy cannot attach; this is the one way to see a stall."""
+    try:
+        import faulthandler
+        import signal
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except (AttributeError, ValueError, RuntimeError, OSError):
+        pass
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    _stack_dumps()
     if argv and argv[0] in COMMANDS:
         # A subcommand is implemented as a module-level function of the same name, appended below as the
         # commit that owns it lands; the rest still print the usage and say so.

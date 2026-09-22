@@ -895,6 +895,8 @@ def _produce_entry(cfg_json, out, gpu, frac, backend):
     is why this module imports torch nowhere at the top level."""
     if gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(int(gpu))
+    from rvsm import cli
+    cli._stack_dumps()          # `kill -USR1` dumps the producer's threads too
     cfg = CFG.Config(**{k: CFG._coerce(k, v) for k, v in cfg_json.items() if k in CFG._TYPES})
     try:
         return produce_loop(cfg, out, role_gpu=None, device=("cuda:0" if gpu is not None else None),
