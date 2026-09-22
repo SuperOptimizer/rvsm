@@ -182,3 +182,59 @@ def small_cfg(tmp_path, ct_origin, umbilicus):
 # The tiny `fake` teacher lives in tests/teachers_fixture.py; imported here so `fake_teacher` is a
 # fixture of the whole suite. Keep this block at the END of the file: other commits append their own.
 from tests.teachers_fixture import fake_teacher  # noqa: E402,F401
+
+
+# ===================================================================================================
+# commit 3 (stream / regions / sample / prep / model) fixtures -- appended; keep additions at the end.
+# ===================================================================================================
+
+@pytest.fixture
+def region_cfg(small_cfg):
+    """`small_cfg` with a 128^3 region.
+
+    A store is a volcomp array and volcomp encodes 128^3 blocks only, so `stores.out_array` refuses a
+    shape that is not a multiple of 128: 128 is the smallest region a real store can have. Everything
+    else stays tiny (patch 32, rungs 2-3, ctx 1-3), so the fixture CT's 256^3 holds 2x2x2 regions."""
+    from dataclasses import replace
+    return replace(small_cfg, region=128)
+
+
+@pytest.fixture
+def synth_run(region_cfg, ct_origin, umbilicus, has_volcomp):
+    """A run directory with SYNTHETIC rung-2 region stores, written from the fixture CT itself.
+
+    One store per rung-2 region per channel: `recto` = the bright slab as a probability, `verso` = the
+    slab shifted by one voxel in y (so the two channels are not the same array), `rw` = full agreement,
+    `midline` / `thickness` = a non-zero code everywhere the slab is (code 0 is the no-data marker the
+    sampler turns into weight 0). Yields a namespace with `.cfg`, `.root`, `.ax`, `.pyr`, `.regions`
+    (the rung-2 records) and `.lo` (their origins)."""
+    import types
+
+    import numpy as np
+
+    from rvsm import axis as AX, ladder, regions as RG, stores
+    if not has_volcomp:
+        pytest.skip("a region store is a volcomp array; no libvolcomp on this host")
+    cfg = region_cfg
+    root = cfg.out
+    os.makedirs(root, exist_ok=True)
+    ax = AX.load(cfg.umbilicus, ct=cfg.ct)
+    pyr = ladder.rungs(cfg.ct)
+    recs = RG.region_list(pyr, rungs=cfg.rungs, patch=cfg.patch, region=cfg.region,
+                          boost=cfg.rung_boost, occ_min_fine=cfg.occ_min_fine,
+                          occ_min_coarse=cfg.occ_min_coarse)
+    two = [r for r in recs if r["k"] == 2]
+    los = []
+    for r in two:
+        lo, sz = np.array(r["lo"], np.int64), np.array(r["size"], np.int64)
+        ct = ladder.read_rung(pyr, 2, lo, sz, dtype=np.uint8)
+        recto = (ct > 0).astype(np.uint8) * np.uint8(255)
+        verso = np.roll(recto, 1, axis=1)
+        code = np.where(recto > 0, np.uint8(128), np.uint8(0))  # 0 = no data, as targets.encode_signed
+        for chan, blk, q in (("recto", recto, 8), ("verso", verso, 8), ("rw", recto * 0 + 255, 8),
+                             ("midline", code, 0), ("thickness", code, 0)):
+            stores.write(stores.store_path(root, chan, lo), blk, lo, rung=2, channels=(chan,), q=q,
+                         volume=cfg.ct, umbilicus=cfg.umbilicus)
+        los.append(tuple(int(v) for v in lo))
+    yield types.SimpleNamespace(cfg=cfg, root=root, ax=ax, pyr=pyr, regions=recs, two=two, lo=los)
+    RG.clear_pool()
