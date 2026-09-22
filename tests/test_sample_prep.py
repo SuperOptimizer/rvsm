@@ -299,3 +299,30 @@ def test_the_cascade_self_pass_takes_a_module_without_len(small_cfg):
     c = prep.Cascade("self", self_p=1.0, drop=0.0, noise=False, net=net, fwd=f, seed=1)
     out = c.channel(b, x, b["norm"], torch.float32)
     assert out.shape == (1, 1, 8, 8, 8) and f.calls == 1
+
+
+def test_the_visit_super_cube_is_ladder_context_bit_for_bit(synth_run):
+    """`Patches._ctx_cube` slices a visit's context cubes from one super-cube per rung; every window a
+    visit can draw must get exactly `ladder.context`'s cubes (and the tenth cube `cx`)."""
+    ds = _patches(synth_run, seed=3)
+    ds._open()
+    ds.SUPER_MAX = 1 << 40                      # cache every rung, including the ones prod would read
+    rng = np.random.default_rng(0)
+    p = ds.patch
+    for rec in [v for v in ds.visits if int(v["k"]) in (2, 3)][:6]:
+        k = int(rec["k"])
+        rlo, rsz = np.array(rec["lo"], np.int64), np.array(rec["size"], np.int64)
+        hi = np.maximum(rlo + rsz - p, rlo)
+        for _ in range(4):
+            lo = rng.integers(np.minimum(rlo, hi), hi + 1)
+            want = ladder.context(ds.ct, lo, p, ds.ctx, rung=k)
+            got = [ds._ctx_cube(rec, k, d, lo, p) for d in ds.ctx]
+            assert all(np.array_equal(a, b) for a, b in zip(want, got)), (k, lo)
+            ref = ds._cascade_extras(k, lo, p)["cx"]
+            assert np.array_equal(ds._cascade_extras(k, lo, p, rec=rec)["cx"], ref)
+    ds.SUPER_MAX = 0                             # nothing cached: the per-window read path
+    ds._vkey = None
+    rec = [v for v in ds.visits if int(v["k"]) == 2][0]
+    lo = np.array(rec["lo"], np.int64)
+    assert all(np.array_equal(a, b) for a, b in zip(
+        ladder.context(ds.ct, lo, p, ds.ctx, rung=2), [ds._ctx_cube(rec, 2, d, lo, p) for d in ds.ctx]))

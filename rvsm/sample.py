@@ -280,7 +280,7 @@ class Patches(torch.utils.data.IterableDataset):
 
     # ---- the extras ------------------------------------------------------
 
-    def _cascade_extras(self, k, lo, shape):
+    def _cascade_extras(self, k, lo, shape, rec=None):
         """`cm` (the rung-(k+1) target block over the patch footprint, half the patch on every axis) and,
         for the self/mix cascade modes, the tenth context cube `cx` and the corner `lo1` of the coarse
         cube. The top rung has no rung above it, so its cascade block is zero -- which is also what
@@ -290,8 +290,41 @@ class Patches(torch.utils.data.IterableDataset):
         cm = self._target_block(self.channels[0], int(k) + 1, lo // 2, hp)
         d = (int(self.ctx[-1]) + 1) if self.ctx else 1
         c0 = lo + p // 2
-        cx = ladder.read_rung(self.pyr, int(k) + d, c0 // (1 << d) - p // 2, p, dtype=np.uint8)
+        cx = self._ctx_cube(rec, k, d, lo, p) if rec is not None else \
+            ladder.read_rung(self.pyr, int(k) + d, c0 // (1 << d) - p // 2, p, dtype=np.uint8)
         return {"cm": cm, "cx": cx, "lo1": c0 // 2 - p // 2}
+
+    SUPER_MAX = 128 << 20    # a visit's context super-cube is cached when it is at most this many voxels
+
+    def _ctx_cube(self, rec, k, d, lo, p):
+        """The rung-(k+d) context cube of the window at `lo` -- `ladder.context`'s cube, bit for bit --
+        sliced from ONE super-cube per visit covering every window centre the visit can draw.
+
+        A visit draws `windows_per_region` windows in one tile, and above d = 1 their context cubes
+        overlap almost entirely (at d >= 3 the whole tile is smaller than one cube): reading nine cubes
+        per window re-decoded the same coarse chunks ~128 times and was 2.4 s of a 4.1 s draw on
+        tnr-0. A super-cube larger than `SUPER_MAX` voxels (d = 1: 640^3 for a 1024 tile) is not
+        cached; that cube is read per window as before."""
+        key = (int(rec["k"]), tuple(int(v) for v in rec["lo"]), rec.get("v"))
+        if getattr(self, "_vkey", None) != key:
+            self._vkey, self._vcubes = key, {}
+        p3 = ladder.shape3(p)
+        c0 = np.asarray(lo, np.int64) + p3 // 2
+        if d not in self._vcubes:
+            rlo, rsz = np.array(rec["lo"], np.int64), np.array(rec["size"], np.int64)
+            hi = np.maximum(rlo + rsz - p3, rlo)
+            cmin, cmax = np.minimum(rlo, hi) + p3 // 2, hi + p3 // 2
+            a = cmin // (1 << int(d)) - p3 // 2
+            b = cmax // (1 << int(d)) - p3 // 2 + p3
+            self._vcubes[d] = None if int(np.prod(b - a)) > self.SUPER_MAX else \
+                (a, ladder.read_rung(self.pyr, int(k) + int(d), a, b - a, dtype=np.uint8))
+        ent = self._vcubes[d]
+        lo_d = c0 // (1 << int(d)) - p3 // 2
+        if ent is None:
+            return ladder.read_rung(self.pyr, int(k) + int(d), lo_d, p3, dtype=np.uint8)
+        a, cube = ent
+        o = lo_d - a
+        return cube[o[0]:o[0] + p3[0], o[1]:o[1] + p3[1], o[2]:o[2] + p3[2]]
 
     def _plane_extras(self, k):
         """The per-sample numbers the radius and scan planes need: r_max at this rung, and the five
@@ -311,9 +344,9 @@ class Patches(torch.utils.data.IterableDataset):
             return None
         tg, w = self._rung_target(k, lo, ct)
         sym = int(draw_sym(rng, tuple(p))) if self.sym else 0
-        cx = ladder.context(self.ct, lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
+        cx = [self._ctx_cube(rec, k, d, lo, ct.shape) for d in self.ctx] if self.ctx else ()
         return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, self.ax, sym,
-                         **self._plane_extras(k), **self._cascade_extras(k, lo, ct.shape))
+                         **self._plane_extras(k), **self._cascade_extras(k, lo, ct.shape, rec=rec))
 
     def _visitable(self, rec):
         """Is this visit worth making? A fine region with no finished store would yield only zero
