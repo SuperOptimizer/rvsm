@@ -537,7 +537,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     hb = os.path.join(out, "workers", "produce.json")
     _write_json(hb, {"pid": os.getpid(), "phase": "start", "last_ts": time.time()})
 
-    cache = stream.ShardCache(cfg.ct, out, budget_gb=cfg.cache_gb,
+    cache = stream.ShardCache(cfg.ct, out, budget_gb=cfg.cache_gb, seed=cfg.ct_seed or None,
                               log=lambda m: jlog(out, "produce", {"kind": "cache", "msg": str(m)},
                                                  echo=False))
     pinned = cache.pin_small_levels()
@@ -1008,7 +1008,7 @@ def setup(cfg, out=None):
     meta5 = [float(v) for v in SM.scan_planes(meta)]
     _write_json(os.path.join(out, "meta5.json"), meta5)
 
-    mirror = stream.ShardCache(cfg.ct, out, budget_gb=cfg.cache_gb)
+    mirror = stream.ShardCache(cfg.ct, out, budget_gb=cfg.cache_gb, seed=cfg.ct_seed or None)
     try:
         mirror.meta()
         ct_local = mirror.base

@@ -150,7 +150,7 @@ RUNG_ITEM_KEYS = ("ct", "tgt", "w", "lo", "cyx", "sym", "rung", "norm", "cm", "c
                   "rmax", "meta")
 
 # Fields a resume is allowed to differ in: a longer run, a different eval cadence, different hardware.
-FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds")
+FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_seed")
 
 
 @dataclass
@@ -171,6 +171,8 @@ class Config:
     tifxyz: str = ""                   # optional directory of human tifxyz meshes, for eval only
     teacher_ckpts: dict = field(default_factory=dict)  # {"recto": path, "m7": path} local teacher weights
     cache_gb: float = 64.0             # CT shard cache budget on disk/RAM
+    ct_seed: str = ""                  # a local, possibly partial mirror of a URL `ct`: shards it has are
+                                       # hard-linked into the cache instead of fetched
 
     # ------------------------------------------------------------------ fixed recipe: the ladder
     ctx: tuple = (1, 2, 3, 4, 5, 6, 7, 8, 9)   # context cube offsets, in rungs above the sample's own

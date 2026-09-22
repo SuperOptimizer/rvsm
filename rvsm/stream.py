@@ -118,11 +118,12 @@ class Fetcher:
     `urlof` maps a local mirror path to its origin URL; the cache owns that mapping because it owns the
     mirror root."""
 
-    def __init__(self, session, urlof, jobs=16, retries=4, log=print):
-        self.session, self.urlof, self.log = session, urlof, log
+    def __init__(self, session, urlof, jobs=16, retries=4, log=print, seedof=None):
+        self.session, self.urlof, self.log, self.seedof = session, urlof, log, seedof
         self.sem, self.retries = asyncio.Semaphore(int(jobs)), int(retries)
         self.lock = {}   # one download per shard: concurrent regions wanting the same object wait for it
         self.bytes = self.fetched = self.absent = self.have = self.failed = self.requests = 0
+        self.seeded = 0
 
     async def get(self, path):
         """(status, bytes) with status in have / new / absent / fail; `path` is the LOCAL mirror path.
@@ -149,6 +150,9 @@ class Fetcher:
         if os.path.exists(path + ".absent"):
             self.have += 1
             return "absent", 0
+        got = self._from_seed(path) if self.seedof is not None else None
+        if got is not None:
+            return got
         url = self.urlof(path)
         async with self.sem:
             for attempt in range(self.retries):
@@ -175,6 +179,32 @@ class Fetcher:
                         self.failed += 1
                         return "fail", 0
                     await asyncio.sleep(2 * (attempt + 1))
+
+
+    def _from_seed(self, path):
+        """Serve `path` from the local seed mirror when it can answer: a file it has is HARD-LINKED in
+        (copied across filesystems), so eviction later removes the cache's link and never the seed's
+        file; a file it lacks in a level its `mirror.json` marks complete is absent on the origin too.
+        None = the seed cannot tell, ask the origin."""
+        src, complete = self.seedof(path)
+        if src is None:
+            return None
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                os.link(src, path + ".part")
+            except OSError:
+                import shutil
+                shutil.copyfile(src, path + ".part")
+            os.replace(path + ".part", path)
+            self.seeded += 1
+            return "new", 0
+        if os.path.isfile(src + ".absent") or (complete and os.path.basename(src) != "zarr.json"):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path + ".absent", "wb").close()
+            self.absent += 1
+            return "absent", 0
+        return None
 
 
 async def fetch_group_meta(f, base):
@@ -218,8 +248,10 @@ class ShardCache:
     and `release(key)` gives those shards back to the LRU. Every public method is synchronous: the
     asyncio loop and the keep-alive session are this object's private business."""
 
-    def __init__(self, src, root, budget_gb=64.0, jobs=16, retries=4, log=print):
+    def __init__(self, src, root, budget_gb=64.0, jobs=16, retries=4, log=print, seed=None):
         self.src = ladder.pyramid_base(str(src))
+        self.seed = os.path.abspath(str(seed)) if seed else None
+        self._complete = {}
         self.root, self.jobs, self.retries, self.log = str(root), int(jobs), int(retries), log
         self.remote = ladder.is_url(self.src)
         self.vol = os.path.basename(self.src.rstrip("/"))
@@ -255,13 +287,29 @@ class ShardCache:
                 connector=aiohttp.TCPConnector(limit=self.jobs, force_close=False),
                 timeout=aiohttp.ClientTimeout(total=600, sock_connect=30))
             self._f = Fetcher(self._sess, self.url_of, jobs=self.jobs, retries=self.retries,
-                              log=self.log)
+                              log=self.log, seedof=self.seed_of if self.seed else None)
         return self._f
 
     def url_of(self, path):
         """A local mirror path -> its origin URL (the inverse of the mirror layout)."""
         rel = os.path.relpath(os.path.abspath(path), os.path.abspath(self.base)).replace(os.sep, "/")
         return f"{self.src.rstrip('/')}/{rel}"
+
+    def seed_of(self, path):
+        """A mirror path -> (the same object in the seed mirror, whether its level is complete there).
+        A level is complete when the seed's `<level>/mirror.json` says `{"complete": true}`; only then
+        does a missing file mean absent rather than not-yet-mirrored."""
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(self.base))
+        if rel.startswith(".."):
+            return None, False
+        lvl = rel.split(os.sep, 1)[0]
+        if lvl not in self._complete:
+            try:
+                with open(os.path.join(self.seed, lvl, "mirror.json")) as f:
+                    self._complete[lvl] = bool(json.load(f).get("complete"))
+            except (OSError, ValueError, AttributeError):
+                self._complete[lvl] = False
+        return os.path.join(self.seed, rel), self._complete[lvl] and os.sep in rel
 
     def close(self):
         if self._sess is not None:
@@ -408,5 +456,5 @@ class ShardCache:
         f = self._f
         return {"gb": self.cache_bytes / (1 << 30), "shards": len(self.size), "pinned": len(self.pin),
                 "regions": len(self.regions), "evicted": self.evicted,
-                "fetched": getattr(f, "fetched", 0), "have": getattr(f, "have", 0),
+                "fetched": getattr(f, "fetched", 0), "seeded": getattr(f, "seeded", 0), "have": getattr(f, "have", 0),
                 "absent": getattr(f, "absent", 0), "failed": getattr(f, "failed", 0)}

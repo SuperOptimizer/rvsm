@@ -101,3 +101,38 @@ def test_a_local_volume_is_symlinked_not_copied(ct_origin, tmp_path):
     assert cache.stats()["gb"] == 0 and cache.stats()["fetched"] == 0
     cache.release(cache.region_key((0, 64, 0)))
     assert os.path.realpath(cache.base) == os.path.realpath(ct_origin.path)  # nothing was deleted
+
+
+def test_a_seed_mirror_is_linked_and_only_its_gaps_are_fetched(ct_origin, tmp_path, windowed):
+    """`ct_seed`: a partial local mirror of the URL. What it has is linked in (never fetched, and
+    eviction removes only the cache's link); a gap in an INCOMPLETE level goes to the origin; a gap in a
+    level whose mirror.json says complete is absent without asking anyone."""
+    import json
+    import shutil
+    seed = tmp_path / "seed"
+    shutil.copytree(ct_origin.path, seed)
+    lv = sorted((d for d in os.listdir(seed) if d.isdigit()), key=int)
+    fine, coarse = lv[0], lv[-1]
+    (seed / coarse / "mirror.json").write_text(json.dumps({"complete": True}))
+    shards = [os.path.join(r, f) for r, _, fs in os.walk(seed / fine / "c") for f in fs]
+    assert len(shards) > 1
+    gone = shards[0]
+    os.remove(gone)                                  # level `fine` is partial: this one must be fetched
+    cache = stream.ShardCache(ct_origin.url, str(tmp_path / "c"), budget_gb=1, seed=str(seed))
+    pyr = cache.levels()
+    assert sorted(pyr) == sorted(ladder.rungs(ct_origin.path))
+    rel = [os.path.relpath(p, seed) for p in shards]
+    cache._fetch([os.path.join(cache.base, r) for r in rel], key="w")
+    st = cache.stats()
+    assert st["fetched"] == 1 and st["seeded"] >= len(shards) - 1
+    assert os.path.samefile(os.path.join(cache.base, rel[1]), shards[1])   # a link, not a copy
+    miss = os.path.join(cache.base, coarse, "c", "99", "0", "0")
+    n = cache._f.requests
+    cache._fetch([miss], key="w")
+    assert os.path.exists(miss + ".absent") and cache._f.requests == n   # complete level: no request
+    a = ladder.read_rung(ladder.rungs(ct_origin.path), 2, (0, 0, 0), 64, dtype=np.uint8)
+    b = ladder.read_rung(ladder.rungs(cache.base), 2, (0, 0, 0), 64, dtype=np.uint8)
+    assert np.array_equal(a, b)
+    os.remove(os.path.join(cache.base, rel[1]))      # what eviction does
+    assert os.path.exists(shards[1])
+    cache.close()

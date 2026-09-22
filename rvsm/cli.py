@@ -1003,7 +1003,7 @@ globals()["ladder-report"] = ladder_report
 # --------------------------------------------------------------------------- #
 # `rvsm run`, `rvsm status`, `rvsm stop`: the driver (commit 6)
 # --------------------------------------------------------------------------- #
-RUN_USAGE = """rvsm run [cfg.toml] [--ct URL|PATH] [--umbilicus PATH|auto] [--out DIR] [--gpus 0[,1]]
+RUN_USAGE = """rvsm run [cfg.toml] [--ct URL|PATH] [--ct-seed LOCAL_MIRROR] [--umbilicus PATH|auto] [--out DIR] [--gpus 0[,1]]
              [--mode auto|resident|timeshare|cpu] [--rounds N] [--steps N] [--size 30m6]
              [--init ckpt.pt] [--device cuda:0] [--backend trt|torch] [--no-producer]
 
@@ -1039,9 +1039,9 @@ def run(argv):
         return 0
 
     over = {}
-    for k in ("ct", "umbilicus", "out", "size", "mode"):
-        if f.get(k):
-            over[k] = str(f[k][0])
+    for k in ("ct", "umbilicus", "out", "size", "mode", "ct_seed"):
+        if f.get(k) or f.get(k.replace("_", "-")):
+            over[k] = str((f.get(k) or f.get(k.replace("_", "-")))[0])
     for k in ("rounds", "steps", "workers"):
         if f.get(k):
             over[k] = int(f[k][0])
