@@ -419,7 +419,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     layout = cfg.layout()
     nsteps = int(cfg.steps if steps is None else steps)
-    grid = list(val_items or [])
+    grid = val_items if val_items is not None else []   # a list, or a `sample.DiskGrid` (never list()ed:
+                                                         # that would load a spilled grid whole)
 
     net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, ckpt_act=cfg.ckpt_act, verbose=False).to(dev)
     newp = set()

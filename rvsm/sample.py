@@ -355,14 +355,9 @@ class Patches(torch.utils.data.IterableDataset):
 
 # --------------------------------------------------------------------------- validation and loading
 
-def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, limit=8, **kw):
-    """A FIXED set of windows over the held-out regions: the same corners at every evaluation, so two
-    checkpoints are compared on identical data. Non-overlapping tiles of each held-out region at each
-    rung the region can supply, evenly subsampled to `limit` per (region, rung)."""
-    ds = Patches(cfg, root=root, ct=ct, ax=ax, round_=round_, region_records=list(heldout),
-                 sym=False, **kw)
-    ds._open()
-    p = ds.patch
+def _grid_corners(cfg, heldout, p, rungs=None, limit=8):
+    """[(k, lo)] of the validation grid, in build order: non-overlapping tiles of each held-out region
+    at each rung, evenly subsampled to `limit` per (region, rung)."""
     out = []
     for r in heldout:
         lo2, sz2 = np.array(r["lo"], np.int64), np.array(r["size"], np.int64)
@@ -374,16 +369,139 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
                   for x in range(0, max(int(sz[2]) - int(p[2]), 0) + 1, int(p[2]))]
             if limit and len(cs) > limit:
                 cs = [cs[i] for i in np.linspace(0, len(cs) - 1, limit).astype(int)]
-            for c in cs:
-                lo = org + np.array(c, np.int64)
-                ct_ = ladder.read_rung(ds.pyr, int(k), lo, p, dtype=np.uint8)
-                tg, w = ds._rung_target(int(k), lo, ct_)
-                cx = ladder.context(ds.ct, lo, ct_.shape, ds.ctx, rung=int(k)) if ds.ctx else ()
-                out.append(rung_item(np.stack([ct_] + list(cx)), tg, w, int(k), lo, ds.ax, 0,
-                                     **ds._plane_extras(int(k)),
-                                     **ds._cascade_extras(int(k), lo, ct_.shape)))
-    assert out, "the held-out regions are smaller than one patch at every rung"
+            out += [(int(k), org + np.array(c, np.int64)) for c in cs]
     return out
+
+
+def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, limit=8, spill=None,
+             threads=1, **kw):
+    """A FIXED set of windows over the held-out regions: the same corners at every evaluation, so two
+    checkpoints are compared on identical data. Non-overlapping tiles of each held-out region at each
+    rung the region can supply, evenly subsampled to `limit` per (region, rung).
+
+    A grid item is ~310 MB (the CT and nine context cubes at 256^3 are 160 MB of it), and eight held-out
+    regions make ~190 items: ~60 GB, which is the whole host on a 64 GB machine. With `spill=<dir>` the
+    grid is written there compressed as it is built and returned as a `DiskGrid`, which holds ONE item
+    in memory at a time; a directory whose manifest matches this grid is reused as it is, so a restart
+    does not rebuild it. `threads` builds items concurrently (the reads are volcomp decodes, which run
+    without the GIL); the item order, and so the grid, does not depend on it."""
+    ds = Patches(cfg, root=root, ct=ct, ax=ax, round_=round_, region_records=list(heldout),
+                 sym=False, **kw)
+    ds._open()
+    p = ds.patch
+    corners = _grid_corners(cfg, heldout, p, rungs=rungs, limit=limit)
+    assert corners, "the held-out regions are smaller than one patch at every rung"
+
+    def build(kl):
+        k, lo = kl
+        ct_ = ladder.read_rung(ds.pyr, int(k), lo, p, dtype=np.uint8)
+        tg, w = ds._rung_target(int(k), lo, ct_)
+        cx = ladder.context(ds.ct, lo, ct_.shape, ds.ctx, rung=int(k)) if ds.ctx else ()
+        return rung_item(np.stack([ct_] + list(cx)), tg, w, int(k), lo, ds.ax, 0,
+                         **ds._plane_extras(int(k)), **ds._cascade_extras(int(k), lo, ct_.shape))
+
+    def items():
+        if int(threads) <= 1:
+            yield from (build(c) for c in corners)
+            return
+        import concurrent.futures as cf
+        with cf.ThreadPoolExecutor(int(threads)) as ex:
+            yield from ex.map(build, corners)      # map keeps the corner order
+
+    if spill is None:
+        return list(items())
+    import hashlib
+    import json
+    import os
+    key = hashlib.sha256(json.dumps({
+        "corners": [[k, [int(v) for v in lo]] for k, lo in corners], "round": int(round_),
+        "fingerprint": cfg.fingerprint(), "keys": list(RUNG_ITEM_KEYS)}).encode()).hexdigest()[:16]
+    os.makedirs(spill, exist_ok=True)
+    man = os.path.join(spill, "grid.json")
+    try:
+        with open(man) as f:
+            old = json.load(f)
+        if old.get("key") == key and all(os.path.exists(os.path.join(spill, q)) for q in old["items"]):
+            return DiskGrid(spill, old["items"])
+    except (OSError, ValueError, KeyError):
+        pass
+    names = []
+    for i, it in enumerate(items()):
+        names.append(f"item_{i:04d}.pt")
+        _save_item(os.path.join(spill, names[-1]), it)
+    with open(man + ".tmp", "w") as f:
+        json.dump({"key": key, "items": names, "n": len(names)}, f)
+    os.replace(man + ".tmp", man)
+    return DiskGrid(spill, names)
+
+
+_PACK_MIN = 1 << 20      # arrays at least this big are compressed on disk
+
+
+def _save_item(path, item):
+    """One grid item to disk: every large array Blosc-zstd compressed (the targets and weights are
+    mostly zeros; the CT compresses less), everything else as it is."""
+    import numcodecs
+    codec = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
+    rec = {}
+    for k, v in item.items():
+        a = v.numpy() if torch.is_tensor(v) else v
+        if isinstance(a, np.ndarray) and a.nbytes >= _PACK_MIN:
+            rec[k] = ("blosc", codec.encode(np.ascontiguousarray(a)), a.shape, str(a.dtype),
+                      torch.is_tensor(v))
+        else:
+            rec[k] = ("raw", v)
+    torch.save(rec, path + ".tmp")
+    import os
+    os.replace(path + ".tmp", path)
+
+
+def _load_item(path):
+    import numcodecs
+    codec = numcodecs.Blosc()
+    rec = torch.load(path, weights_only=False)
+    out = {}
+    for k, v in rec.items():
+        if v[0] == "blosc":
+            _, buf, shape, dt, is_t = v
+            a = np.frombuffer(codec.decode(buf), dtype=np.dtype(dt)).reshape(shape).copy()
+            out[k] = torch.from_numpy(a) if is_t else a
+        else:
+            out[k] = v[1]
+    return out
+
+
+class DiskGrid:
+    """The validation grid on disk (`val_grid(spill=...)`), used like the list it replaces: `len`,
+    indexing, slicing and iteration. Iteration reads the NEXT item on a thread while the caller scores
+    the current one, and never holds more than those two in memory."""
+
+    def __init__(self, root, names):
+        import os
+        self.paths = [os.path.join(root, n) for n in names]
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __bool__(self):
+        return bool(self.paths)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [_load_item(p) for p in self.paths[i]]
+        return _load_item(self.paths[i])
+
+    def __iter__(self):
+        import concurrent.futures as cf
+        if not self.paths:
+            return
+        with cf.ThreadPoolExecutor(1) as ex:
+            nxt = ex.submit(_load_item, self.paths[0])
+            for j in range(len(self.paths)):
+                cur = nxt.result()
+                if j + 1 < len(self.paths):
+                    nxt = ex.submit(_load_item, self.paths[j + 1])
+                yield cur
 
 
 def loader(patches, workers=0, batch=1):

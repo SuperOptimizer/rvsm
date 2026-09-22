@@ -1,4 +1,6 @@
 """The sampler and the GPU prep: the item contract, where weight comes from, and the channel order."""
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -246,3 +248,27 @@ def test_loader_collates_the_contract(synth_run):
     b = next(iter(dl))
     assert tuple(sorted(b)) == tuple(sorted(RUNG_ITEM_KEYS))
     assert b["ct"].shape[0] == 2 and b["lo"].shape == (2, 3)
+
+
+def test_a_spilled_val_grid_is_the_grid_and_is_reused(synth_run, tmp_path):
+    """`val_grid(spill=...)` writes the items compressed and hands back a `DiskGrid`: the same items
+    as the in-memory grid, in the same order, built the same with threads, and a second call with the
+    same grid reuses the directory instead of rebuilding it."""
+    held = [r for r in synth_run.regions if r["k"] == 2][:1]
+    kw = dict(root=synth_run.root, ct=synth_run.cfg.ct, ax=synth_run.ax, rungs=(2, 3))
+    ref = sample.val_grid(synth_run.cfg, held, **kw)
+    d = tmp_path / "grid"
+    g = sample.val_grid(synth_run.cfg, held, spill=str(d), threads=3, **kw)
+    assert isinstance(g, sample.DiskGrid) and len(g) == len(ref) and g
+    for a, b in zip(ref, g):
+        assert sorted(a) == sorted(b)
+        for k in a:
+            va, vb = a[k], b[k]
+            if torch.is_tensor(va):
+                assert torch.equal(va, vb), k
+            else:
+                assert np.array_equal(np.asarray(va), np.asarray(vb)), k
+    assert len(g[:2]) == min(2, len(ref))
+    m = os.path.getmtime(d / "grid.json")
+    g2 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+    assert len(g2) == len(g) and os.path.getmtime(d / "grid.json") == m

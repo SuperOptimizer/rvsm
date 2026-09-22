@@ -77,12 +77,15 @@ def binary_frac(tgt, w):
 
 
 @torch.no_grad()
-def collect(net, grid_iter, layout=None, device=None):
+def collect(net, grid_iter, layout=None, device=None, stride=(2, 4, 4)):
     """{rung: (logit, tgt, weight)} over the grid, CHANNEL 0 only -- the recto band is the one channel
     every validation patch carries and the only one with a published meaning.
 
     `grid_iter` yields prepared `(x, t, w, rung)` batches; `w` may be None (all ones). Everything is
-    moved to the CPU as it is collected, so a long grid costs host memory and not VRAM."""
+    moved to the CPU as it is collected, so a long grid costs host memory and not VRAM -- which is why
+    only every `stride`-th voxel (z, y, x) is kept: the whole of eight held-out regions' grid was ~40 GB
+    of float32 on a 64 GB host, and one temperature per rung does not need 16 M voxels per window. (An
+    axis shorter than 64 voxels is kept whole.)"""
     out = {}
     net.eval()
     for item in grid_iter:
@@ -98,7 +101,9 @@ def collect(net, grid_iter, layout=None, device=None):
         if layout is not None:
             lg = lg[:, :layout.cout_t]
         w = torch.ones_like(t) if w is None else w
-        a, b, c = lg[:, :1].detach().cpu(), t[:, :1].detach().cpu(), w[:, :1].detach().cpu()
+        sl = (slice(None), slice(0, 1)) + tuple(slice(None, None, int(q) if n >= 64 else 1)
+                                                for q, n in zip(stride, lg.shape[2:]))
+        a, b, c = lg[sl].detach().cpu(), t[sl].detach().cpu(), w[sl].detach().cpu()
         if float(c.sum()) <= 0:
             continue
         out.setdefault(rung, []).append((a, b, c))

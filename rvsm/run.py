@@ -1290,8 +1290,11 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     # ---- the trainer, round by round. The validation grid is ALWAYS round 0's stores: the round-0
     # reference is the fixed reference every round is compared against (plan §3).
     ckpt = os.path.join(out, "ckpt", "student.pt")
+    t_g = time.time()
     val = sample.val_grid(cfg, ctx["heldout"], root=out, ct=ctx["ct"], ax=ctx["ax"], round_=0,
-                          meta=ctx["meta5"])
+                          meta=ctx["meta5"], spill=os.path.join(out, "eval", "grid"),
+                          threads=max(min(int(os.cpu_count() or 1) // 2, 4), 1))
+    jlog(out, "sched", {"kind": "val_grid", "items": len(val), "s": round(time.time() - t_g, 1)})
     state = {"round": int(read_state(out).get("round", 0)), "stop": False, "ref": None}
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
     resume = os.path.exists(ckpt)
