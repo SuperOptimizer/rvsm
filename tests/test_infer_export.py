@@ -776,3 +776,17 @@ def test_gpu_smoke_student_region(student_env, student_ckpt):
                                heads=["recto"], meta=e.meta, device="cuda", window=WIN, halo=HALO,
                                cascade_depth=1, batch=2)
     assert got["recto"].shape == (128, 128, 128) and got["recto"].max() > 0
+
+
+def test_an_engine_slower_than_torch_is_not_used_and_the_verdict_sticks(tmp_path):
+    """A plan built blind (optimization level 0) can be far slower than torch; `trt.verdict` measures
+    once, records the decision beside the plan, and a later process reads it instead of re-timing."""
+    import time as _t
+    x = torch.zeros(2)
+    slow, fast = (lambda t: _t.sleep(0.02) or t), (lambda t: t)
+    p = tmp_path / "slow.plan"
+    assert trt.verdict(p, slow, fast, x, reps=1) is False
+    assert os.path.exists(str(p) + ".verdict.json")
+    assert trt.verdict(p, fast, slow, x, reps=1) is False      # recorded: not re-timed
+    q = tmp_path / "fast.plan"
+    assert trt.verdict(q, fast, slow, x, reps=1) is True

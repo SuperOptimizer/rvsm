@@ -411,11 +411,15 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
     pc = run_region(fn, inp, tuple(int(v) for v in (b - a)), w, h, batch=batch, planes=1,
                     acc_dtype=acc_dtype)[0]
     pc = pc[c[0]:c[0] + s[0], c[1]:c[1] + s[1], c[2]:c[2] + s[2]]
-    up = F.interpolate(pc[None, None].float().cpu(), size=tuple(int(v) for v in size), mode="trilinear",
-                       align_corners=False)[0, 0].numpy()
-    coarse = roi[c[0]:c[0] + s[0], c[1]:c[1] + s[1], c[2]:c[2] + s[2]] == 0
-    air = np.repeat(np.repeat(np.repeat(coarse, f, 0), f, 1), f, 2)[:size[0], :size[1], :size[2]]
-    return np.where(air, 0.0, up).astype(np.float32)
+    # upsample and mask ON THE DEVICE: the same trilinear on the CPU was ~115 s of a ~125 s m7 region
+    up = F.interpolate(pc[None, None].float(), size=tuple(int(v) for v in size), mode="trilinear",
+                       align_corners=False)[0, 0]
+    del pc
+    coarse = inp.roi[c[0]:c[0] + s[0], c[1]:c[1] + s[1], c[2]:c[2] + s[2]] == 0
+    air = coarse.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
+    up.masked_fill_(air[:size[0], :size[1], :size[2]], 0.0)
+    del air
+    return up.cpu().numpy().astype(np.float32, copy=False)
 
 
 # --------------------------------------------------------------------------- #

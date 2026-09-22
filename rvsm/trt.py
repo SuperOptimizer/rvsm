@@ -146,7 +146,62 @@ def engine_for(net, name, window, cin, dir_, device="cuda", workspace_gb=8.0):
                     last = e
             else:
                 raise last
-        return Engine(p, device)
+        eng = Engine(p, device)
     except Exception as e:  # noqa: BLE001
         _once(f"{name} p{window}: {e.__class__.__name__}: {e}")
         return None
+    try:
+        x = torch.randn(eng.in_shape, dtype=torch.float32, device=device)
+
+        def ref(t):
+            with torch.no_grad():
+                return net(t)
+        use = verdict(p, eng, ref, x)
+    except Exception as e:  # noqa: BLE001
+        _once(f"{name} p{window}: the engine-vs-torch benchmark failed ({e.__class__.__name__}: {e})")
+        return None
+    if not use:
+        _once(f"{name} p{window}: the engine is slower than torch on this GPU")
+        return None
+    return eng
+
+
+def _time(fn, x, reps=3):
+    """Median seconds of `fn(x)` after one warm-up call, synchronised."""
+    sync = torch.cuda.synchronize if x.is_cuda else (lambda: None)
+    fn(x)
+    sync()
+    ts = []
+    for _ in range(int(reps)):
+        t = time.perf_counter()
+        fn(x)
+        sync()
+        ts.append(time.perf_counter() - t)
+    return sorted(ts)[len(ts) // 2]
+
+
+def verdict(plan_path, eng, ref, x, reps=3):
+    """Whether the engine at `plan_path` beats the torch module `ref` on one window, decided ONCE and
+    recorded next to the plan as `<plan>.verdict.json`.
+
+    A plan built by the untimed rungs of the ladder (optimization level 0 on a GPU whose autotuner
+    cannot time tactics) runs whatever kernels it picked blind: on Thunder's A100 the recto engine came
+    out 8.6x SLOWER than torch (380 s against 44 s per 1024^3 region). An engine is only worth using when
+    it is faster, so it has to be measured, not assumed."""
+    import json
+    vp = str(plan_path) + ".verdict.json"
+    if os.path.exists(vp):
+        try:
+            with open(vp) as f:
+                return bool(json.load(f)["use"])
+        except (OSError, ValueError, KeyError):
+            pass
+    te, tt = _time(eng, x, reps), _time(ref, x, reps)
+    use = te < tt
+    rec = {"use": use, "trt_s": round(te, 4), "torch_s": round(tt, 4), "ts": time.time()}
+    with open(vp + ".tmp", "w") as f:
+        json.dump(rec, f)
+    os.replace(vp + ".tmp", vp)
+    print(f"[trt] {os.path.basename(str(plan_path))}: engine {te * 1e3:.0f} ms, torch {tt * 1e3:.0f} ms "
+          f"per window -> {'engine' if use else 'torch'}", flush=True)
+    return use
