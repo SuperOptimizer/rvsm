@@ -510,22 +510,32 @@ def for_rung(cfg, rung=2):
     return out
 
 
+def _gate(c, m, f, k):
+    """Apply op `f` to the samples `m` (a CPU bool (B,)) selects. The whole batch selected is just
+    `f(c)`; a partial selection blends with `where`. `m` lives on the HOST on purpose: deciding
+    whether to run an op from a device tensor is a device->host sync per op per slot (576 of them
+    per batch for the shuffled 24-op chain), and on a GPU behind an RPC link (Thunder) those syncs
+    were ~300 ms of a ~440 ms augmentation pass."""
+    if not bool(m.any()):
+        return c
+    if bool(m.all()):
+        return f(c, k)
+    return torch.where(m.to(c.device).view(-1, 1, 1, 1, 1), f(c, k), c)
+
+
 def intensity(c, cfg):
     ops = [(n, f, cfg[n]) for n, f in INTENS if cfg.get(n)]
+    b = c.shape[0]
     if not cfg.get("shuffle"):
-        for name, f, k in ops:
-            m = _m(c.shape[0], c.device, k["p"]).bool()
-            if m.any():  # an aug that selected no sample of this batch costs nothing (half the time at p=0.3, B=2)
-                c = torch.where(m, f(c, k), c)
+        for name, f, k in ops:   # an aug that selected no sample of this batch costs nothing
+            c = _gate(c, (torch.rand(b) < k["p"]), f, k)
         return c
-    b, n = c.shape[0], len(ops)
-    sel = torch.stack([_m(b, c.device, k["p"]).bool().view(b) for _, _, k in ops], 1)  # (B, n)
-    slot = torch.rand(b, n, device=c.device).argsort(1)  # slot[b, t] = the op sample b applies t-th
+    n = len(ops)
+    sel = torch.stack([(torch.rand(b) < k["p"]) for _, _, k in ops], 1)  # (B, n), on the host
+    slot = torch.rand(b, n).argsort(1)  # slot[b, t] = the op sample b applies t-th
     for t in range(n):
         for i, (name, f, k) in enumerate(ops):
-            m = sel[:, i] & (slot[:, t] == i)  # only the samples that put op i in slot t, and drew it
-            if m.any():
-                c = torch.where(m.view(b, 1, 1, 1, 1), f(c, k), c)
+            c = _gate(c, sel[:, i] & (slot[:, t] == i), f, k)   # the samples that put op i in slot t
     return c
 
 
