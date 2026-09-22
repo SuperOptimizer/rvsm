@@ -276,11 +276,18 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
             acc[:, o[0]:o[0] + w, o[1]:o[1] + w, o[2]:o[2] + w] += pj * g
             wsum[o[0]:o[0] + w, o[1]:o[1] + w, o[2]:o[2] + w] += g
         del p
-    keep = ((wsum > 0) & (inputs.roi > 0))[None]
-    out = torch.where(keep, acc.float() / wsum.float().clamp_min(1e-6)[None], torch.zeros((), device=dev))
-    del acc, wsum
     Z, Y, X = (int(v) for v in size)
-    return out[:, :Z, :Y, :X].to(out_dtype)
+    # normalised in z-slabs straight into the output dtype: the whole-volume float32 temporaries of
+    # `where(keep, acc / wsum)` were 4 GB per plane on top of the accumulators (20+ GB for five heads)
+    out = torch.empty((int(planes), Z, Y, X), dtype=out_dtype, device=dev)
+    for z in range(0, Z, 64):
+        e = min(z + 64, Z)
+        ws = wsum[z:e, :Y, :X]
+        keep = (ws > 0) & (inputs.roi[z:e, :Y, :X] > 0)
+        q = acc[:, z:e, :Y, :X].float() / ws.float().clamp_min(1e-6)[None]
+        out[:, z:e] = torch.where(keep[None], q, torch.zeros((), device=dev)).to(out_dtype)
+    del acc, wsum
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -365,8 +372,32 @@ def teacher_fn(net, spec, tta=1):
     return flips_chan(go, int(tta), radial=False) if int(tta) > 1 else go
 
 
+def teacher_read(ct, lo, size, spec, pyr=None):
+    """The CT a teacher pass over the region (`lo`, `size`, rung 2) reads, as (roi uint8, a): the block
+    at the teacher's own level, with `spec.margin` voxels of context for a coarse teacher, and its
+    corner `a` at that level. Split out of `teacher_region` so a producer can read the NEXT region's CT
+    (the volcomp decode is seconds) on a thread while the GPU runs the current one."""
+    if isinstance(spec, str):
+        spec = teachers.TEACHERS[spec]
+    pyr = ladder.rungs(ct) if pyr is None else pyr
+    lvl = int(spec.level)
+    lo, size = np.asarray(lo, np.int64), np.asarray(size, np.int64)
+    if lvl == 0:
+        return ladder.read_rung(pyr, RUNG, lo, size, dtype=np.uint8), lo
+    f = 1 << lvl
+    assert not (lo % f).any() and not (size % f).any(), \
+        f"teacher {spec.name} runs at level {lvl}: the box must be a multiple of {f}"
+    o, s = lo // f, size // f
+    m = int(spec.margin)
+    shape_l = ladder.rung_shape(pyr, RUNG + lvl)
+    a = np.maximum(o - m, 0)
+    b = np.minimum(o + s + m, shape_l)
+    return ladder.read_rung(pyr, RUNG + lvl, a, b - a, dtype=np.uint8), a
+
+
 def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1, window=None, halo=None,
-                   batch=1, engine_dir=None, acc_dtype=torch.float16, net=None):
+                   batch=1, engine_dir=None, acc_dtype=torch.float16, net=None, roi=None,
+                   as_tensor=False):
     """One teacher over one region: the foreground probability as (Z, Y, X) float32 at RUNG 2.
 
     `lo` / `size` are rung-2 voxels. A teacher whose `level` is 0 (recto) runs on the region as it is. A
@@ -374,6 +405,10 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
     voxels of context on every side -- a 1024^3 region is only 256^3 there, thinner than the window it
     was trained at -- and its probability is trilinearly upsampled back to rung 2 and masked by the
     COARSE air mask (the loader masks again with the fine CT, so a coarse mask here is safe and cheap).
+
+    `roi` is `teacher_read`'s result when the caller read the CT ahead of time. `as_tensor` returns the
+    probability as a float16 tensor ON THE DEVICE instead of a host array, so a producer can fuse and
+    quantise there and move only uint8 across the bus.
     """
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if net is None:   # `net` is a teacher the CALLER already loaded: a producer loads each one once
@@ -390,36 +425,30 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
         if eng is not None:
             batch = 1
     fn = teacher_fn(eng if eng is not None else net, spec, tta=tta)
-    pyr = ladder.rungs(ct)
     lo, size = np.asarray(lo, np.int64), np.asarray(size, np.int64)
-    f = 1 << lvl
+    blk, a = teacher_read(ct, lo, size, spec) if roi is None else roi
+    odt = torch.float16 if as_tensor else torch.float32
     if lvl == 0:
-        ct_blk = ladder.read_rung(pyr, RUNG, lo, size, dtype=np.uint8)
-        inp = TeacherInputs(ct_blk, spec.normalizer, w, device=dev)
-        p = run_region(fn, inp, tuple(size), w, h, batch=batch, planes=1, acc_dtype=acc_dtype)
-        return p[0].float().cpu().numpy()
-    assert not (lo % f).any() and not (size % f).any(), \
-        f"teacher {spec.name} runs at level {lvl}: the box must be a multiple of {f}"
+        inp = TeacherInputs(blk, spec.normalizer, w, device=dev)
+        p = run_region(fn, inp, tuple(size), w, h, batch=batch, planes=1, acc_dtype=acc_dtype,
+                       out_dtype=odt)[0]
+        return p if as_tensor else p.float().cpu().numpy()
+    f = 1 << lvl
     o, s = lo // f, size // f
-    m = int(spec.margin)
-    shape_l = ladder.rung_shape(pyr, RUNG + lvl)
-    a = np.maximum(o - m, 0)
-    b = np.minimum(o + s + m, shape_l)
-    roi = ladder.read_rung(pyr, RUNG + lvl, a, b - a, dtype=np.uint8)
-    inp = TeacherInputs(roi, spec.normalizer, w, device=dev)
-    c = o - a
-    pc = run_region(fn, inp, tuple(int(v) for v in (b - a)), w, h, batch=batch, planes=1,
-                    acc_dtype=acc_dtype)[0]
+    inp = TeacherInputs(blk, spec.normalizer, w, device=dev)
+    c = o - np.asarray(a, np.int64)
+    pc = run_region(fn, inp, tuple(int(v) for v in blk.shape), w, h, batch=batch, planes=1,
+                    acc_dtype=acc_dtype, out_dtype=odt)[0]
     pc = pc[c[0]:c[0] + s[0], c[1]:c[1] + s[1], c[2]:c[2] + s[2]]
     # upsample and mask ON THE DEVICE: the same trilinear on the CPU was ~115 s of a ~125 s m7 region
-    up = F.interpolate(pc[None, None].float(), size=tuple(int(v) for v in size), mode="trilinear",
+    up = F.interpolate(pc[None, None], size=tuple(int(v) for v in size), mode="trilinear",
                        align_corners=False)[0, 0]
     del pc
     coarse = inp.roi[c[0]:c[0] + s[0], c[1]:c[1] + s[1], c[2]:c[2] + s[2]] == 0
     air = coarse.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
     up.masked_fill_(air[:size[0], :size[1], :size[2]], 0.0)
     del air
-    return up.cpu().numpy().astype(np.float32, copy=False)
+    return up if as_tensor else up.cpu().numpy().astype(np.float32, copy=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -450,6 +479,32 @@ def fuse_agreement(ps, pm, ws=1.0, wm=1.0, floor=0.05):
     a_m = float(wm) * (binary_confidence(pm) + float(floor))
     p = (a_s * ps + a_m * pm) / np.maximum(a_s + a_m, 1e-6)
     return p.astype(np.float32), (1.0 - np.abs(ps - pm)).astype(np.float32)
+
+
+def u8_t(p):
+    """`stores.u8` on a tensor: round-half-even to 0..255, uint8, on whatever device `p` is on."""
+    return torch.round(p.float() * 255).clamp_(0, 255).to(torch.uint8)
+
+
+def fuse_agreement_u8(ps, pm, ws=1.0, wm=1.0, floor=0.05, chunk=32):
+    """`fuse_agreement` on DEVICE tensors, straight to the two uint8 stores: (u8 probability, u8 weight),
+    both still on the device. Done in z-slabs of `chunk` so the float32 temporaries of a 1024^3 region
+    stay a few hundred MB instead of a dozen GB. The same formula as the numpy version, in float32."""
+    P = torch.empty(ps.shape, dtype=torch.uint8, device=ps.device)
+    W = torch.empty(ps.shape, dtype=torch.uint8, device=ps.device)
+    ln2 = float(np.log(2.0))
+
+    def conf(q):
+        q = q.clamp(1e-6, 1 - 1e-6)
+        return 1.0 - (-(q * torch.log(q) + (1 - q) * torch.log1p(-q)) / ln2)
+
+    for z in range(0, int(ps.shape[0]), int(chunk)):
+        a, b = ps[z:z + chunk].float(), pm[z:z + chunk].float()
+        a_s = float(ws) * (conf(a) + float(floor))
+        a_m = float(wm) * (conf(b) + float(floor))
+        P[z:z + chunk] = u8_t((a_s * a + a_m * b) / (a_s + a_m).clamp_min(1e-6))
+        W[z:z + chunk] = u8_t(1.0 - (a - b).abs())
+    return P, W
 
 
 # --------------------------------------------------------------------------- #
@@ -599,8 +654,9 @@ def student_fn(ckpt_path, device=None, compile=True, mode="max-autotune-no-cudag
 
 def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, device=None,
                    window=None, halo=None, cascade_depth=None, batch=1, rung=RUNG, tta=1, pyr=None,
-                   acc_dtype=torch.float16, umbilicus=None):
-    """One student pass over one region: `{plane name: (Z, Y, X) float32}` in rung-`rung` voxels.
+                   acc_dtype=torch.float16, umbilicus=None, as_tensor=False):
+    """One student pass over one region: `{plane name: (Z, Y, X) float32}` in rung-`rung` voxels
+    (`as_tensor`: float16 tensors left on the device, for a producer that encodes there).
 
     `student` is a `Student` or a checkpoint path; `lo` / `size` the box in rung-`rung` voxels; `ax` the
     umbilicus control points in rung-2 voxels (`axis.load`). `sign=-1` negates the radial input channels,
@@ -621,6 +677,9 @@ def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, 
     if int(tta) > 1:
         fn = flips_chan(fn, int(tta), radial=True)
     out = run_region(fn, inp, tuple(int(v) for v in ladder.shape3(size)), w, h, batch=batch,
-                     planes=len(names), offs=inp.offs, acc_dtype=acc_dtype)
+                     planes=len(names), offs=inp.offs, acc_dtype=acc_dtype,
+                     out_dtype=(torch.float16 if as_tensor else torch.float32))
+    if as_tensor:
+        return {n: out[i] for i, n in enumerate(names)}
     return {n: np.ascontiguousarray(out[i].float().cpu().numpy(), np.float32)
             for i, n in enumerate(names)}

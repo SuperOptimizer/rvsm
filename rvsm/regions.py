@@ -376,23 +376,57 @@ def _coarse_array(root, channel, k, round_=0, shape2=None, coverage=False, creat
                              overwrite=False)
 
 
-def feed_coarse(root, channel, lo, u8, round_=0, shape2=None, ks=COARSE_RUNGS):
+def pool_chain(u8, ks=COARSE_RUNGS):
+    """{k: the rung-2 uint8 block mean-pooled 2^(k-2)} for every k in `ks`, each rung pooled from the one
+    below it ONCE (a fresh chain per rung pooled the 1 GB block five times: ~50 s a region).
+
+    `u8` may be a numpy array or a uint8 TENSOR on any device; a tensor is pooled there (avg_pool3d of
+    the zero-padded block, then floored, which is `ladder.pool2` bit for bit: the mean of eight integers
+    is exact in float32 and the cast truncates) and only the small results come back to the host."""
+    want = sorted(int(k) for k in ks)
+    if not want:
+        return {}
+    out = {}
+    if hasattr(u8, "is_cuda") or type(u8).__module__.startswith("torch"):
+        import torch
+        import torch.nn.functional as F
+        v = u8
+        for k in range(3, max(want) + 1):
+            if min(v.shape) < 2:
+                break
+            pad = [q for d in (2, 1, 0) for q in (0, int(v.shape[d]) % 2)]
+            x = F.pad(v.float()[None, None], pad)
+            v = torch.floor(F.avg_pool3d(x, 2))[0, 0].to(torch.uint8)
+            if k in want:
+                out[k] = v.cpu().numpy()
+        return out
+    v = np.ascontiguousarray(u8, np.uint8)
+    for k in range(3, max(want) + 1):
+        if min(v.shape) < 2:
+            break
+        v = ladder.pool2(v)
+        if k in want:
+            out[k] = v
+    return out
+
+
+def feed_coarse(root, channel, lo, u8, round_=0, shape2=None, ks=COARSE_RUNGS, pooled=None):
     """Fold a finished rung-2 region block into the whole-scroll coarse arrays, rungs 7..11.
 
     `u8` is the region's rung-2 uint8 block and `lo` its rung-2 origin. For each rung k the block is mean
     pooled 2^(k-2) and written at `lo >> (k-2)`, and the same footprint of `coverage/<k>` is set to 255.
     A rung whose pooling factor is larger than the region itself is SKIPPED: the block would be under a
-    single coarse voxel and two different regions would collide in it. Returns the rungs written."""
-    u8 = np.ascontiguousarray(u8, np.uint8)
+    single coarse voxel and two different regions would collide in it. Returns the rungs written.
+
+    `pooled` is `pool_chain(u8, ks)` when the caller already has it (a producer pools on the GPU); `u8`
+    is then only consulted for its shape."""
     lo = np.asarray(lo, np.int64)
+    shp = tuple(int(q) for q in u8.shape)
+    ok = [int(k) for k in ks if (1 << (int(k) - 2)) <= min(shp) and not (lo % (1 << (int(k) - 2))).any()]
+    pooled = pool_chain(u8, ok) if pooled is None else pooled
     out = []
-    for k in ks:
-        e = 1 << (int(k) - 2)
-        if e > int(min(u8.shape)) or (lo % e).any():
-            continue
-        v = u8
-        for _ in range(int(k) - 2):
-            v = ladder.pool2(v)
+    for k in ok:
+        v = pooled[k]
         a = _coarse_array(root, channel, k, round_, shape2=shape2)
         c = _coarse_array(root, channel, k, round_, shape2=shape2, coverage=True)
         if a is None or c is None:

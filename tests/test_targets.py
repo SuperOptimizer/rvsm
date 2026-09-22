@@ -158,3 +158,30 @@ def test_read_pooled_matches_pooling_the_whole_store(slab_region):
     assert np.array_equal(blk, whole[16:32, 16:32, 16:32])
     out = targets.read_pooled(a, 3, (-8, -8, -8), (8, 8, 8))     # wholly outside: air, not an error
     assert int(out.max()) == 0
+
+
+def test_a_persistent_field_pool_is_byte_identical(slab_region):
+    """The producer keeps ONE `field_pool` for its lifetime and feeds it region after region; the
+    stores must be the ones `jobs=1` writes, for every region it is fed (the worker re-initialises when
+    the region changes)."""
+    a = slab_region(name="p1", n=128, recto_x=80, verso_x=70)
+    b = slab_region(name="p2", n=128, recto_x=80, verso_x=70)
+    c = slab_region(name="p3", n=128, recto_x=60, verso_x=50)
+    d = slab_region(name="p4", n=128, recto_x=60, verso_x=50)
+    targets.region_fields(a.root, a.lo, a.ax, rungs=(2, 3), block=64, halo=16, jobs=1)
+    targets.region_fields(c.root, c.lo, c.ax, rungs=(2, 3), block=64, halo=16, jobs=1)
+    pool = targets.field_pool(2)
+    try:
+        targets.region_fields(b.root, b.lo, b.ax, rungs=(2, 3), block=64, halo=16, jobs=2, pool=pool)
+        targets.region_fields(d.root, d.lo, d.ax, rungs=(2, 3), block=64, halo=16, jobs=2, pool=pool)
+    finally:
+        pool.shutdown(wait=True)
+    for x, y in ((a, b), (c, d)):
+        for kind in ("midline", "thickness"):
+            for rung in (2, 3):
+                ch = targets.channel(kind, rung)
+                pa, pb = stores.store_path(x.root, ch, x.lo), stores.store_path(y.root, ch, y.lo)
+                fa, fb = _tree(pa), _tree(pb)
+                assert fa == fb and fa, ch
+                for f in fa:
+                    assert filecmp.cmp(os.path.join(pa, f), os.path.join(pb, f), shallow=False), (ch, f)

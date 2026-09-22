@@ -790,3 +790,16 @@ def test_an_engine_slower_than_torch_is_not_used_and_the_verdict_sticks(tmp_path
     assert trt.verdict(p, fast, slow, x, reps=1) is False      # recorded: not re-timed
     q = tmp_path / "fast.plan"
     assert trt.verdict(q, fast, slow, x, reps=1) is True
+
+
+def test_the_device_fuse_is_the_host_fuse_to_one_code():
+    """`fuse_agreement_u8` (the producer's, on the GPU) against `stores.u8(fuse_agreement(...))`."""
+    rng = np.random.default_rng(1)
+    a = rng.random((40, 16, 16), dtype=np.float32)
+    b = rng.random((40, 16, 16), dtype=np.float32)
+    a[:5], b[:5] = 0.0, 1.0
+    p, w = infer.fuse_agreement(a, b)
+    P, W = infer.fuse_agreement_u8(torch.from_numpy(a), torch.from_numpy(b), chunk=7)
+    assert np.abs(P.numpy().astype(int) - stores.u8(p).astype(int)).max() <= 1
+    assert np.abs(W.numpy().astype(int) - stores.u8(w).astype(int)).max() <= 1
+    assert (P.numpy() == stores.u8(p)).mean() > 0.999

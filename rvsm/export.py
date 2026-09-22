@@ -43,6 +43,15 @@ def enc_signed(d, valid):
     return np.where(valid, np.clip(c, 1, 255), 0).astype(np.uint8)
 
 
+def enc_t(x, valid, lo, hi, unit, off=0.0):
+    """The uint8 field encoders (`enc_signed`, `targets.encode_signed` / `encode_unsigned`) on a TENSOR:
+    clip to [lo, hi], divide by `unit`, round half-even, add `off`, clip to 1..255, and code 0 wherever
+    `valid` is False. On the device, so a producer moves uint8 and not float planes across the bus."""
+    import torch
+    c = torch.round(x.float().clamp(lo, hi) / unit) + off
+    return torch.where(valid, c.clamp_(1, 255), torch.zeros((), device=x.device)).to(torch.uint8)
+
+
 def enc_normal(n, valid):
     """a normal COMPONENT in -1..1 -> uint8, code 0 = no data."""
     c = np.rint(np.clip(n, -1.0, 1.0) * NORMAL_SCALE) + TRACER_OFF

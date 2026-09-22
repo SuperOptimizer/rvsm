@@ -46,6 +46,8 @@ worker processes. Every block is computed from the stores alone, with a `halo` o
 parent assembles the cores, so the bytes written do not depend on how the blocks were handed out:
 `jobs=4` is byte-identical to `jobs=1`.
 """
+import os
+
 import numpy as np
 
 from rvsm import axis as AX, ladder, stores
@@ -243,6 +245,36 @@ def _block(task):
         encode_unsigned(t, (ok & okt))[sl]
 
 
+def _block_in(arg):
+    """`_block` for a PERSISTENT pool (`field_pool`): the task carries its region's init, and a worker
+    re-initialises only when the region changes."""
+    init, task = arg
+    key = (init[0], init[1]) + tuple(init[3:])       # the store paths and the scalars (not the axis array)
+    if _CTX.get("key") != key:
+        _init(*init)
+        _CTX["key"] = key
+    return _block(task)
+
+
+def _nice():
+    try:
+        os.nice(10)       # the fields are background work: the trainer's loader keeps the cores it needs
+    except OSError:
+        pass
+
+
+def field_pool(jobs):
+    """A process pool for `region_fields(pool=...)` that lives as long as the producer.
+
+    `forkserver`, not `fork`: the producer that owns it has CUDA and several threads, and a forked child
+    of a threaded process can inherit a lock some other thread held at the fork. The workers run at
+    nice 10."""
+    import concurrent.futures as cf
+    import multiprocessing as mp
+    return cf.ProcessPoolExecutor(max_workers=int(jobs), mp_context=mp.get_context("forkserver"),
+                                  initializer=_nice)
+
+
 def _blocks(shape, block):
     for z in range(0, int(shape[0]), block):
         for y in range(0, int(shape[1]), block):
@@ -256,7 +288,7 @@ def _pad128(n):
 
 
 def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXIS_R_UM,
-                  thr=0.5, cap=CAP, tmin=TMIN, block=BLOCK, halo=HALO, force=False):
+                  thr=0.5, cap=CAP, tmin=TMIN, block=BLOCK, halo=HALO, force=False, pool=None):
     """Build the `midline` and `thickness` stores of one region, at every rung in `rungs`.
 
     `root` is the run directory, `lo` the region corner in rung-2 voxels, `ax` the umbilicus control
@@ -265,7 +297,8 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     falls back to the recto face and the thickness is no-data everywhere (see `block_fields`).
 
     Returns a report dict. A rung whose two stores are already `done` is skipped (`force` recomputes),
-    which is what makes this resumable at region granularity.
+    which is what makes this resumable at region granularity. `pool` is a `field_pool` the caller keeps
+    alive across regions (a producer); without one, `jobs > 1` forks a pool for this call.
 
     A pooled rung whose shape is not a multiple of 128 is padded up to one, because a store's shape must
     be; the padding is code 0, i.e. no data. For the production region (1024 at rung 2) rungs 3 and 4 are
@@ -294,7 +327,10 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     init = (rp, vp, np.asarray(ax, np.float64), thr, cap, tmin, float(axis_r_um), int(halo))
     out = {k: {kind: np.zeros(tuple(_pad128(v) for v in Sk), np.uint8) for kind in KINDS}
            for k, Sk, _ in todo}
-    if int(jobs) <= 1 or len(tasks) < 2:
+    if pool is not None and len(tasks) >= 2:
+        for k, blo, m, t in pool.map(_block_in, [(init, t) for t in tasks], chunksize=1):
+            _store_block(out[k], k, blo, origin2, m, t)
+    elif int(jobs) <= 1 or len(tasks) < 2:
         _init(*init)
         results = (_block(t) for t in tasks)
         for k, blo, m, t in results:

@@ -132,3 +132,20 @@ def test_feed_coarse_places_the_block_and_sets_coverage(synth_run):
 def test_read_coarse_without_a_coarse_array_is_empty(tmp_path):
     got, cov = RG.read_coarse(str(tmp_path), "recto", 9, (0, 0, 0), (4, 4, 4))
     assert got.shape == (4, 4, 4) and not got.any() and not cov.any()
+
+
+def test_pool_chain_on_a_tensor_is_pool2_bit_for_bit():
+    """The producer pools the fused recto on the GPU; it must be the loader's `ladder.pool2`, exactly,
+    odd shapes (zero padding) included."""
+    import torch
+    rng = np.random.default_rng(0)
+    for shape in ((64, 64, 64), (70, 33, 45)):
+        blk = rng.integers(0, 256, size=shape, dtype=np.uint8)
+        ref = RG.pool_chain(blk, (3, 5, 7))
+        got = RG.pool_chain(torch.from_numpy(blk), (3, 5, 7))
+        assert sorted(ref) == sorted(got) == [3, 5, 7]
+        want = blk
+        for k in range(3, 8):
+            want = ladder.pool2(want)
+            if k in ref:
+                assert np.array_equal(ref[k], want) and np.array_equal(got[k], want), (shape, k)

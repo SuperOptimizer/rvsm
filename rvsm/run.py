@@ -419,22 +419,45 @@ class TeacherBank:
             row[1], row[3] = spec, net
         return row[3]
 
-    def probs(self, ct, lo, size):
-        """(fused probability, agreement weight, attrs) for one region, over every loaded teacher."""
+    def read(self, ct, lo, size, pyr=None):
+        """Every teacher's CT for a region, read ahead of its pass (`infer.teacher_read`): the producer's
+        reader thread calls this for the NEXT region while the GPU runs the current one."""
+        from rvsm import infer, ladder
+        pyr = ladder.rungs(ct) if pyr is None else pyr
+        return [infer.teacher_read(ct, lo, size, row[1], pyr=pyr) for row in self.items]
+
+    def probs_u8(self, ct, lo, size, rois=None):
+        """(u8 fused probability, u8 agreement weight, attrs) for one region, over every loaded teacher,
+        as uint8 TENSORS on the device: the teachers' float planes never leave the card (the host-side
+        fuse of two 1024^3 float32 volumes was ~40 s a region)."""
         from rvsm import infer
         ps, names = [], []
-        for row in self.items:
+        for i, row in enumerate(self.items):
             net = self._net(row)
             ps.append(infer.teacher_region(ct, lo, size, row[1], row[2], device=self.device,
-                                           backend=self.backend, net=net,
+                                           backend=self.backend, net=net, as_tensor=True,
+                                           roi=(rois[i] if rois is not None else None),
                                            engine_dir=os.path.join(self.out, "ckpt", "trt")))
             names.append(row[0])
         if len(ps) >= 2:
-            p, rw = infer.fuse_agreement(ps[0], ps[1])
+            P, W = infer.fuse_agreement_u8(ps[0], ps[1])
         else:
-            p, rw = ps[0], np.ones_like(ps[0])
-        return p, rw, {"producer": "teacher:" + ",".join(names), "radial_sign": 1,
-                       "ckpt": {r[0]: r[2] for r in self.items}, "backend": self.backend}
+            P = infer.u8_t(ps[0])
+            W = torch_full_like_u8(P, 255)
+        del ps
+        return P, W, {"producer": "teacher:" + ",".join(names), "radial_sign": 1,
+                      "ckpt": {r[0]: r[2] for r in self.items}, "backend": self.backend}
+
+    def probs(self, ct, lo, size):
+        """(fused probability, agreement weight, attrs) as host float32 arrays (the u8 path, decoded)."""
+        P, W, attrs = self.probs_u8(ct, lo, size)
+        return (P.cpu().numpy().astype(np.float32) / 255.0, W.cpu().numpy().astype(np.float32) / 255.0,
+                attrs)
+
+
+def torch_full_like_u8(t, v):
+    import torch
+    return torch.full_like(t, int(v), dtype=torch.uint8)
 
 
 class StudentSlot:
@@ -480,6 +503,25 @@ def student_rows(planes, layout, heads):
             ("conf", stores.u8(planes["conf"]), 0, "conf_u8")]
 
 
+def student_rows_t(planes, layout, heads):
+    """`student_rows` for DEVICE float planes (`student_region(..., as_tensor=True)`): the same codes,
+    computed on the card, returned as host uint8 arrays -- one byte per voxel crosses the bus."""
+    from rvsm import export as EX, infer, targets as TG
+    first = str(layout.channels[0])
+    if heads == "verso":
+        return [("verso", infer.u8_t(planes[first]).cpu().numpy(), 8, "prob_u8")]
+    rec = planes["recto"]
+    valid = rec > 0
+    return [("recto", infer.u8_t(rec).cpu().numpy(), 8, "prob_u8"),
+            ("verso", infer.u8_t(planes["verso"]).cpu().numpy(), 8, "prob_u8"),
+            ("midline", EX.enc_t(planes["midline"], valid, -EX.TRACER_CAP, EX.TRACER_CAP,
+                                 EX.TRACER_UNIT, EX.TRACER_OFF).cpu().numpy(), 0,
+             "signed_u8_off128_q0.25"),
+            ("thickness", EX.enc_t(planes["thickness"], valid, TG.UNIT, 255 * TG.UNIT,
+                                   TG.UNIT).cpu().numpy(), 0, "unsigned_u8_q0.25"),
+            ("conf", infer.u8_t(planes["conf"]).cpu().numpy(), 0, "conf_u8")]
+
+
 def write_rows(out, lo, rows, cfg, round_, attrs):
     from rvsm import infer, stores
     for ch, block, q, enc in rows:
@@ -498,14 +540,14 @@ def _fed_marker(out, lo, round_):
                         "region_%d_%d_%d" % tuple(int(v) for v in lo))
 
 
-def feed_coarse_once(out, lo, round_, block, shape2):
+def feed_coarse_once(out, lo, round_, block, shape2, pooled=None):
     """Fold a finished recto block into the coarse rungs, once per region and round (a marker file, so
     a restart does not redo it and two producers could not double-count it)."""
     from rvsm import regions as RG
     m = _fed_marker(out, lo, round_)
     if os.path.exists(m):
         return []
-    ks = RG.feed_coarse(out, "recto", lo, block, round_=round_, shape2=shape2)
+    ks = RG.feed_coarse(out, "recto", lo, block, round_=round_, shape2=shape2, pooled=pooled)
     os.makedirs(os.path.dirname(m), exist_ok=True)
     with open(m, "w") as f:
         f.write(json.dumps({"rungs": ks, "t": time.time()}))
@@ -562,7 +604,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     route, pos = region_route(cfg, visits, order, held)
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
     frungs = field_rungs(cfg)
-    jobs = max(min(int(os.cpu_count() or 1) // 2, 4), 1)
+    jobs = max(int(os.cpu_count() or 1), 1)   # the fields pool: every core, at low priority
     jlog(out, "produce", {"kind": "start", "pid": os.getpid(), "device": str(device),
                           "regions": len(route), "heldout": len(held), "pinned": pinned,
                           "backend": str(backend), "field_rungs": list(frungs), "jobs": jobs})
@@ -576,8 +618,71 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
         return stop_requested(out) or (stop is not None and stop.is_set()) or \
             (max_s is not None and time.time() - t_start > float(max_s))
 
+    # THE OVERLAP. The GPU thread (this one) only ever runs network passes. Around it:
+    #   reader   fetches the NEXT unit's shards and decodes its CT while the current unit infers
+    #   writer   volcomp-encodes and writes the stores, folds the coarse rungs, logs the unit
+    #   fields   the CPU distance fields (`targets.region_fields`, a process pool of `jobs`)
+    # A region with a unit in the writer or the fields queue is BUSY: its stores are not on disk yet,
+    # so the disk-derived state machine would hand out the same unit again.
+    import concurrent.futures as cf
+    import threading
+    reader = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-read")
+    writer = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-write")
+    fielder = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fields")
+    wslots = threading.BoundedSemaphore(2)     # at most two finished units waiting for the writer
+    busy, pend, lock = set(), [], threading.Lock()
+    fpool = TG.field_pool(jobs) if jobs > 1 else None
+    pre = {}                                    # (lo, job) -> future of the reader's inputs
+
+    clock = threading.Lock()                    # the shard cache is not thread-safe: one caller at a time
+
+    def need(lo, job):
+        """What the reader prepares for a unit: its shards always, and a teacher unit's CT as well."""
+        with clock:
+            if lo not in keys:
+                keys[lo] = cache.fetch_region(np.array(lo, np.int64), ctx=cfg.ctx, patch=cfg.patch,
+                                              region=cfg.region)
+        if job == "teacher" and bank is not None:
+            return bank.read(ct_local, lo, region_size(pyr, lo, cfg.region), pyr=pyr)
+        return None
+
+    def prefetch(lo, job):
+        if (lo, job) not in pre:
+            pre[(lo, job)] = reader.submit(need, lo, job)
+
+    def settle():
+        """Raise a background failure here, on the producer's own thread, and forget finished work."""
+        with lock:
+            done = [f for f in pend if f.done()]
+            for f in done:
+                pend.remove(f)
+        for f in done:
+            f.result()
+
+    def finish(kind, lo, round_, t0, rows, attrs, pooled=None, extra=None):
+        try:
+            write_rows(out, lo, rows, cfg, round_, attrs)
+            if pooled is not None or (kind == "self" and rows):
+                feed_coarse_once(out, lo, round_, rows[0][1], shape2, pooled=pooled)
+            jlog(out, "produce", {"kind": kind, "region": list(lo), "round": round_,
+                                  "s": round(time.time() - t0, 2), **(extra or {})})
+        finally:
+            with lock:
+                busy.discard(lo)
+            wslots.release()
+
+    def fields(lo, round_, t0, cursor):
+        try:
+            TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs, pool=fpool)
+            jlog(out, "produce", {"kind": "fields", "region": list(lo), "round": round_,
+                                  "s": round(time.time() - t0, 2), "cursor": cursor})
+        finally:
+            with lock:
+                busy.discard(lo)
+
     try:
         while not stopping():
+            settle()
             st = read_state(out)
             round_ = int(st.get("round", 0))
             verso_on = bool(st.get("verso_on", False))
@@ -597,69 +702,103 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 continue
 
             cat = RG.Catalog(out, round_, ttl=1.0)
-            window = _window(route, pos, cursor, L, held)
+            units = []
+            for lo in _window(route, pos, cursor, L, held):
+                with lock:
+                    if lo in busy:
+                        continue
+                if region_size(pyr, lo, cfg.region) is None:
+                    continue
+                job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs)
+                if job is not None:
+                    units.append((lo, job))
+            gpu_units = [u for u in units if u[1] != "fields"]
             did = False
-            for lo in window:
+            for lo, job in units:               # the CPU units go straight to their own pool
+                if job == "fields" and not stopping():
+                    with lock:
+                        busy.add(lo)
+                    with lock:
+                        pend.append(fielder.submit(fields, lo, round_, time.time(), cursor))
+                    did = True
+            if gpu_units:
+                prefetch(*gpu_units[0])
+            for i, (lo, job) in enumerate(gpu_units):
                 if stopping():
                     break
                 size = region_size(pyr, lo, cfg.region)
-                if size is None:
-                    continue
-                job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs)
-                if job is None:
-                    continue
-                did = True
+                if job == "teacher" and bank is None:
+                    bank = TeacherBank(cfg, out, device=device, backend=backend)
+                    pre.pop((lo, job), None)        # read before the bank existed: no CT in it
+                if job in ("verso", "self") and slot.get() is None:
+                    break
                 t0 = time.time()
-                # stamped per UNIT, not per window: a window is L regions of minutes each, and a
-                # heartbeat per window read as a dead producer to the supervisor within one window
                 _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "job": job,
                                  "region": list(lo), "last_ts": t0, "L": L, "cursor": cursor})
-                if lo not in keys:
-                    keys[lo] = cache.fetch_region(np.array(lo, np.int64), ctx=cfg.ctx,
-                                                  patch=cfg.patch, region=cfg.region)
-                if job == "teacher":
-                    if bank is None:
-                        bank = TeacherBank(cfg, out, device=device, backend=backend)
-                    p, rw, attrs = bank.probs(ct_local, lo, size)
-                    write_rows(out, lo, [("recto", stores.u8(p), 8, "prob_u8"),
-                                         ("rw", stores.u8(rw), 8, "prob_u8")], cfg, round_, attrs)
-                    feed_coarse_once(out, lo, round_, stores.u8(p), shape2)
-                elif job in ("verso", "self"):
-                    stu = slot.get()
-                    if stu is None:
-                        did = False
-                        break
-                    heads = "verso" if job == "verso" else "all"
-                    sign = -1.0 if job == "verso" else 1.0
-                    want = [str(stu.layout.channels[0])] if heads == "verso" else "all"
-                    planes = _student_planes(stu, ct_local, ax, lo, size, sign, want, meta5, pyr)
-                    attrs = {"producer": "student", "ckpt": stu.ckpt, "step": int(stu.step),
-                             "radial_sign": int(sign), "window": int(stu.cfg.infer_window),
-                             "halo": int(stu.cfg.infer_halo),
-                             "cascade_depth": int(stu.cfg.cascade_depth),
-                             "temps": {str(k): float(v) for k, v in stu.temps.items()}}
-                    rows = student_rows(planes, stu.layout, heads)
-                    write_rows(out, lo, rows, cfg, round_, attrs)
-                    if heads == "all":
-                        feed_coarse_once(out, lo, round_, rows[0][1], shape2)
-                elif job == "fields":
-                    TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs)
-                jlog(out, "produce", {"kind": job, "region": list(lo), "round": round_,
-                                      "s": round(time.time() - t0, 2), "L": L,
-                                      "cursor": cursor, **_vram()})
-                _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs)
+                prefetch(lo, job)
+                got = pre.pop((lo, job)).result()
+                t_in = time.time() - t0
+                if i + 1 < len(gpu_units):
+                    prefetch(*gpu_units[i + 1])    # the next unit's read overlaps this unit's pass
+                wslots.acquire()                    # backpressure: never more than two units unwritten
+                with lock:
+                    busy.add(lo)
+                try:
+                    t1 = time.time()
+                    if job == "teacher":
+                        P, W, attrs = bank.probs_u8(ct_local, lo, size, rois=got)
+                        pooled = RG.pool_chain(P, RG.COARSE_RUNGS)
+                        rows = [("recto", P.cpu().numpy(), 8, "prob_u8"),
+                                ("rw", W.cpu().numpy(), 8, "prob_u8")]
+                        del P, W
+                    else:
+                        stu = slot.get()
+                        heads = "verso" if job == "verso" else "all"
+                        sign = -1.0 if job == "verso" else 1.0
+                        want = [str(stu.layout.channels[0])] if heads == "verso" else "all"
+                        planes = _student_planes(stu, ct_local, ax, lo, size, sign, want, meta5, pyr)
+                        attrs = {"producer": "student", "ckpt": stu.ckpt, "step": int(stu.step),
+                                 "radial_sign": int(sign), "window": int(stu.cfg.infer_window),
+                                 "halo": int(stu.cfg.infer_halo),
+                                 "cascade_depth": int(stu.cfg.cascade_depth),
+                                 "temps": {str(k): float(v) for k, v in stu.temps.items()}}
+                        rows = student_rows_t(planes, stu.layout, heads)
+                        del planes
+                        pooled = None
+                    t_gpu = time.time() - t1
+                    extra = {"L": L, "cursor": cursor, "read_wait_s": round(t_in, 2),
+                             "gpu_s": round(t_gpu, 2), **_vram()}
+                    with lock:
+                        pend.append(writer.submit(finish, job, lo, round_, t0, rows, attrs,
+                                                  pooled, extra))
+                except BaseException:
+                    with lock:
+                        busy.discard(lo)
+                    wslots.release()
+                    raise
+                did = True
+                with clock:
+                    _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs)
+            for k in [k for k in pre if k not in gpu_units]:
+                pre.pop(k)                          # a read for a unit this pass no longer wants
             if not did:
-                _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs)
+                with clock:
+                    _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs)
                 time.sleep(IDLE_S)
-                if read_phase(out, "") == "produce":
+                if read_phase(out, "") == "produce" and not busy:
                     write_phase(out, "train")     # the window is drained: give the card back
     finally:
+        for ex in (reader, writer, fielder):
+            ex.shutdown(wait=True)
+        if fpool is not None:
+            fpool.shutdown(wait=True)
         try:
             cache.close()
         except Exception:  # noqa: BLE001
             pass
         _write_json(hb, {"pid": os.getpid(), "phase": "exit", "last_ts": time.time()})
         jlog(out, "produce", {"kind": "exit", "pid": os.getpid()})
+    settle()
     return 0
 
 
@@ -675,7 +814,8 @@ def _vram():
 
 def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr):
     from rvsm import infer
-    return infer.student_region(stu, ct, ax, lo, size, sign=sign, heads=want, meta=meta5, pyr=pyr)
+    return infer.student_region(stu, ct, ax, lo, size, sign=sign, heads=want, meta=meta5, pyr=pyr,
+                                as_tensor=True)
 
 
 def _window(route, pos, cursor, L, held):
