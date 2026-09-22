@@ -238,3 +238,51 @@ def synth_run(region_cfg, ct_origin, umbilicus, has_volcomp):
         los.append(tuple(int(v) for v in lo))
     yield types.SimpleNamespace(cfg=cfg, root=root, ax=ax, pyr=pyr, regions=recs, two=two, lo=los)
     RG.clear_pool()
+
+
+# ============================================================================================
+# Fixtures for the loss / augmentation / calibration / distance-target / evaluation modules.
+# (Appended for rvsm/losses.py, aug.py, calib.py, targets.py, evalsurf.py and their tests.)
+# ============================================================================================
+
+@pytest.fixture
+def slab_region(tmp_path, volcomp_lib):
+    """A builder for the region stores `rvsm.targets` reads: two parallel sheets perpendicular to x.
+
+    The umbilicus is put far away in -x by default, so the radial direction is +x everywhere in the
+    region and the geometry is exactly one-dimensional: the recto face sits at `recto_x` and the verso
+    face, one sheet thickness further IN, at `verso_x`. Then, for a voxel at x,
+
+        d_recto = x - recto_x     d_verso = x - verso_x
+        midline = x - (recto_x + verso_x) / 2        thickness = recto_x - verso_x
+
+    which is what the tests assert against, code by code. `axis_yx` inside the region instead puts every
+    voxel within the excluded radius of the axis, which is how the near-axis weight-0 rule is tested.
+
+    Returns a namespace with `.root` (a run directory holding `stores/round_0/{recto,verso}/...`),
+    `.lo`, `.ax` (3, N) control points in rung-2 voxels, and the geometry it was built with."""
+    import types
+
+    import numpy as np
+
+    from rvsm import stores
+
+    def build(name="r", n=128, recto_x=80, verso_x=70, half=1, verso=True,
+              axis_yx=(64.0, -1000.0), lo=(0, 0, 0), round_=0):
+        root = str(tmp_path / name)
+        x = np.arange(n)[None, None, :]
+        rec = np.where(np.abs(x - recto_x) <= half, np.uint8(255), np.uint8(0))
+        rec = np.broadcast_to(rec, (n, n, n)).astype(np.uint8)
+        stores.write(stores.store_path(root, "recto", lo, round_), rec, lo, rung=2,
+                     channels=("recto",), q=8)
+        if verso:
+            v = np.where(np.abs(x - verso_x) <= half, np.uint8(255), np.uint8(0))
+            stores.write(stores.store_path(root, "verso", lo, round_),
+                         np.broadcast_to(v, (n, n, n)).astype(np.uint8), lo, rung=2,
+                         channels=("verso",), q=8)
+        zs = np.arange(0, n + 1, 16, dtype=np.float64)
+        ax = np.stack([zs, np.full_like(zs, float(axis_yx[0])), np.full_like(zs, float(axis_yx[1]))])
+        return types.SimpleNamespace(root=root, lo=tuple(lo), ax=ax, n=n, recto_x=recto_x,
+                                     verso_x=verso_x, round_=round_)
+
+    return build
