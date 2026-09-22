@@ -403,12 +403,13 @@ class _Phases:
 
     def __init__(self, dev, on):
         self.on = bool(on)
-        self.dev, self.acc, self.n, self.t = dev, {}, 0, None
+        self.dev, self.acc, self.n, self.t, self.peak = dev, {}, 0, None, {}
 
     def start(self):
         if self.on:
             if self.dev.type == "cuda":
                 torch.cuda.synchronize(self.dev)
+                torch.cuda.reset_peak_memory_stats(self.dev)
             self.t = time.perf_counter()
 
     def mark(self, name):
@@ -416,6 +417,9 @@ class _Phases:
             return
         if self.dev.type == "cuda":
             torch.cuda.synchronize(self.dev)
+            pk = torch.cuda.max_memory_allocated(self.dev) / 2 ** 30
+            self.peak[name] = max(self.peak.get(name, 0.0), pk)   # GB high-water within this phase
+            torch.cuda.reset_peak_memory_stats(self.dev)
         now = time.perf_counter()
         self.acc[name] = self.acc.get(name, 0.0) + (now - self.t) * 1e3
         self.t = now
@@ -426,8 +430,9 @@ class _Phases:
     def take(self):
         if not self.on or not self.n:
             return {}
-        out = {"ms": {k: round(v / self.n, 1) for k, v in self.acc.items()}}
-        self.acc, self.n = {}, 0
+        out = {"ms": {k: round(v / self.n, 1) for k, v in self.acc.items()},
+               "peak_gb": {k: round(v, 2) for k, v in self.peak.items()}}
+        self.acc, self.n, self.peak = {}, 0, {}
         return out
 
 
