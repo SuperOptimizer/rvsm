@@ -1162,7 +1162,9 @@ def setup(cfg, out=None):
 
     mirror = stream.ShardCache(cfg.ct, out, budget_gb=cfg.cache_gb, seed=cfg.ct_seed or None)
     try:
-        mirror.meta()
+        # the coarse levels WHOLE, not just the metadata: the occupancy below reads one of them, and a
+        # remote level whose shards are not here yet reads as air -- a fresh run on a URL found 0 regions
+        mirror.pin_small_levels()
         ct_local = mirror.base
     finally:
         mirror.close()

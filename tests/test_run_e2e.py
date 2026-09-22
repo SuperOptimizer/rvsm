@@ -382,3 +382,15 @@ def test_a_config_of_defaults_is_still_a_config(tmp_path):
     got = CFG.load(write_toml(cfg, tmp_path / "c.toml"))
     assert got.fingerprint() == cfg.fingerprint()
     assert asdict(got) == asdict(cfg)
+
+
+def test_setup_on_a_url_finds_the_regions(small_cfg, ct_origin, tmp_path):
+    """A fresh run on a CT URL: the occupancy must be read from shards that are THERE. setup used to
+    fetch only the metadata, read the occupancy level as air and freeze a run with zero regions and no
+    held-out set."""
+    from dataclasses import replace
+    cfg = replace(small_cfg, ct=ct_origin.url, out=str(tmp_path / "url_run"))
+    ctx = RUN.setup(cfg, cfg.out)
+    ref = RUN.setup(replace(small_cfg, out=str(tmp_path / "path_run")), str(tmp_path / "path_run"))
+    assert len(ctx["records"]) == len(ref["records"]) > 0
+    assert len(ctx["heldout"]) == len(ref["heldout"]) > 0
