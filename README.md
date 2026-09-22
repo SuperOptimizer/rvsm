@@ -24,7 +24,7 @@ rvsm ladder   cfg.toml --sizes 15m,30m6,60m
 rvsm status | stop | ledger --rebuild | umbilicus --ct URL --out umbilicus.json
 ```
 
-Only the skeleton is in place so far (`rvsm.config`, `rvsm.ladder`, `rvsm.axis`, `rvsm.scanmeta`); the
+Status: commits 1-3 of the plan plus the pure ports are on main; the trainer, student inference, driver, pretraining and ladder are landing (see docs/plan.md for the progress table).
 subcommands land with the modules that drive them.
 
 ## Documentation
