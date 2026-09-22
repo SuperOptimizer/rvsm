@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# rvsm
+.venv/
+uv.lock
+out/
+*.zarr/
+*.pt
+*.plan
+*.onnx

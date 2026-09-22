@@ -1,0 +1,114 @@
+{
+ "zarr_export": {
+  "target_window_f32_min": -0.04,
+  "target_window_f32_max": 0.22,
+  "window_u16_min": 2725,
+  "window_u16_max": 47214,
+  "z_crop_start": 1528,
+  "z_crop_end": 75783,
+  "workflow_name": "export-2-4um-pherc-paris4-997fe6",
+  "workflow_creation": "2026-04-11T13:47:26Z"
+ },
+ "masking": {
+  "method": "SAM2",
+  "sam2_checkpoint": "/recon/models/masking/sam2-checkpoints/sam2.1_hiera_tiny.pt",
+  "sam2_model_cfg": "configs/sam2.1/sam2.1_hiera_t",
+  "finetuned_weights": "/recon/models/masking/sam2-checkpoints/scrollmask_august_t_4000.torch",
+  "dilation_structure": "5",
+  "dilation_iterations": "1",
+  "mask_scale": 16
+ },
+ "scan": {
+  "tomo": {
+   "acquisition": {
+    "scanRadix": "2.4um_PHerc-Paris4_B_HA",
+    "scanType": "helical",
+    "nb_scans": 36,
+    "start_date": "2026-03-10T18:08:40.173143+01:00",
+    "end_date": "2026-03-11T03:49:14.762511+01:00",
+    "beamline": "bm18",
+    "machineMode": "16 bunch",
+    "machineCurrentStart": 87.560084,
+    "machineCurrentStop": 76.62,
+    "sampleDetectorDistance": 220.0,
+    "sourceSampleDistance": 178000.0,
+    "xray_magnification": 1.001236,
+    "energy": 78.0,
+    "scanRange": 360.0,
+    "rotationMode": "continuous",
+    "half_acquisition": false,
+    "tomo_N": 49000,
+    "ref_N": 401,
+    "dark_N": 400,
+    "z_start": -355.0,
+    "z_end": -175.9792,
+    "z_step": 5.115,
+    "detector": {
+     "sensor": "Pco",
+     "sensorPixelSize": 0.0046,
+     "roi_size": "[4416, 2368]",
+     "sensorBinning": 1,
+     "opticsName": "Fixed_X2",
+     "opticsType": "FixedmagOptic",
+     "optical_magnification": 2.0,
+     "samplePixelSize": 0.0024,
+     "scintillator": "GAGG_50um_refl"
+    },
+    "acq_mode": "SINGLE",
+    "expo_time": 0.017,
+    "subframe": 0.017,
+    "latency_time": 0.0017,
+    "accumulation": 1,
+    "scan_time": 936.729806,
+    "scan_time_total": 34834.589368,
+    "comment": "wba11 = sapphire 5.0mm, wba14 = Au 0.10mm, wba22 = sapphire 15mm rods  3x5mm"
+   },
+   "processing": {
+    "general": {
+     "WorkFlowScheme": "nabu",
+     "BlissFirstScan": "/gpfs/gb/data/visitor/in1215/bm18/20260311/RAW_DATA/2.4um_PHerc-Paris4_B_TA3/2.4um_PHerc-Paris4_B_TA3_0001/2.4um_PHerc-Paris4_B_TA3_0001.h5",
+     "BlissLastScan": "/gpfs/gb/data/visitor/in1215/bm18/20260311/RAW_DATA/2.4um_PHerc-Paris4_B_TA3/2.4um_PHerc-Paris4_B_TA3_0001/2.4um_PHerc-Paris4_B_TA3_0001.h5",
+     "FlatField": "Standard",
+     "DoubleFlatsScheme": false,
+     "DetectorDistortionCorrection": true,
+     "LutPathScheme": false,
+     "AutoCorrectZTranslations": false
+    },
+    "preprocessing": {
+     "DetectorDistortionCorrection": {
+      "MapXzPathPar": "/gpfs/jazzy/data/bm18/inhouse/PAUL/OPTICS/2xOtus/260310_bi10_dist-map/test_nonrectified/mapfromslit_2368_4416.h5"
+     },
+     "phase": {
+      "method": "Paganin",
+      "delta_beta": 1000.0,
+      "unsharp_coeff": 4.0,
+      "unsharp_sigma": 1.2,
+      "unsharp_method": "gaussian",
+      "padding_type": "edge"
+     }
+    },
+    "reconstruction": {
+     "method": "GHBP",
+     "prefix": "2.4um_PHerc-Paris4_B_TA3_0001",
+     "rotation_axis_position": "16345.875"
+    },
+    "postprocessing": {
+     "32BitsConversion": {
+      "dataset_used_min": -0.055924028158187866,
+      "dataset_used_max": 0.32707345485687256
+     }
+    },
+    "32bitsData": {
+     "histogram": {
+      "min": -0.3480614423751831,
+      "max": 4.913288116455078,
+      "min_0p002_percentile": -0.01706598699092865,
+      "max_0p998_percentile": 0.13065475225448608,
+      "min_0p00001_percentile": -0.055924028158187866,
+      "max_0p99999_percentile": 0.32707345485687256
+     }
+    }
+   }
+  }
+ }
+}

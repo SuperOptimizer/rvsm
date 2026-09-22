@@ -1,0 +1,42 @@
+[project]
+name = "rvsm"
+version = "0.1.0"
+description = "Recto/Verso Surface Model: raw CT + umbilicus in, a self-distilled multi-rung surface model out, on one machine"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.4",
+    "numpy>=2",
+    "zarr>=3",
+    "aiohttp>=3.9",
+    "scipy>=1.13",
+    "pillow>=10",
+    "volcomp-zarr @ git+https://github.com/SuperOptimizer/volume-compressor#subdirectory=python",
+]
+
+[project.optional-dependencies]
+mesh = ["scikit-image>=0.24", "tifffile>=2024"]  # marching cubes + the published tifxyz surfaces
+trt = ["tensorrt", "onnx"]                        # the teacher engines (fallback: torch bf16)
+dev = ["pytest>=8"]
+
+[project.scripts]
+rvsm = "rvsm.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["rvsm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+index-url = "https://download.pytorch.org/whl/cu130"
+extra-index-url = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"
