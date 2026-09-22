@@ -18,6 +18,8 @@ and defining it here is what breaks usrm2's prep -> train import cycle.
 """
 import contextlib
 
+import time
+
 import torch
 
 from rvsm import ladder, model as M
@@ -215,12 +217,23 @@ class Cascade:
         # the largest single cost of a training step on the A100). `net` stays the module whose
         # state_dict `sync` copies the EMA into: a compiled wrapper renames every key.
         self.fwd = fwd
+        self.clock, self._ms = False, {}   # RVSM_PROFILE: ms spent in the self / mask sources
         self.gen = None if seed is None else torch.Generator().manual_seed(int(seed))
         # (B,) 1 where the last `channel()` call took the SELF source for that sample. The cascade
         # self-consistency loss scores ONLY those: the `mask` source is the coarse TARGET, so a
         # consistency term against it would be a second, blurrier copy of the supervised loss, and a
         # dropped channel is all zeros.
         self.last_self = None
+
+    def _tick(self, name, t0):
+        if self.clock:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._ms[name] = self._ms.get(name, 0.0) + (time.perf_counter() - t0) * 1e3
+
+    def take_clock(self):
+        d, self._ms = {f"  of which cascade_{k}": v for k, v in self._ms.items()}, {}
+        return d
 
     @property
     def on(self):
@@ -313,8 +326,12 @@ class Cascade:
             if self.mode == "self" or (self.mode == "mix" and float(self._rand()) < self.self_p):
                 assert self.net is not None and b.get("cx") is not None, \
                     "cascade self mode needs a net and the tenth context cube"
+                t0 = time.perf_counter()
                 out[i:i + 1] = self._self(b, i, dev, dtype, S)
+                self._tick("self", t0)
                 sel[i] = 1
             else:
+                t0 = time.perf_counter()
                 out[i:i + 1] = self._mask(b, i, dev, dtype, S)
+                self._tick("mask", t0)
         return out

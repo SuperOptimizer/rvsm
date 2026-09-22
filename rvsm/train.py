@@ -399,6 +399,46 @@ def _prepared(grid, dev, layout, cascade=None):
         yield x.to(memory_format=M.memfmt()), t, w, _rungs_of(b)[0]
 
 
+def to_device_iter(src, dev, side=True):
+    """Batches from `src` with every tensor already on `dev`: batch i+1 is copied (non_blocking) on a
+    SIDE stream while the caller runs step i on the default stream, and the default stream waits on
+    that copy's event before it touches the batch. On a GPU whose host link is slow (Thunder's A100:
+    2.7 GB/s, ~110 ms for one 256^3 sample's ~300 MB of uint8) the copy then hides under the step.
+    `side=False` copies on the default stream (the fallback if a host misbehaves with extra streams)."""
+    if dev.type != "cuda":
+        yield from src
+        return
+    stream = torch.cuda.Stream(dev) if side else None
+
+    def ship(item):
+        b = _batch(item)
+        if stream is None:
+            return {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}, None
+        with torch.cuda.stream(stream):
+            d = {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
+            ev = torch.cuda.Event()
+            ev.record(stream)
+        return d, ev
+
+    it = iter(src)
+    try:
+        nxt = ship(next(it))
+    except StopIteration:
+        return
+    while nxt is not None:
+        cur, ev = nxt
+        try:
+            nxt = ship(next(it))
+        except StopIteration:
+            nxt = None
+        if ev is not None:
+            torch.cuda.current_stream(dev).wait_event(ev)
+            for v in cur.values():
+                if torch.is_tensor(v) and v.is_cuda:
+                    v.record_stream(torch.cuda.current_stream(dev))
+        yield cur
+
+
 class _Phases:
     """Per-phase milliseconds of a training step, for `RVSM_PROFILE=1` only: every mark synchronises the
     device, which costs throughput, so it is off in production. `mark(name)` closes the phase that
@@ -426,6 +466,11 @@ class _Phases:
         now = time.perf_counter()
         self.acc[name] = self.acc.get(name, 0.0) + (now - self.t) * 1e3
         self.t = now
+
+    def note(self, d):
+        """Add externally timed pieces (ms) that sit INSIDE a phase (the cascade's own clock)."""
+        for k, v in (d or {}).items():
+            self.acc[k] = self.acc.get(k, 0.0) + float(v)
 
     def step(self):
         self.n += 1
@@ -567,6 +612,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     ph = _Phases(dev, os.environ.get("RVSM_PROFILE", "") not in ("", "0"))
     t0, micro, rung_n, wait_s = time.time(), 0, {}, 0.0
     src = patches_factory() if patches_factory is not None else iter(())
+    src = to_device_iter(src, dev, side=bool(getattr(cfg, "gpu_prefetch", True)))
     loss = bce = dice = None
     reg_log, aux_log = {}, {}
     nvox = 0
@@ -577,6 +623,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         wait_s += time.time() - tw
         ph.start()
         b = _batch(item)
+        ph.mark("h2d_wait")
         ks = _rungs_of(b)
         for r in ks:
             rung_n[r] = rung_n.get(r, 0) + 1
@@ -584,8 +631,10 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             cas.sync(ema)   # the self-mode coarse pass always runs on the current EMA weights
             a0, a1 = float(cfg.self_p_lo), float(cfg.self_p_hi)
             cas.self_p = a0 + (a1 - a0) * min(step / max(nsteps, 1), 1.0)
+        cas.clock = ph.on
         ct, tg, wt = prep.prepare(b, dev, cascade=cas, layout=layout)
         ph.mark("prepare+cascade")
+        ph.note(cas.take_clock())
         casch = ct[:, layout.i_cas:layout.i_cas + 1].detach().clone() if cas.on else None
         # the weights ride along as extra target channels, so the geometric augs transform them
         # identically to the fields they weigh
