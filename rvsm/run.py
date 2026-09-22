@@ -82,7 +82,9 @@ from rvsm import config as CFG
 STOP_FILE = "STOP"
 PHASE_FILE = "PHASE"
 HEARTBEAT_S = 30.0          # how often the supervisor stamps workers.json / logs/sched.jsonl
-SILENT_MAX_S = 600.0        # a producer that has not stamped its heartbeat for this long is restarted
+SILENT_MAX_S = 1800.0       # a producer that has not stamped its heartbeat for this long is restarted
+                            # (it stamps once per unit; one teacher region with its first engine
+                            # builds is ~10 min on an A100, so the margin is 3x that)
 WAIT_S = 5.0                # the trainer's sleep when nothing in the lookahead window is ready
 IDLE_S = 2.0                # the producer's sleep when there is nothing to produce
 ROUND_GAIN = 0.02           # "< 2 % remaining gain" is the plateau half of the round gate
@@ -608,6 +610,10 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     continue
                 did = True
                 t0 = time.time()
+                # stamped per UNIT, not per window: a window is L regions of minutes each, and a
+                # heartbeat per window read as a dead producer to the supervisor within one window
+                _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "job": job,
+                                 "region": list(lo), "last_ts": t0, "L": L, "cursor": cursor})
                 if lo not in keys:
                     keys[lo] = cache.fetch_region(np.array(lo, np.int64), ctx=cfg.ctx,
                                                   patch=cfg.patch, region=cfg.region)
