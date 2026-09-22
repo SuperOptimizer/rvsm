@@ -31,8 +31,9 @@ Citations: `§n` = `/home/forrest/usrm2/docs/unified_design.md`; `research/<file
 | `tifxyz` | `""` | human meshes are **optional** and eval-only, by user decision | plan Context |
 | `teacher_ckpts` | `{}` | teacher weights come from **local paths in the config**, by user decision — no registry lookup, no download at train time | plan Context |
 | `cache_gb` | `64.0` | the CT shard cache budget; region mode fetches 1.37 bytes per training voxel at a 0.98 hit rate, so tens of GB is many hours of training | `usrm2-streaming.md`; §16 |
+| `ct_seed` | `""` | a local, possibly partial mirror of a URL `ct`: shards it has are hard-linked into the cache (eviction removes only the link), a gap in a level its `mirror.json` marks complete is absent without a request, and only real gaps go to the origin. On tnr-0 the Paris 4 mirror has levels 1-9 complete and level 0 at 501 of 76,800 shards, so a region costs one level-0 GET. Outside the fingerprint: it changes where bytes come from, not what they are | 2026-09-22 |
 
-`FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds")` — a resume may be longer, may
+`FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_seed", "ckpt_act", "compile")` — a resume may be longer, may
 evaluate at a different cadence, and may run on different hardware; everything else must match, which is
 usrm2's `grow` tuple made explicit (§26.2).
 

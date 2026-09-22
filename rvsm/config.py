@@ -150,7 +150,7 @@ RUNG_ITEM_KEYS = ("ct", "tgt", "w", "lo", "cyx", "sym", "rung", "norm", "cm", "c
                   "rmax", "meta")
 
 # Fields a resume is allowed to differ in: a longer run, a different eval cadence, different hardware.
-FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_seed")
+FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_seed", "ckpt_act", "compile")
 
 
 @dataclass
@@ -173,6 +173,7 @@ class Config:
     cache_gb: float = 64.0             # CT shard cache budget on disk/RAM
     ct_seed: str = ""                  # a local, possibly partial mirror of a URL `ct`: shards it has are
                                        # hard-linked into the cache instead of fetched
+# (ckpt_act and compile are in FINGERPRINT_EXCLUDE: they change the speed and the memory, never the math)
 
     # ------------------------------------------------------------------ fixed recipe: the ladder
     ctx: tuple = (1, 2, 3, 4, 5, 6, 7, 8, 9)   # context cube offsets, in rungs above the sample's own
