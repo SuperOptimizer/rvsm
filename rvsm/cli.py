@@ -16,10 +16,11 @@ USAGE = """rvsm <command> [options]
   pretrain   cfg.toml [--steps N]
   ladder     cfg.toml --sizes 15m,30m6,60m
   status | stop | ledger --rebuild | umbilicus --ct URL --out umbilicus.json
+  teachers   fetch [recto,m7] [--cache DIR] [--extras]
 """
 
 COMMANDS = ("run", "produce", "train", "eval", "export", "calibrate", "pretrain", "ladder",
-            "status", "stop", "ledger", "umbilicus")
+            "status", "stop", "ledger", "umbilicus", "teachers")
 
 
 def main(argv=None):
@@ -36,9 +37,6 @@ def main(argv=None):
     print(USAGE, end="")
     return 0 if not argv else 2
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 # --------------------------------------------------------------------------- #
@@ -77,7 +75,8 @@ def produce(argv):
     """The `produce` subcommand. Returns a process exit code."""
     import numpy as np
 
-    from rvsm import infer, ladder, stores, teachers
+    from rvsm import infer, ladder, stores
+    from rvsm import teachers as T
 
     f = _flags(argv)
     if "help" in f or "h" in f or not f:
@@ -115,14 +114,19 @@ def produce(argv):
                          f"(rung-2 shape {tuple(int(v) for v in shape)})")
     size3 = tuple(int(v) for v in n)
 
-    probs, win, hal = {}, {}, {}
+    probs, win, hal, ckpts = {}, {}, {}, {}
     for nm in names:
-        if nm not in teachers.TEACHERS:
-            raise SystemExit(f"rvsm produce: unknown teacher {nm!r} (have {sorted(teachers.TEACHERS)})")
-        spec = teachers.TEACHERS[nm]
+        if nm not in T.TEACHERS:
+            raise SystemExit(f"rvsm produce: unknown teacher {nm!r} (have {sorted(T.TEACHERS)})")
+        spec = T.TEACHERS[nm]
         ckpt = one(f"ckpt-{nm}", one("ckpt", None))
         if not ckpt:
-            raise SystemExit(f"rvsm produce: --ckpt-{nm} PATH is required for teacher {nm!r}")
+            # No explicit checkpoint: use (and, the first time, fill) the weights cache. A teacher with
+            # no published URL -- the tests' `fake` -- has to be pointed at its file.
+            if not spec.url:
+                raise SystemExit(f"rvsm produce: --ckpt-{nm} PATH is required for teacher {nm!r} "
+                                 f"(it has no published weights to download)")
+            ckpt = T.fetch_weights(nm, cache_dir=one("cache", T.CACHE_DIR))
         w = int(one("window", spec.patch[0], int))
         h = int(one("halo", max(1, w // 8), int))
         print(f"[produce] {nm}: region {tuple(int(v) for v in lo)} size {size3} window {w} halo {h} "
@@ -130,7 +134,7 @@ def produce(argv):
         probs[nm] = infer.teacher_region(ct, lo, size3, spec, ckpt, device=device, backend=backend,
                                          tta=tta, window=w, halo=h,
                                          engine_dir=os.path.join(str(out), "ckpt", "trt"))
-        win[nm], hal[nm] = w, h
+        win[nm], hal[nm], ckpts[nm] = w, h, ckpt
 
     if len(probs) >= 2:
         a, b = names[0], names[1]
@@ -140,7 +144,7 @@ def produce(argv):
         rw = np.ones_like(p)
 
     attrs = {"producer": "teacher:" + ",".join(names), "round": int(round_),
-             "ckpt": {nm: str(one(f"ckpt-{nm}", one("ckpt", ""))) for nm in names},
+             "ckpt": {nm: str(ckpts[nm]) for nm in names},
              "window": {nm: int(win[nm]) for nm in names}, "halo": {nm: int(hal[nm]) for nm in names},
              "radial_sign": 1, "tta": int(tta), "backend": str(backend)}
     got = {}
@@ -151,4 +155,109 @@ def produce(argv):
                      volume=str(ct), umbilicus=str(umb), attrs=attrs)
         got[ch] = path
         print(f"[produce] wrote {path} {block.shape}", flush=True)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# `rvsm teachers`: the published weights
+# --------------------------------------------------------------------------- #
+TEACHERS_USAGE = """rvsm teachers fetch [recto,m7] [--cache DIR] [--extras]
+
+Downloads the round-0 teachers' published weights (Hugging Face, scrollprize) into the local cache
+(default ~/.cache/rvsm) and prints where they landed. A file already there is left alone, so this is
+safe to run before every run; `rvsm produce` calls the same cache when no --ckpt-<name> is given.
+`--extras` also fetches the companion files a teacher lists (m7's plans.json), which rvsm never reads:
+our port infers the architecture from the state dict's own shapes and pins the normaliser in the spec.
+"""
+
+
+def teachers(argv):
+    """The `teachers` subcommand: `fetch` today, and nothing else yet."""
+    from rvsm import teachers as T
+    argv = list(argv)
+    sub = argv[0] if argv and not str(argv[0]).startswith("--") else ""
+    if sub != "fetch":
+        print(TEACHERS_USAGE, end="")
+        return 0 if not argv else 2
+    rest = [str(a) for a in argv[1:]]
+    pos = rest[:next((i for i, a in enumerate(rest) if a.startswith("--")), len(rest))]
+    f = _flags(rest[len(pos):])
+    names = " ".join(pos).replace(",", " ").split() or [n for n, s in T.TEACHERS.items() if s.url]
+    cache = (f.get("cache") or [T.CACHE_DIR])[0]
+    for nm in names:
+        if nm not in T.TEACHERS:
+            raise SystemExit(f"rvsm teachers: unknown teacher {nm!r} (have {sorted(T.TEACHERS)})")
+        print(T.fetch_weights(nm, cache_dir=cache, extras="extras" in f))
+    return 0
+
+
+if __name__ == "__main__":       # kept LAST: `main` dispatches on the functions defined above it
+    raise SystemExit(main())
+
+
+# --------------------------------------------------------------------------- #
+# `rvsm train`: the trainer alone, on whatever stores already exist (commit 4)
+# --------------------------------------------------------------------------- #
+TRAIN_USAGE = """rvsm train cfg.toml [--out DIR] [--init CKPT] [--resume] [--steps N] [--device cuda]
+
+Trains the student on the region stores under `<out>/stores/round_<r>/`, with the held-out regions
+(`--heldout` of them, stratified by z and radius) kept out of the walk and used as the validation
+grid. Nothing is produced here: this is the trainer of `rvsm run` on its own, for a directory whose
+stores another process (or `rvsm produce`) has already written.
+
+  --out DIR     the run directory (default: the config's `out`)
+  --init CKPT   warm start from another run's weights (copied by tensor NAME; new slots start at zero)
+  --resume      continue `<out>/ckpt.pt`; the config fingerprint must match
+  --steps N     override the config's step budget
+"""
+
+
+def train(argv):
+    """The `train` subcommand. Returns a process exit code."""
+    import json
+
+    from rvsm import axis as AX, config as CFG, ladder, regions as RG, sample
+    from rvsm import train as TR
+
+    argv = list(argv)
+    pos = [a for a in argv if not str(a).startswith("--")]
+    # the positional config file is whatever comes before the first flag
+    cut = next((i for i, a in enumerate(argv) if str(a).startswith("--")), len(argv))
+    pos, f = argv[:cut], _flags(argv[cut:])
+    if "help" in f or "h" in f:
+        print(TRAIN_USAGE, end="")
+        return 0
+    over = {}
+    if f.get("out"):
+        over["out"] = str(f["out"][0])
+    if f.get("steps"):
+        over["steps"] = int(f["steps"][0])
+    cfg = CFG.load(str(pos[0]) if pos else None, overrides=over)
+    out = str(cfg.out)
+    os.makedirs(out, exist_ok=True)
+
+    # the round is whatever the run's own state says; a bare `rvsm train` on a fresh directory is round 0
+    round_ = 0
+    sp = os.path.join(out, "state.json")
+    if os.path.exists(sp):
+        with open(sp) as fh:
+            round_ = int(json.load(fh).get("round", 0))
+
+    pyr = ladder.rungs(cfg.ct)
+    ax = AX.load(cfg.umbilicus, ct=cfg.ct)
+    recs = RG.region_list(pyr, rungs=cfg.rungs, patch=cfg.patch, region=cfg.region,
+                          boost=cfg.rung_boost, occ_min_fine=cfg.occ_min_fine,
+                          occ_min_coarse=cfg.occ_min_coarse)
+    heldout = RG.held_out(recs, n=cfg.heldout, ax=ax)
+    print(f"[train] round {round_}: {len(recs)} region records, {len(heldout)} held out", flush=True)
+
+    def patches_factory():
+        ds = sample.Patches(cfg, root=out, ct=cfg.ct, ax=ax, round_=round_, heldout=heldout)
+        return sample.loader(ds, workers=cfg.workers, batch=cfg.batch)
+
+    val = sample.val_grid(cfg, heldout, root=out, ct=cfg.ct, ax=ax, round_=round_)
+    ck = TR.train(cfg, out=out, init=(f["init"][0] if f.get("init") else None),
+                  resume="resume" in f, patches_factory=patches_factory,
+                  device=(f["device"][0] if f.get("device") else None), val_items=val)
+    print(f"[train] wrote {ck}", flush=True)
     return 0

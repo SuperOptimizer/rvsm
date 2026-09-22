@@ -35,6 +35,9 @@ packages = ["rvsm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `slow` is the real-weights smoke: ~1.9 GB off Hugging Face. It skips itself unless RVSM_SLOW=1 or
+# the cache is already primed, so `pytest` stays a CPU-only, offline run.
+markers = ["slow: downloads or otherwise costs minutes (opt in with RVSM_SLOW=1)"]
 
 [tool.uv]
 index-url = "https://download.pytorch.org/whl/cu130"

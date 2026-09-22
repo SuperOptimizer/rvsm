@@ -421,3 +421,23 @@ def test_gpu_smoke_region(fake_net):
     assert tuple(p.shape) == (1, 64, 64, 64)
     q = p[0].cpu().numpy()
     assert np.all(q[ct == 0] == 0) and q.max() > 0
+
+
+def test_produce_falls_back_to_the_weights_cache(tmp_path, ct_origin, fake_teacher, monkeypatch,
+                                                 has_volcomp):
+    """With no --ckpt-<name>, `produce` takes the published weights out of the cache (fetching once)."""
+    if not has_volcomp:
+        pytest.skip("volcomp is required to write a store")
+    import dataclasses
+    teachers.register("fake", dataclasses.replace(fake_teacher.spec, url="https://hf.test/w.pth",
+                                                  file="w.pth"))
+    called = []
+    monkeypatch.setattr(teachers, "fetch_weights",
+                        lambda name, cache_dir=teachers.CACHE_DIR, **kw: (called.append((name, cache_dir))
+                                                                          or fake_teacher.ckpt))
+    out = str(tmp_path / "run")
+    rc = cli.main(["produce", "--out", out, "--ct", ct_origin.path, "--teacher", "fake",
+                   "--region", "0", "0", "0", "--size", "128", "--device", "cpu", "--halo", "4"])
+    assert rc == 0 and called == [("fake", teachers.CACHE_DIR)]
+    a = stores.open_store(stores.store_path(out, "recto", (0, 0, 0), 0))
+    assert a.attrs["ckpt"]["fake"] == fake_teacher.ckpt

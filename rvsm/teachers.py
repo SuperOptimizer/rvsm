@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
@@ -661,6 +662,9 @@ class TeacherSpec:
     target: str | None = None       # key of the VesuviusUNet output dict (None for nnunet)
     norm_type: str | None = None    # None -> infer from shapes / ckpt['norm_type']
     margin: int = 64                # level-`level` voxels of CT context read around a box
+    url: str = ""                   # where the published weights live (Hugging Face); "" = local only
+    file: str = ""                  # the name they are cached under
+    extra_urls: tuple = ()          # (url, filename) companions -- nnU-Net's plans.json, never needed
 
     def select(self, out):
         """Pick this teacher's logits from a model forward output."""
@@ -669,17 +673,26 @@ class TeacherSpec:
         return out
 
 
+_HF = "https://huggingface.co/scrollprize"
+
 # Only the two surface teachers of round 0: no ink, no fibers, no lasagna, and no encoder distillation.
 TEACHERS: dict = {
     "recto": TeacherSpec(
         name="recto", state_key="model", kind="vesuvius", patch=(256, 256, 256),
         normalizer=Normalizer("zscore_instance"), activation="softmax", fg_channel=1,
-        voxel_um=2.4, level=0, target="surface"),
+        voxel_um=2.4, level=0, target="surface",
+        url=f"{_HF}/surface_recto_3dunet/resolve/main/checkpoint_inference_ready.pth",
+        file="surface_recto_3dunet.pth"),
     # Trained at ~8 um: run on level 2 of a 2.4 um pyramid (9.6 um = rung 4) and upsample x4.
+    # `plans.json` is listed as a companion for the record only: the architecture comes out of the
+    # state dict's own shapes and the normaliser is pinned above, so nothing here ever reads it.
     "m7": TeacherSpec(
         name="m7", state_key="network_weights", kind="nnunet", patch=(192, 192, 192),
         normalizer=Normalizer("ct_clip", mean=87.54424285888672, std=47.74376678466797, lo=0.0, hi=212.0),
-        activation="softmax", fg_channel=1, voxel_um=9.6, level=2, target=None),
+        activation="softmax", fg_channel=1, voxel_um=9.6, level=2, target=None,
+        url=f"{_HF}/surface_m7_nnunet/resolve/main/fold_0/checkpoint_best.pth",
+        file="surface_m7_nnunet.pth",
+        extra_urls=((f"{_HF}/surface_m7_nnunet/resolve/main/plans.json", "surface_m7_nnunet.plans.json"),)),
 }
 
 
@@ -687,6 +700,73 @@ def register(name, spec):
     """Add (or replace) a teacher at runtime -- the tests' tiny `fake` network takes this door."""
     TEACHERS[str(name)] = spec
     return spec
+
+
+# --------------------------------------------------------------------------- #
+# The published weights
+# --------------------------------------------------------------------------- #
+CACHE_DIR = "~/.cache/rvsm"
+MIN_BYTES = 1 << 20   # anything smaller than a megabyte is an error page, not a teacher
+
+
+def _download(url, dest, log=print):
+    """Stream `url` to `dest` through `<dest>.part`, so an interrupted fetch is never mistaken for a
+    finished one, and check the result is plausibly a checkpoint before the rename."""
+    import urllib.request
+    part = str(dest) + ".part"
+    os.makedirs(os.path.dirname(str(dest)) or ".", exist_ok=True)
+    req = urllib.request.Request(str(url), headers={"User-Agent": "rvsm"})
+    t0, n = time.time(), 0
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:  # noqa: S310
+            total = int(r.headers.get("Content-Length") or 0) if hasattr(r, "headers") else 0
+            while True:
+                chunk = r.read(1 << 22)
+                if not chunk:
+                    break
+                f.write(chunk)
+                n += len(chunk)
+                if total and n % (1 << 26) < (1 << 22):
+                    log(f"[teachers] {os.path.basename(str(dest))}: {n >> 20}/{total >> 20} MiB")
+        if n < MIN_BYTES:
+            raise RuntimeError(f"{url}: {n} bytes is too small to be a checkpoint")
+        os.replace(part, str(dest))
+    except BaseException:
+        if os.path.exists(part):
+            os.remove(part)
+        raise
+    log(f"[teachers] fetched {dest} ({n >> 20} MiB in {time.time() - t0:.0f}s)")
+    return str(dest)
+
+
+def fetch_weights(name, cache_dir=CACHE_DIR, extras=False, log=print):
+    """The local path of teacher `name`'s published weights, downloading them once if need be.
+
+    The two round-0 teachers are public on Hugging Face, so a fresh machine needs nothing but this: no
+    manual copy off another host, no filename convention to get wrong. An existing file of a plausible
+    size is used as is (this is a cache, not a mirror: it is never re-verified against the remote), and
+    a download that dies part way leaves `<file>.part` removed rather than a truncated checkpoint that
+    would load with a confusing shape error.
+
+    `extras=True` also fetches the companions a spec lists (m7's `plans.json`). Nothing in rvsm reads
+    them -- the architecture is inferred from the state dict and the normaliser is pinned in the spec --
+    they are there for a human comparing our port against nnU-Net's own configuration."""
+    spec = TEACHERS[name]
+    if not spec.url:
+        raise ValueError(f"teacher {name!r} has no published weights: pass an explicit checkpoint path")
+    d = os.path.expanduser(str(cache_dir))
+    dest = os.path.join(d, spec.file or f"{name}.pth")
+    if extras:
+        for u, fn in spec.extra_urls:
+            p = os.path.join(d, fn)
+            if not os.path.exists(p):
+                _download(u, p, log=log)
+    if os.path.exists(dest):
+        if os.path.getsize(dest) >= MIN_BYTES:
+            return dest
+        os.remove(dest)   # a truncated or error-page "checkpoint" from an older run
+    log(f"[teachers] fetching {name} from {spec.url}")
+    return _download(spec.url, dest, log=log)
 
 
 def _extract_state(ckpt, state_key):
@@ -703,16 +783,17 @@ def _extract_state(ckpt, state_key):
     return strip_prefix(sd)
 
 
-def load_teacher(name, path, device="cpu", dtype=torch.float32):
+def load_teacher(name, path=None, device="cpu", dtype=torch.float32, cache_dir=CACHE_DIR):
     """Load a teacher checkpoint STRICTLY into our reimplementation (eval mode, no grad).
 
-    Unlike tsm's loader there is no models directory and no filename convention: rvsm takes the explicit
-    checkpoint path from the config, because a run must never depend on what happens to be in a cache.
+    `path` is the explicit checkpoint the config names -- a run must never depend on what happens to be
+    lying in a cache. With `path=None` the published weights are fetched (once) into `cache_dir`, which
+    is what makes a fresh machine a one-command affair.
     The checkpoint is memory-mapped, its weights copied into the freshly built network, and the
     checkpoint released before returning. Returns (module, spec) -- the spec may differ from the
     registered one where the checkpoint overrides it (`output_sigmoid`, `model_patch_size`)."""
     spec = TEACHERS[name]
-    path = os.fspath(path)
+    path = os.fspath(path) if path is not None else fetch_weights(name, cache_dir=cache_dir)
     if not os.path.exists(path):
         raise FileNotFoundError(f"teacher {name!r}: no checkpoint at {path}")
     ckpt = torch.load(path, map_location="cpu", mmap=True, weights_only=False)

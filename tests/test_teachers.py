@@ -5,6 +5,8 @@ published networks from a checkpoint ALONE, with no config file and no `vesuvius
 strictly. A silent key mismatch would be a teacher running with half its weights randomly initialised,
 which looks like a plausible probability field and is worthless.
 """
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -145,3 +147,148 @@ def test_load_teacher_unwraps_ema_and_prefixes(fake_teacher, tmp_path):
     torch.save({"model": {"model": {"module." + k: v for k, v in sd.items()}}}, p)
     net, _ = teachers.load_teacher("fake", p, device="cpu")
     assert isinstance(net, teachers.VesuviusUNet)
+
+
+# --------------------------------------------------------------------------- #
+# The published weights
+# --------------------------------------------------------------------------- #
+class _Resp:
+    """The bits of an `urlopen` response `_download` uses: a context manager, `.read(n)`, `.headers`."""
+
+    def __init__(self, blob):
+        self.blob, self.i, self.headers = blob, 0, {"Content-Length": str(len(blob))}
+
+    def read(self, n=-1):
+        b = self.blob[self.i:] if n is None or n < 0 else self.blob[self.i:self.i + n]
+        self.i += len(b)
+        return b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.fixture
+def hf(monkeypatch):
+    """A fake Hugging Face: `fetchme` is a teacher with a URL, and urlopen serves it from a dict."""
+    import types
+    import urllib.request
+    served, seen = {}, []
+    spec = teachers.TeacherSpec(
+        name="fetchme", state_key="model", kind="vesuvius", patch=(32,) * 3,
+        normalizer=teachers.Normalizer("zscore_instance"), activation="softmax", fg_channel=1,
+        voxel_um=2.4, target="surface", url="https://hf.test/w.pth", file="w.pth",
+        extra_urls=(("https://hf.test/plans.json", "plans.json"),))
+    teachers.register("fetchme", spec)
+
+    def urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        seen.append(url)
+        if url not in served:
+            raise OSError(f"404 {url}")
+        return _Resp(served[url])
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    try:
+        yield types.SimpleNamespace(served=served, seen=seen, spec=spec)
+    finally:
+        teachers.TEACHERS.pop("fetchme", None)
+
+
+def test_fetch_weights_downloads_once_and_renames(tmp_path, hf):
+    blob = b"x" * (2 << 20)
+    hf.served["https://hf.test/w.pth"] = blob
+    p = teachers.fetch_weights("fetchme", cache_dir=tmp_path, log=lambda *a: None)
+    assert p == str(tmp_path / "w.pth") and open(p, "rb").read() == blob
+    assert not os.path.exists(p + ".part")            # the partial name never survives
+    assert len(hf.seen) == 1
+    # a second call is a cache hit: no request at all
+    assert teachers.fetch_weights("fetchme", cache_dir=tmp_path, log=lambda *a: None) == p
+    assert len(hf.seen) == 1
+
+
+def test_fetch_weights_rejects_a_short_download(tmp_path, hf):
+    hf.served["https://hf.test/w.pth"] = b"<html>404</html>"   # an error page, not a checkpoint
+    with pytest.raises(RuntimeError, match="too small"):
+        teachers.fetch_weights("fetchme", cache_dir=tmp_path, log=lambda *a: None)
+    assert not list(tmp_path.iterdir())                        # and nothing is left behind
+
+
+def test_fetch_weights_replaces_a_truncated_cache_entry(tmp_path, hf):
+    (tmp_path / "w.pth").write_bytes(b"truncated")
+    hf.served["https://hf.test/w.pth"] = b"y" * (2 << 20)
+    p = teachers.fetch_weights("fetchme", cache_dir=tmp_path, log=lambda *a: None)
+    assert os.path.getsize(p) == 2 << 20
+
+
+def test_fetch_weights_extras(tmp_path, hf):
+    hf.served["https://hf.test/w.pth"] = b"z" * (2 << 20)
+    hf.served["https://hf.test/plans.json"] = b"{}" + b" " * (2 << 20)
+    teachers.fetch_weights("fetchme", cache_dir=tmp_path, extras=True, log=lambda *a: None)
+    assert (tmp_path / "plans.json").exists()         # fetched for a human, never read by rvsm
+    assert (tmp_path / "w.pth").exists()
+
+
+def test_a_teacher_without_a_url_says_so(tmp_path, fake_teacher):
+    with pytest.raises(ValueError, match="no published weights"):
+        teachers.fetch_weights("fake", cache_dir=tmp_path)
+
+
+def test_the_two_real_teachers_carry_their_hugging_face_urls():
+    for n, host in (("recto", "surface_recto_3dunet"), ("m7", "surface_m7_nnunet")):
+        s = teachers.TEACHERS[n]
+        assert s.url.startswith(f"https://huggingface.co/scrollprize/{host}/resolve/main/")
+        assert s.file.endswith(".pth")
+    assert teachers.TEACHERS["recto"].url.endswith("checkpoint_inference_ready.pth")
+    assert teachers.TEACHERS["m7"].url.endswith("fold_0/checkpoint_best.pth")
+    assert teachers.TEACHERS["m7"].extra_urls[0][0].endswith("plans.json")
+
+
+def test_load_teacher_falls_back_to_the_cache(monkeypatch, fake_teacher):
+    """`load_teacher(name)` with no path fetches the published weights (once)."""
+    called = []
+
+    def fake_fetch(name, cache_dir=teachers.CACHE_DIR, **kw):
+        called.append((name, cache_dir))
+        return fake_teacher.ckpt
+
+    monkeypatch.setattr(teachers, "fetch_weights", fake_fetch)
+    net, _ = teachers.load_teacher("fake", device="cpu")
+    assert isinstance(net, teachers.VesuviusUNet) and called == [("fake", teachers.CACHE_DIR)]
+
+
+# --------------------------------------------------------------------------- #
+# The real checkpoints (~1.9 GB): opt in with RVSM_SLOW=1, or free once they are cached
+# --------------------------------------------------------------------------- #
+def _cached(name):
+    s = teachers.TEACHERS[name]
+    p = os.path.join(os.path.expanduser(teachers.CACHE_DIR), s.file)
+    return os.path.exists(p) and os.path.getsize(p) >= teachers.MIN_BYTES
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.environ.get("RVSM_SLOW") and not (_cached("recto") and _cached("m7")),
+                    reason="downloads ~1.9 GB; set RVSM_SLOW=1 (or prime the cache) to run it")
+# The window each one can actually take: a stage count of n downsamples by 2^(n-1), and InstanceNorm
+# refuses a bottleneck of one voxel. recto has 7 stages (64x), m7 has 6 (32x).
+@pytest.mark.parametrize("name,window,stages", [("recto", 128, 7), ("m7", 64, 6)])
+def test_real_teacher_loads_strictly_and_forwards(name, window, stages):
+    """The whole claim, against the published bytes: fetch, infer the architecture from the state
+    dict's own shapes, load STRICTLY, and forward a window to a finite probability."""
+    net, spec = teachers.load_teacher(name, device="cpu")
+    arch = net.spec
+    assert len(arch.features_per_stage) == stages
+    assert arch.features_per_stage[:5] == [32, 64, 128, 256, 320]     # the published ResEnc widths
+    assert arch.strides == [1] + [2] * (stages - 1) and arch.norm == "instance"
+    assert (arch.squeeze_excitation == "scse") == (name == "recto")   # villa adds scSE, nnU-Net does not
+    x = torch.zeros(1, 1, window, window, window)
+    with torch.no_grad():
+        y = spec.select(net(x))
+    assert y.shape[0] == 1 and y.shape[1] == 2 and y.shape[2:] == (window,) * 3
+    p = teachers.apply_activation(y.float(), spec.activation)
+    assert torch.isfinite(p).all()
+    assert torch.allclose(p.sum(1), torch.ones(1, *(window,) * 3), atol=1e-4)  # both are 2-way softmax
+    fg = p[:, spec.fg_channel]
+    assert float(fg.min()) >= 0.0 and float(fg.max()) <= 1.0
