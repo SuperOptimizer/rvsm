@@ -178,3 +178,44 @@ def mesh_shards(d, valid, origin, out, level=0.0, shard=stores.SHARD, log=print)
                 paths.append(p)
                 log(f"  shard {z},{y},{x}: {len(v)} vertices, {len(tri)} triangles -> {os.path.basename(p)}")
     return str(out) if paths else None
+
+
+# --------------------------------------------------------------------------- #
+# The student, wired to the contract (commit 5)
+# --------------------------------------------------------------------------- #
+def export_student(ckpt, ct, ax, origin, size, out, meta=None, device=None, rung=2, sign=1.0,
+                   window=None, halo=None, cascade_depth=None, batch=1, tta=1, compile=False,
+                   marching_cubes=False, mc_level=0.0, umbilicus="", attrs=None, log=print):
+    """`rvsm export`: ONE multi-head student pass over a box, written as the tracer contract.
+
+    The pass is `infer.student_region(..., heads="all")` -- recto, verso, midline, thickness and conf
+    off a single forward per window -- and `export_tracer` does the rest: the recto-face distance is the
+    midline minus half the thickness, the normal is the Scharr gradient of THAT field (never a network
+    output), and the sign convention is the one the attrs claim. `--marching-cubes` additionally meshes
+    the zero level, one shard at a time.
+
+    The export is always at `sign=+1`: the contract's d and n point from the verso face to the recto
+    face, so a box exported with the radial sign flipped would carry the same attrs and the opposite
+    geometry. A negative `sign` is refused rather than recorded.
+    """
+    from rvsm import infer
+    assert float(sign) > 0, ("export: the tracer contract is defined at radial sign +1 "
+                             "(d and n point verso -> recto); --sign -1 is the round-0 verso pass, "
+                             "which is written as a store by `rvsm produce`, not as an export")
+    st = infer.student_fn(ckpt, device=device, compile=compile)
+    origin = tuple(int(v) for v in origin)
+    size = tuple(int(v) for v in size)
+
+    def probs_multi(o, s):
+        log(f"export: student pass over {o} {s} at rung {rung} (planes {list(st.planes)})")
+        return infer.student_region(st, ct, ax, o, s, sign=float(sign), heads="all", meta=meta,
+                                    window=window, halo=halo, cascade_depth=cascade_depth,
+                                    batch=batch, rung=int(rung), tta=tta)
+
+    return export_tracer(probs_multi, origin, size, out, rung=int(rung), volume=str(ct),
+                         umbilicus=str(umbilicus), marching_cubes=bool(marching_cubes),
+                         mc_level=mc_level, log=log,
+                         attrs={"producer": "student", "ckpt": str(st.ckpt), "step": int(st.step),
+                                "radial_sign": int(sign), "temps": {str(k): v for k, v in
+                                                                    st.temps.items()},
+                                **(attrs or {})})

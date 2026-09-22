@@ -441,3 +441,338 @@ def test_produce_falls_back_to_the_weights_cache(tmp_path, ct_origin, fake_teach
     assert rc == 0 and called == [("fake", teachers.CACHE_DIR)]
     a = stores.open_store(stores.store_path(out, "recto", (0, 0, 0), 0))
     assert a.attrs["ckpt"]["fake"] == fake_teacher.ckpt
+
+
+# ===================================================================================================
+# commit 5: the student pass, the student produce and the student export
+# ===================================================================================================
+WIN, HALO = 32, 4          # a window the size of `region_cfg`'s patch, over its 128^3 region
+
+
+@pytest.fixture
+def student_ckpt(tmp_path, region_cfg):
+    """A checkpoint of an untrained `1m` net with `region_cfg`'s own layout, and two temperatures.
+
+    Untrained is the point: every test here is about the PLUMBING -- the channel order, the sign, the
+    temperature, the encodings -- and a trained net would only make the numbers prettier while hiding
+    exactly the mistakes that matter."""
+    from rvsm import model as M
+    cfg = region_cfg
+    L = cfg.layout()
+    torch.manual_seed(0)
+    net = M.build(cfg.size, cin=L.cin, cout=L.cout, verbose=False)
+    return infer.save_student(str(tmp_path / "student.pt"), net.state_dict(), cfg,
+                              temps={2: 2.0, 3: 1.5}, step=123)
+
+
+def _student_inputs(cfg, ax, meta, lo=(0, 64, 0), size=(128, 128, 128), sign=1.0, **kw):
+    return infer.StudentInputs(cfg.ct, ax, lo, size, cfg.layout(), meta=meta, rung=2, ctx=cfg.ctx,
+                               window=WIN, halo=HALO, sign=sign, **kw)
+
+
+@pytest.fixture
+def student_env(region_cfg, has_volcomp):
+    """(cfg, axis, meta planes, pyramid) for the fixture CT: what every student input needs."""
+    if not has_volcomp:
+        pytest.skip("volcomp is required to read the CT fixture")
+    import types
+
+    from rvsm import axis as AX, scanmeta as SM
+    cfg = region_cfg
+    return types.SimpleNamespace(cfg=cfg, ax=AX.load(cfg.umbilicus, ct=cfg.ct),
+                                 meta=SM.scan_planes(SM.fetch(cfg.ct)),
+                                 pyr=ladder.rungs(cfg.ct), layout=cfg.layout())
+
+
+# --------------------------------------------------------------------------- #
+# StudentInputs.prep: the ONE channel contract, checked against the loader's own path
+# --------------------------------------------------------------------------- #
+def test_student_prep_is_the_loader_stem(student_env):
+    """`StudentInputs.prep(o)` must be, to the last channel, what `prep.prepare` builds for the same
+    window out of a `sample.rung_item`. Two code paths build the model input -- the loader's (uint8
+    cubes collated, floats on the GPU) and inference's (one region read, sliced per window) -- and the
+    only thing that keeps them the same tensor is this test."""
+    from rvsm import axis as AX, prep as P, sample as S
+    e = student_env
+    cfg, L, ax = e.cfg, e.layout, e.ax
+    lo, size = (0, 64, 0), (128, 128, 128)
+    inp = _student_inputs(cfg, ax, e.meta, lo, size, cascade_depth=0)
+    assert inp.cascade is None                                 # depth 0: the channel is fed as zeros
+    o = inp.offs[len(inp.offs) // 2]
+    x = inp.prep(o)
+    assert tuple(x.shape) == (1, L.cin, WIN, WIN, WIN) and L.cin == len(L.stem_names())
+
+    glo = np.array([lo[a] + o[a] for a in range(3)], np.int64)
+    ct = ladder.read_rung(e.pyr, 2, glo, (WIN,) * 3, dtype=np.uint8)
+    cx = ladder.context(cfg.ct, glo, ct.shape, cfg.ctx, rung=2)
+    kn = min(e.pyr)
+    rmax_um = AX.rmax_vox(AX.axis_at(ax, kn), ladder.rung_shape(e.pyr, kn)) * ladder.rung_um(kn)
+    assert inp.rmax_um == pytest.approx(rmax_um)               # the radius plane's own denominator
+    z = np.zeros((len(cfg.channels) + 2,) + (WIN,) * 3, np.uint8)
+    item = S.rung_item(np.stack([ct] + list(cx)), z, z, 2, glo, ax, 0,
+                       rmax=rmax_um / ladder.rung_um(2), meta=e.meta)
+    y, _, _ = P.prepare(P.batch1(item), "cpu", layout=L)       # `prepare` asserts the layout itself
+    assert torch.allclose(x, y, atol=1e-5), \
+        f"max |prep - prepare| = {float((x - y).abs().max())}"
+
+    # ... and, channel by channel, what `Layout` says each one is
+    assert float(x[0, L.i_ct].mean().abs()) < 1e-4             # the CT channel is z-scored
+    assert float(x[0, L.i_cas].abs().max()) == 0.0             # no cascade
+    assert float(x[0, L.i_scale].min()) == float(x[0, L.i_scale].max()) == 0.0   # rung 2 -> (2-2)/9
+    rad = AX.radial(AX.axis_at(ax, 2), glo, (WIN,) * 3)
+    assert np.abs(x[0, L.i_rad:L.i_rad + 3].numpy() - rad).max() < 1e-5
+    r = AX.radius(AX.axis_at(ax, 2), glo, (WIN,) * 3, rmax_um / ladder.rung_um(2))
+    assert np.abs(x[0, L.i_radius].numpy() - r[0]).max() < 1e-5
+    assert np.abs(x[0, L.i_meta:L.i_meta + L.n_meta, 0, 0, 0].numpy() - e.meta).max() < 1e-6
+
+
+def test_the_flipped_sign_negates_exactly_the_radial_channels(student_env):
+    """The whole verso trick, and the whole risk in it: `--sign -1` must move the three radial channels
+    and nothing else. A sign that leaked into the radius plane (which is a DISTANCE, not a direction)
+    would put the student out of distribution everywhere at once."""
+    e = student_env
+    L = e.layout
+    a = _student_inputs(e.cfg, e.ax, e.meta, cascade_depth=0)
+    b = _student_inputs(e.cfg, e.ax, e.meta, sign=-1.0, cascade_depth=0)
+    o = a.offs[len(a.offs) // 2]
+    xa, xb = a.prep(o), b.prep(o)
+    assert torch.equal(xa[:, :L.i_rad], xb[:, :L.i_rad])           # bit for bit, up to the vector
+    assert torch.allclose(xb[:, L.i_rad:], -xa[:, L.i_rad:], atol=1e-7)
+    assert float(xa[:, L.i_rad:].abs().max()) > 0.5                # ... and there was something to flip
+
+
+# --------------------------------------------------------------------------- #
+# the top-down cascade
+# --------------------------------------------------------------------------- #
+def _head0_of(x):
+    """A deterministic stand-in for a student's head 0: a pointwise function of the CT channel."""
+    return torch.sigmoid(x[:, :1])
+
+
+def test_cascade_for_at_depth_one_is_the_coarse_pass_upsampled(student_env):
+    e = student_env
+    cfg, L, ax = e.cfg, e.layout, e.ax
+    lo, size = (0, 64, 0), (128, 128, 128)
+    head0 = lambda k: _head0_of  # noqa: E731  (the same window function at every rung)
+    inp = _student_inputs(cfg, ax, e.meta, lo, size, cascade_depth=1, head0=head0)
+    casc = inp.cascade
+    assert casc is not None and casc.shape == size and casc.dtype == np.float32
+    assert casc.max() > 0
+
+    m = infer.CASCADE_HALO
+    o1 = [max(int(v) // 2 - m, 0) for v in lo]
+    s1 = [(int(v) + 1) // 2 + 2 * m for v in size]
+    sub = infer.StudentInputs(cfg.ct, ax, o1, s1, L, meta=e.meta, rung=3, ctx=cfg.ctx, window=WIN,
+                              halo=HALO, cascade_depth=0)
+    assert sub.rung == 3 and sub.cascade is None                  # depth exhausted one rung up
+    p1 = infer.run_region(_head0_of, sub, s1, WIN, HALO, planes=1, offs=sub.offs)[0].numpy()
+    up = infer.up2x_np(p1)
+    a = [int(lo[i]) - 2 * o1[i] for i in range(3)]
+    man = up[a[0]:a[0] + size[0], a[1]:a[1] + size[1], a[2]:a[2] + size[2]]
+    assert np.abs(casc - man).max() < 1e-6
+
+    # and the channel really is fed: prep's cascade plane is the crop of that array
+    o = inp.offs[0]
+    assert np.abs(inp.prep(o)[0, L.i_cas].numpy()
+                  - infer.crop_pad(casc, o, (WIN,) * 3)).max() < 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# student_fn: the heads, and what the temperature may touch
+# --------------------------------------------------------------------------- #
+def test_student_fn_applies_the_temperature_to_the_probability_heads_only(student_ckpt, region_cfg):
+    """A temperature calibrates a PROBABILITY. Dividing a distance in voxels, a thickness in voxels or
+    a confidence by 1.13 would be a silent unit error, so the plane builder must apply it to the
+    sigmoid heads and nowhere else."""
+    import torch.nn.functional as F
+    L = region_cfg.layout()
+    hot = infer.student_fn(student_ckpt, device="cpu", compile=False, temps=True)
+    cold = infer.student_fn(student_ckpt, device="cpu", compile=False, temps=False)
+    assert hot.temps == {2: 2.0, 3: 1.5} and cold.temps == {}
+    assert hot.temp(2) == 2.0 and hot.temp(3) == 1.5 and hot.temp(7) == 1.0 and cold.temp(2) == 1.0
+    assert hot.step == 123 and hot.planes == ("recto", "verso", "midline", "thickness", "conf")
+
+    torch.manual_seed(1)
+    x = torch.randn(1, L.cin, 16, 16, 16)
+    names = list(hot.planes)
+    pa, pb = hot.plane_fn("all", 2)(x), cold.plane_fn("all", 2)(x)
+    assert tuple(pa.shape) == (1, len(names), 16, 16, 16)
+    with torch.no_grad():
+        y = hot.raw(x)
+    for i, nm in enumerate(("recto", "verso")):
+        j = names.index(nm)
+        assert torch.allclose(pa[:, j:j + 1], torch.sigmoid(y[:, i:i + 1] / 2.0), atol=1e-6)
+        assert torch.allclose(pb[:, j:j + 1], torch.sigmoid(y[:, i:i + 1]), atol=1e-6)
+        assert not torch.allclose(pa[:, j], pb[:, j])          # the temperature really did something
+    for nm in ("midline", "thickness", "conf"):
+        assert torch.equal(pa[:, names.index(nm)], pb[:, names.index(nm)]), nm
+    assert torch.allclose(pa[:, names.index("midline")], y[:, L.i_mid], atol=1e-6)
+    assert torch.allclose(pa[:, names.index("thickness")], 3.0 + F.softplus(y[:, L.i_thick]), atol=1e-5)
+    assert float(pa[:, names.index("thickness")].min()) >= 3.0    # the floor the contract promises
+    assert float(pa[:, names.index("conf")].min()) > 0.0 and float(pa[:, names.index("conf")].max()) < 1.0
+    # the temperature at a DIFFERENT rung is a different number, and the affinity heads are never read
+    assert not torch.allclose(hot.plane_fn(["recto"], 3)(x), hot.plane_fn(["recto"], 2)(x))
+    with pytest.raises(AssertionError):
+        hot.plane_names(["aff8_z"])
+
+
+def test_student_region_returns_one_array_per_plane(student_env, student_ckpt):
+    e = student_env
+    got = infer.student_region(student_ckpt, e.cfg.ct, e.ax, (0, 64, 0), (128, 128, 128), sign=1.0,
+                               heads="all", meta=e.meta, device="cpu", window=WIN, halo=HALO,
+                               cascade_depth=0)
+    assert sorted(got) == ["conf", "midline", "recto", "thickness", "verso"]
+    ct = ladder.read_rung(e.pyr, 2, (0, 64, 0), (128, 128, 128), dtype=np.uint8)
+    for nm, v in got.items():
+        assert v.shape == (128, 128, 128) and v.dtype == np.float32
+        assert np.all(v[ct == 0] == 0), nm            # every plane is zero where the CT is air
+    assert got["recto"].max() > 0 and got["thickness"][ct > 0].min() >= 3.0
+
+
+# --------------------------------------------------------------------------- #
+# `rvsm produce --student`
+# --------------------------------------------------------------------------- #
+def _produce(out, cfg, ckpt, *extra):
+    return cli.main(["produce", "--out", out, "--ct", cfg.ct, "--umbilicus", cfg.umbilicus,
+                     "--student", ckpt, "--region", "0", "0", "0", "--size", "128",
+                     "--device", "cpu", "--window", str(WIN), "--halo", str(HALO),
+                     "--cascade-depth", "0", "--no-compile", *extra])
+
+
+def test_produce_student_verso_writes_only_the_verso_store(tmp_path, student_env, student_ckpt):
+    e = student_env
+    out = str(tmp_path / "vrun")
+    assert _produce(out, e.cfg, student_ckpt, "--sign", "-1", "--heads", "verso") == 0
+    p = stores.store_path(out, "verso", (0, 0, 0), 0)
+    assert stores.is_done(p)
+    a = stores.open_store(p)
+    assert a.shape == (128, 128, 128) and a.attrs["rung"] == 2 and a.attrs["volcomp_q"] == 8
+    assert a.attrs["channels"] == ["verso"] and a.attrs["origin_zyx"] == [0, 0, 0]
+    assert a.attrs["producer"] == "student" and a.attrs["radial_sign"] == -1
+    assert a.attrs["ckpt"] == student_ckpt and a.attrs["step"] == 123
+    assert a.attrs["encoding"] == "prob_u8" and a.attrs["volume"] == e.cfg.ct
+    assert a.attrs["temps"] == {"2": 2.0, "3": 1.5} and a.attrs["cascade_depth"] == 0
+    # round 0's verso pass writes ONE store: the recto is the teachers', and is not touched
+    for ch in ("recto", "midline", "thickness", "conf"):
+        assert not os.path.exists(stores.store_path(out, ch, (0, 0, 0), 0)), ch
+
+
+def test_produce_student_all_heads_writes_the_five_stores(tmp_path, student_env, student_ckpt):
+    e = student_env
+    out = str(tmp_path / "arun")
+    assert _produce(out, e.cfg, student_ckpt, "--heads", "all", "--round", "1") == 0
+    q = {"recto": 8, "verso": 8, "midline": 0, "thickness": 0, "conf": 0}
+    enc = {"recto": "prob_u8", "verso": "prob_u8", "midline": "signed_u8_off128_q0.25",
+           "thickness": "unsigned_u8_q0.25", "conf": "conf_u8"}
+    for ch in q:
+        p = stores.store_path(out, ch, (0, 0, 0), 1)
+        assert stores.is_done(p), ch
+        a = stores.open_store(p)
+        assert a.attrs["volcomp_q"] == q[ch], ch          # q8 probabilities, q0 fields
+        assert a.attrs["encoding"] == enc[ch], ch
+        assert a.attrs["rung"] == 2 and a.attrs["round"] == 1 and a.attrs["radial_sign"] == 1
+        assert "radially OUTWARD" in a.attrs["sign_convention"]
+        assert a.attrs["no_data"] == 0 and a.attrs["channels"] == [ch]
+    # the fields obey their own encoding: code 0 is NO DATA and lands exactly where the CT is air
+    ct = ladder.read_rung(e.pyr, 2, (0, 0, 0), (128, 128, 128), dtype=np.uint8)
+    mid = np.asarray(stores.open_store(stores.store_path(out, "midline", (0, 0, 0), 1))[:])
+    assert np.all(mid[ct == 0] == 0) and mid.max() > 0
+    thick = np.asarray(stores.open_store(stores.store_path(out, "thickness", (0, 0, 0), 1))[:])
+    assert np.all(thick[ct == 0] == 0)
+
+
+def test_produce_student_refuses_the_field_heads_at_a_negative_sign(tmp_path, student_env,
+                                                                    student_ckpt):
+    with pytest.raises(SystemExit, match="sign"):
+        _produce(str(tmp_path / "x"), student_env.cfg, student_ckpt, "--sign", "-1", "--heads", "all")
+    with pytest.raises(SystemExit):
+        _produce(str(tmp_path / "x"), student_env.cfg, student_ckpt, "--heads", "nonsense")
+
+
+def test_produce_student_fields_are_opt_in(tmp_path, student_env, student_ckpt):
+    """`--fields` is the driver's decision, not the pass's: without it nothing is recomputed, with it
+    the rungs the multi-head pass did NOT write (3 and 4) are built from the region's own stores."""
+    from rvsm import targets as TG
+    e = student_env
+    out = str(tmp_path / "frun")
+    assert _produce(out, e.cfg, student_ckpt, "--heads", "all") == 0
+    assert not os.path.exists(stores.store_path(out, TG.channel("midline", 3), (0, 0, 0), 0))
+    assert _produce(out, e.cfg, student_ckpt, "--heads", "all", "--fields") == 0
+    for k in (3, 4):
+        for kind in TG.KINDS:
+            assert stores.is_done(stores.store_path(out, TG.channel(kind, k), (0, 0, 0), 0)), (kind, k)
+    # rung 2 was already written by the pass itself, so `region_fields` left it alone
+    a = stores.open_store(stores.store_path(out, "midline", (0, 0, 0), 0))
+    assert a.attrs["producer"] == "student"
+
+
+# --------------------------------------------------------------------------- #
+# `rvsm export`
+# --------------------------------------------------------------------------- #
+CONTRACT = ("recto", "verso", "surf_sdist", "nz", "ny", "nx", "gmag", "conf", "thickness")
+
+
+def test_export_box_writes_the_tracer_contract(tmp_path, student_env, student_ckpt):
+    e = student_env
+    dest = str(tmp_path / "exp")
+    argv = ["export", "--ckpt", student_ckpt, "--ct", e.cfg.ct, "--umbilicus", e.cfg.umbilicus,
+            "--box", "0", "0", "0", "128", "128", "128", "--dest", dest, "--device", "cpu",
+            "--window", str(WIN), "--halo", str(HALO), "--cascade-depth", "0", "--no-compile"]
+    has_skimage = True
+    try:
+        import skimage  # noqa: F401
+    except Exception:  # noqa: BLE001
+        has_skimage = False
+    if has_skimage:
+        argv.append("--marching-cubes")
+    assert cli.main(argv) == 0
+    for nm in CONTRACT:
+        p = os.path.join(dest, f"{nm}.zarr")
+        assert stores.is_done(p), nm
+        a = stores.open_store(p)
+        assert a.shape == (128, 128, 128) and a.attrs["origin_zyx"] == [0, 0, 0]
+        assert a.attrs["rung"] == 2 and a.attrs["volcomp_q"] == (8 if nm in ("recto", "verso") else 0)
+        assert "radially OUTWARD" in a.attrs["sign_convention"]
+        assert a.attrs["producer"] == "student" and a.attrs["ckpt"] == student_ckpt
+        assert a.attrs["step"] == 123 and a.attrs["volume"] == e.cfg.ct
+    assert stores.open_store(os.path.join(dest, "surf_sdist.zarr")).attrs["encoding"] \
+        == "signed_u8_off128_q0.25"
+    # a mesh directory only appears where the exported field actually crosses the level
+    if has_skimage and os.path.isdir(os.path.join(dest, "mesh")):
+        objs = [q for q in os.listdir(os.path.join(dest, "mesh")) if q.endswith(".obj")]
+        assert objs and all(q.startswith("shard_") for q in objs)
+
+
+def test_export_refuses_a_flipped_sign(tmp_path, student_env, student_ckpt):
+    """The contract's d and n are defined at radial sign +1; exporting the verso pass under the same
+    attrs would ship the opposite geometry."""
+    from rvsm import export as EX
+    with pytest.raises(AssertionError, match="sign"):
+        EX.export_student(student_ckpt, student_env.cfg.ct, student_env.ax, (0, 0, 0), (8, 8, 8),
+                          str(tmp_path / "e"), sign=-1.0, device="cpu", log=lambda *a: None)
+
+
+def test_mesh_shards_writes_one_obj_per_shard(tmp_path):
+    pytest.importorskip("skimage")
+    mid, thick = outward_slab(128, half=6.0)
+    d = mid - 0.5 * thick                      # crosses zero at y = 70: one surface, one shard
+    out = export.mesh_shards(d, np.ones(d.shape, bool), (0, 256, 0), str(tmp_path / "mesh"),
+                             log=lambda *a: None)
+    assert out is not None
+    objs = sorted(q for q in os.listdir(out) if q.endswith(".obj"))
+    assert objs == ["shard_0_256_0.obj"]       # the store's own shard grid, named in GLOBAL voxels
+    txt = open(os.path.join(out, objs[0])).read().splitlines()
+    vs = [q.split()[1:] for q in txt if q.startswith("v ")]
+    assert vs and any(q.startswith("f ") for q in txt)
+    ys = np.array([float(q[1]) for q in vs])   # vertices are ZYX: y is the SECOND component ...
+    assert np.abs(ys - 70.0).max() < 1.0       # ... and the surface sits where the field crosses 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU smoke")
+def test_gpu_smoke_student_region(student_env, student_ckpt):
+    """The `1m` net over a 128^3 region on the card: fp16 accumulators, a real cascade, every plane."""
+    e = student_env
+    got = infer.student_region(student_ckpt, e.cfg.ct, e.ax, (0, 64, 0), (128, 128, 128), sign=-1.0,
+                               heads=["recto"], meta=e.meta, device="cuda", window=WIN, halo=HALO,
+                               cascade_depth=1, batch=2)
+    assert got["recto"].shape == (128, 128, 128) and got["recto"].max() > 0

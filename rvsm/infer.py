@@ -107,31 +107,147 @@ class TeacherInputs(Inputs):
 
 
 class StudentInputs(Inputs):
-    """The student's region inputs -- the 21-channel stem of `Config.layout()`.
+    """The student's region inputs -- the `cin` stem of `config.Layout`, read ONCE per region.
 
-    NOT IMPLEMENTED IN COMMIT 2, deliberately: every piece it needs belongs to another commit, and a
-    half-built version would be the one copy of the channel contract that drifts. The signature it will
-    carry, so `run_region` and the producer can already be written against it:
+    What is read once, and why it has to be: the rung-`rung` CT of the box (`roi`, which is also the air
+    mask and the pad record), and ONE context super-cube per context rung, sized to cover every window's
+    context box. A 256^3 window at rung 2 asks for nine coarse cubes centred on the same point; reading
+    them per window re-decodes the top of the pyramid once per window, and at 64 windows a region that
+    is the whole cost of the pass. The super-cube of rung `k + d` is the union of every window's box
+    there, which is only `window + spread / 2^d` voxels on a side -- for d >= 3 barely more than one
+    window.
 
-        StudentInputs(ct, lo, size, window, ax, rung=2, ctx=(1..9), planes=..., sign=-1.0,
-                      cascade=None, device="cuda")
+    The umbilicus is interpolated once for the padded region's z range, and `prep` slices it; the radial
+    vector and the radius plane are then built on the DEVICE by `rvsm.prep`'s own kernels, which is what
+    makes a window's input the same tensor the trainer would have built (`test_infer_export` pins
+    `prep(o)` against `prep.prepare` on the matching `sample.rung_item`, to 1e-5).
 
-        lo/size   the region box in rung-`rung` voxels
-        ax        the umbilicus control points (rung-2 voxels, `rvsm.axis`)
-        ctx       the context offsets: one super-cube per rung is read here, once per region
-        planes    the conditioning planes (radius + scan metadata) from `rvsm.scanmeta`
-        sign      the radial sign: +1 recto, -1 the verso flip of round 0
-        cascade   the rung-(k+1) prediction upsampled onto this grid (`cascade_for`), or None
+    `prep(o)` stacks, in `Layout.stem_names()` order and nothing else's:
 
-    `prep` will stack, in `Layout.stem_names()` order: the z-scored CT window, the nine z-scored context
-    windows sliced out of the super-cubes, the cascade channel, the radius plane, the five metadata
-    planes, the scale plane and the three radial components (the last three: the channels a flip TTA
-    must negate). Commit 3 supplies `rvsm.prep`, commit 5 fills this in.
+        [CT z-scored, nctx z-scored context crops, cascade, radius, n_meta meta planes, scale,
+         rz, ry, rx]
+
+    `sign` multiplies the three radial channels and NOTHING else: that is the whole verso trick. A
+    recto-trained student fed the negated radial vector places its band on the other face of the sheet,
+    so round 0's verso store is this same pass at `sign=-1` (`rvsm produce --student --sign -1`).
+
+    THE CASCADE CHANNEL is a top-down pass, not a stored input: the box's own footprint is predicted at
+    rung k+1 first (an eighth of the work, plus a 16-voxel halo), upsampled 2x and fed in, recursively
+    for `cascade_depth` rungs and zero above that -- which is exactly the `cascade_drop` case the model
+    was trained on. `head0(k) -> fn` is the caller's per-rung head-0 window function (a `Student`'s), and
+    the recursion re-enters THIS class at rung k+1, so a coarse pass is built by the same code and cannot
+    drift from the fine one. `cascade=<array>` supplies it directly; `cascade_depth=0` leaves it zero.
     """
 
-    def __init__(self, *a, **kw):
-        raise NotImplementedError(
-            "StudentInputs lands in commit 5, on top of rvsm.prep / rvsm.model (commit 3)")
+    def __init__(self, ct, ax, lo, size, layout, meta=None, rung=RUNG, ctx=None, window=256, halo=32,
+                 sign=1.0, cascade=None, cascade_depth=0, head0=None, norm=None, device="cpu",
+                 pyr=None, rmax_um=None, batch=1):
+        from rvsm import axis as AX, scanmeta as SM
+        self.dev = torch.device(device)
+        self.ct, self.ax = ct, np.asarray(ax, np.float64)
+        self.layout = layout
+        self.rung, self.window, self.halo = int(rung), int(window), int(halo)
+        self.sign, self.batch = float(sign), int(batch)
+        self.ctx = tuple(int(q) for q in (ctx if ctx is not None else range(1, layout.nctx + 1)))
+        assert len(self.ctx) == layout.nctx, \
+            f"StudentInputs: {len(self.ctx)} context offsets for a layout with {layout.nctx}"
+        self.pyr = pyr if pyr is not None else ladder.rungs(ct)
+        self.head0, self.cascade_depth = head0, int(cascade_depth)
+        lo = np.asarray(lo, np.int64)
+        size = ladder.shape3(size)
+        self.lo, self.size = tuple(int(v) for v in lo), tuple(int(v) for v in size)
+        w = self.window
+
+        # ---- the CT of the region, padded to at least one full window (air), as TeacherInputs does
+        roi = ladder.read_rung(self.pyr, self.rung, lo, size, dtype=np.uint8)
+        if any(s < w for s in roi.shape):
+            roi = np.pad(roi, [(0, max(w - s, 0)) for s in roi.shape])
+        self.roi = torch.from_numpy(np.ascontiguousarray(roi)).to(self.dev)
+        self.shape = tuple(self.roi.shape)
+        self.offs = offsets(self.shape, w, self.halo)
+
+        # ---- ONE context super-cube per context rung, covering every window's context box
+        cs = [sorted({self.lo[a] + int(o[a]) + w // 2 for o in self.offs}) for a in range(3)]
+        self.ctx_cubes = {}
+        for d in self.ctx:
+            lo_d = [(min(cs[a]) >> d) - w // 2 for a in range(3)]
+            sz_d = [(max(cs[a]) >> d) - w // 2 + w - lo_d[a] for a in range(3)]
+            cube = ladder.read_rung(self.pyr, self.rung + d, lo_d, sz_d, dtype=np.uint8)
+            self.ctx_cubes[d] = (lo_d, torch.from_numpy(np.ascontiguousarray(cube)).to(self.dev))
+
+        # ---- the axis over the padded region's z range, interpolated once (float64, as `rung_item`'s)
+        a_k = AX.axis_at(self.ax, self.rung)
+        z = np.arange(self.shape[0]) + self.lo[0]
+        self.cyx = torch.from_numpy(np.ascontiguousarray(
+            np.stack([np.interp(z, a_k[0], a_k[1]), np.interp(z, a_k[0], a_k[2])]))).to(self.dev)
+
+        # ---- the per-sample plane numbers: r_max at this rung, and the five scan values
+        if rmax_um is None:
+            kn = min(self.pyr)
+            rmax_um = AX.rmax_vox(AX.axis_at(self.ax, kn), ladder.rung_shape(self.pyr, kn)) \
+                * ladder.rung_um(kn)
+        self.rmax_um = float(rmax_um)
+        self.rmax = torch.tensor([self.rmax_um / ladder.rung_um(self.rung)], dtype=torch.float32,
+                                 device=self.dev)
+        self.meta_np = (np.asarray(SM.scan_planes(SM.fetch(ct)), np.float32) if meta is None
+                        else np.asarray(meta, np.float32))
+        self.meta = torch.from_numpy(np.ascontiguousarray(self.meta_np))[None].to(self.dev)
+        self.norm = torch.tensor([[0.0, 0.0] if norm is None else [float(norm[0]), float(norm[1])]],
+                                 dtype=torch.float32, device=self.dev)
+
+        # ---- the cascade channel: the rung-(k+1) prediction over this footprint, upsampled
+        if cascade is None and self.cascade_depth > 0 and head0 is not None:
+            cascade = cascade_for(self._at_rung, self.rung, self.lo, self.size, self.cascade_depth)
+        self.cascade = None if cascade is None else np.ascontiguousarray(cascade, np.float32)
+
+    # ---- the top-down cascade ------------------------------------------------------------------
+    def _at_rung(self, k1, o1, s1, depth1):
+        """Head-0 probability over a box at rung `k1`, cascading `depth1` rungs above it: the same class
+        one rung up, driven through the same `run_region`."""
+        sub = StudentInputs(self.ct, self.ax, o1, s1, self.layout, meta=self.meta_np, rung=int(k1),
+                            ctx=self.ctx, window=self.window, halo=self.halo, sign=self.sign,
+                            cascade_depth=int(depth1), head0=self.head0, device=self.dev,
+                            pyr=self.pyr, rmax_um=self.rmax_um, batch=self.batch)
+        p = run_region(self.head0(int(k1)), sub, tuple(int(v) for v in s1), self.window, self.halo,
+                       batch=self.batch, planes=1, offs=sub.offs)
+        return p[0].float().cpu().numpy()
+
+    # ---- one window ----------------------------------------------------------------------------
+    def window_ct(self, o):
+        w = self.window
+        return self.roi[o[0]:o[0] + w, o[1]:o[1] + w, o[2]:o[2] + w]
+
+    def ctx_window(self, d, o):
+        """The context cube of rung `rung + d` for the window at `o`, sliced out of that rung's
+        super-cube at the SAME centre the sampler uses (`ladder.context`: centre >> d, minus half a
+        window)."""
+        w = self.window
+        lo_d, cube = self.ctx_cubes[int(d)]
+        i = [((self.lo[a] + int(o[a]) + w // 2) >> int(d)) - w // 2 - lo_d[a] for a in range(3)]
+        return cube[i[0]:i[0] + w, i[1]:i[1] + w, i[2]:i[2] + w]
+
+    def prep(self, o, out_dtype=torch.float32):
+        from rvsm import prep as P
+        w, L = self.window, self.layout
+        C = 1 + L.nctx
+        x = torch.empty((1, L.cin, w, w, w), dtype=out_dtype, device=self.dev)
+        img = x[:, :C]
+        img[0, 0] = self.window_ct(o).to(out_dtype)
+        for i, d in enumerate(self.ctx):
+            img[0, 1 + i] = self.ctx_window(d, o).to(out_dtype)
+        P.zscore_cubes_(img, self.norm, out_dtype)              # per cube, exactly as the loader's is
+        x[:, L.i_cas] = torch.from_numpy(crop_pad(self.cascade, o, (w, w, w))).to(self.dev).to(out_dtype)
+        lo_w = torch.tensor([[self.lo[a] + int(o[a]) for a in range(3)]], dtype=torch.int64,
+                            device=self.dev)
+        cyx_w = self.cyx[None, :, o[0]:o[0] + w]
+        n = P.fill_planes_(x, L.i_planes, cyx_w, lo_w, rmax=self.rmax,
+                           meta=(self.meta if L.n_meta else None), dtype=out_dtype)
+        assert n == L.n_planes, f"StudentInputs: built {n} planes, layout wants {L.n_planes}"
+        x[:, L.i_scale] = (self.rung - 2) / 9.0
+        P.radial_t(cyx_w, lo_w, (w, w, w), out_dtype, out=x[:, L.i_rad:L.i_rad + 3])
+        if self.sign != 1.0:
+            x[:, L.i_rad:L.i_rad + 3] *= self.sign
+        return x
 
 
 # --------------------------------------------------------------------------- #
@@ -327,3 +443,175 @@ def fuse_agreement(ps, pm, ws=1.0, wm=1.0, floor=0.05):
     a_m = float(wm) * (binary_confidence(pm) + float(floor))
     p = (a_s * ps + a_m * pm) / np.maximum(a_s + a_m, 1e-6)
     return p.astype(np.float32), (1.0 - np.abs(ps - pm)).astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# The student pass
+# --------------------------------------------------------------------------- #
+# WHAT A CHECKPOINT HOLDS. `rvsm train` writes, and everything here reads:
+#
+#     {"cfg": asdict(Config), "layout": Layout.to_json(), "ema": state_dict, "model": state_dict,
+#      "temps": {rung: T}, "step": int}
+#
+# `cfg` is the contract: the layout (and therefore cin/cout, the head order, the context offsets) is
+# DERIVED from it, never trusted from the stored copy, so a checkpoint whose recorded layout disagrees
+# with its own config fails loudly at build time instead of silently mapping the wrong head. `ema` is
+# what inference runs -- the raw weights are only ever the training state. The reader below accepts the
+# older spellings (`args`, `config`, `model`, `state_dict`) so a hand-made or third-party checkpoint can
+# still be driven, and says which key it used.
+CKPT_STATE_KEYS = ("ema", "model", "state_dict", "net")
+CKPT_CFG_KEYS = ("cfg", "config", "args")
+
+
+def save_student(path, state, cfg, temps=None, step=0, **extra):
+    """Write a student checkpoint in the format `student_fn` reads. `state` is the EMA state dict."""
+    import os
+    from dataclasses import asdict
+    d = {"cfg": {k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(cfg).items()},
+         "layout": cfg.layout().to_json(), "ema": dict(state), "step": int(step),
+         "temps": {int(k): float(v) for k, v in (temps or {}).items()}, **extra}
+    if os.path.dirname(str(path)):
+        os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+    torch.save(d, str(path) + ".tmp")
+    os.replace(str(path) + ".tmp", str(path))
+    return str(path)
+
+
+def load_student_ckpt(path, map_location="cpu"):
+    """(raw dict, Config, Layout, state dict, {rung: T}, step) of a student checkpoint."""
+    from rvsm import calib as CAL
+    from rvsm.config import Config, _coerce, _TYPES
+    st = torch.load(str(path), map_location=map_location, weights_only=False)
+    raw = next((st[k] for k in CKPT_CFG_KEYS if isinstance(st.get(k), dict)), None)
+    assert raw is not None, f"{path}: no config in the checkpoint (looked for {CKPT_CFG_KEYS})"
+    cfg = Config(**{k: _coerce(k, v) for k, v in raw.items() if k in _TYPES})
+    sd = next((st[k] for k in CKPT_STATE_KEYS if isinstance(st.get(k), dict) and st[k]), None)
+    assert sd is not None, f"{path}: no weights in the checkpoint (looked for {CKPT_STATE_KEYS})"
+    temps = CAL.temps_of(st.get("temps") or raw.get("temps") or {})
+    return st, cfg, cfg.layout(), sd, temps, int(st.get("step", 0))
+
+
+class Student:
+    """One student checkpoint, loaded once, as a set of per-rung window functions.
+
+    Every plane the tracer contract asks for is a POINTWISE function of the same raw head output, so a
+    multi-head pass is one forward per window and not five over the same voxels:
+
+        recto / verso   sigmoid(logit / T(rung))     the probability heads -- the ONLY ones the
+                                                     per-rung temperature touches (a temperature is a
+                                                     calibration of a probability; dividing a distance
+                                                     in voxels by 1.13 would just be wrong)
+        midline         the head, raw, in voxels
+        thickness       TMIN + softplus(head)        it cannot go below the minimum physical thickness
+        conf            1 / (1 + exp(logvar / 2))    from the heteroscedastic log-variance
+
+    The affinity heads are training-only and are never read here. `plane_fn(names, rung)` builds the
+    callable `run_region` drives; `head0(rung)` is the one-plane version the cascade recursion uses.
+    """
+
+    FIELDS = ("midline", "thickness", "conf")
+
+    def __init__(self, ckpt, device=None, compile=True, mode="max-autotune-no-cudagraphs", temps=True):
+        from rvsm import model as M
+        self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.ckpt = str(ckpt)
+        st, cfg, layout, sd, tmps, step = load_student_ckpt(ckpt, map_location=self.dev)
+        self.cfg, self.layout, self.step = cfg, layout, step
+        self.temps = tmps if temps else {}
+        self.use_temps = bool(temps)
+        net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, ckpt_act=0,
+                      add_skip=int(st.get("add_skip", 0)), deep=0, verbose=False).to(self.dev)
+        net.load_state_dict(sd)
+        net.eval()
+        self.raw = net
+        self.net = (torch.compile(net, mode=mode) if (compile and self.dev.type == "cuda") else net)
+        self.planes = tuple(str(c) for c in layout.channels) + self.FIELDS
+
+    # ---- the planes ----------------------------------------------------------------------------
+    def temp(self, rung):
+        """The temperature the probability heads are divided by at `rung` (1.0 when uncalibrated)."""
+        from rvsm import calib as CAL
+        return CAL.temp_for(self.temps, int(rung), use=self.use_temps)
+
+    def plane_names(self, heads="all"):
+        """`heads` -> the plane names, in `self.planes` order. "all" is every one; a name the checkpoint
+        cannot serve is an error, because a silently dropped plane is a store that never appears."""
+        if heads is None or (isinstance(heads, str) and str(heads) == "all"):
+            return list(self.planes)
+        names = [str(q) for q in ([heads] if isinstance(heads, str) else heads)]
+        bad = [n for n in names if n not in self.planes]
+        assert not bad, f"{self.ckpt}: cannot serve plane(s) {bad} (has {list(self.planes)})"
+        return names
+
+    def piece(self, name, rung):
+        """(B, cout, ...) raw head output -> the (B, 1, ...) plane `name`."""
+        from rvsm import losses as L
+        ch = [str(c) for c in self.layout.channels]
+        if name in ch:
+            T = float(self.temp(rung))
+            j = ch.index(name)
+            return lambda y, j=j, T=T: torch.sigmoid(y[:, j:j + 1].float() / T)
+        if name == "midline":
+            return lambda y, j=self.layout.i_mid: y[:, j:j + 1].float()
+        if name == "thickness":
+            return lambda y, j=self.layout.i_thick: L.soft_thickness(y[:, j:j + 1].float(), L.TMIN)
+        if name == "conf":
+            return lambda y, j=self.layout.i_log: 1.0 / (
+                1.0 + torch.exp(0.5 * y[:, j:j + 1].float().clamp(-8, 8)))
+        raise KeyError(f"{self.ckpt}: no plane {name!r} (has {list(self.planes)})")
+
+    def plane_fn(self, heads="all", rung=RUNG):
+        """`fn(x) -> (B, P, w, w, w)`: ONE forward, every named plane read off that one output."""
+        from rvsm import model as M, prep as P
+        names = self.plane_names(heads)
+        parts = [self.piece(n, rung) for n in names]
+
+        def go(x):
+            with torch.no_grad(), P.autocast(self.dev):
+                y = self.net(x.contiguous(memory_format=M.memfmt()))
+            y = y[0] if isinstance(y, (list, tuple)) else y
+            return torch.cat([f(y) for f in parts], 1)
+        go.plane_names = names
+        return go
+
+    def head0(self, rung=RUNG):
+        """The first probability head at `rung` -- what the top-down cascade predicts one rung up."""
+        return self.plane_fn([str(self.layout.channels[0])], rung)
+
+    def __call__(self, x):
+        return self.plane_fn()(x)
+
+
+def student_fn(ckpt_path, device=None, compile=True, mode="max-autotune-no-cudagraphs", temps=True):
+    """A `Student` for a checkpoint: the net built from its own cfg/layout, the EMA weights loaded, the
+    per-rung temperature applied to the PROBABILITY heads only, ready to serve plane stacks."""
+    return Student(ckpt_path, device=device, compile=compile, mode=mode, temps=temps)
+
+
+def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, device=None,
+                   window=None, halo=None, cascade_depth=None, batch=1, rung=RUNG, tta=1, pyr=None,
+                   acc_dtype=torch.float16, umbilicus=None):
+    """One student pass over one region: `{plane name: (Z, Y, X) float32}` in rung-`rung` voxels.
+
+    `student` is a `Student` or a checkpoint path; `lo` / `size` the box in rung-`rung` voxels; `ax` the
+    umbilicus control points in rung-2 voxels (`axis.load`). `sign=-1` negates the radial input channels,
+    which is how a recto-trained student produces the VERSO band (round 0's verso store).
+
+    Every plane comes out of ONE sliding-window pass -- one forward per window, every head read off that
+    output -- and every plane is blended with the same Gaussian and zeroed wherever the CT is air.
+    """
+    st = student if isinstance(student, Student) else student_fn(student, device=device)
+    names = st.plane_names(heads)
+    w = int(window if window is not None else st.cfg.infer_window)
+    h = int(halo if halo is not None else st.cfg.infer_halo)
+    d = int(cascade_depth if cascade_depth is not None else st.cfg.cascade_depth)
+    inp = StudentInputs(ct, ax, lo, size, st.layout, meta=meta, rung=int(rung), ctx=st.cfg.ctx,
+                        window=w, halo=h, sign=sign, cascade_depth=d, head0=st.head0, device=st.dev,
+                        pyr=pyr, batch=batch)
+    fn = st.plane_fn(names, int(rung))
+    if int(tta) > 1:
+        fn = flips_chan(fn, int(tta), radial=True)
+    out = run_region(fn, inp, tuple(int(v) for v in ladder.shape3(size)), w, h, batch=batch,
+                     planes=len(names), offs=inp.offs, acc_dtype=acc_dtype)
+    return {n: np.ascontiguousarray(out[i].float().cpu().numpy(), np.float32)
+            for i, n in enumerate(names)}
