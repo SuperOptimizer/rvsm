@@ -179,7 +179,7 @@ class Config:
     rungs: tuple = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)  # the rungs a run trains on
     rung_boost: dict = field(default_factory=lambda: {2: 2})  # extra draw weight per rung
     region: int = 1024                 # region edge in rung-2 voxels: the unit of production and walk
-    windows_per_region: int = 64       # training windows drawn from a region per visit
+    windows_per_region: int = 128      # training windows drawn from a region per visit
     visits_max: int = 64               # how often the walk may return to one region
     air_keep: float = 0.1              # probability of keeping a drawn window that is pure air
     occ_min_fine: float = 0.05         # minimum CT occupancy fraction for a rung-2 region
@@ -226,7 +226,7 @@ class Config:
     verso_source: str = "flip"         # verso stores come from the student run with the radial sign flipped
     verso_after_steps: int = 10000     # round-0 verso starts here if the gate has not already fired
     verso_gate_dice: float = 0.6       # ... or earlier, once the held-out recto reaches this dice
-    eval_every: int = 500              # held-out evaluation cadence, in steps
+    eval_every: int = 2000             # held-out evaluation cadence, in steps
     calibrate: bool = True             # refit the temperatures after every eval
     infer_window: int = 256            # sliding-window edge at inference
     infer_halo: int = 32               # window overlap discarded on each side
@@ -238,7 +238,9 @@ class Config:
     produce_max_min: float = 10.0      # timeshare: maximum minutes of production per phase
     reserve_gb: float = 50.0           # production pauses below this much free disk
     round_steps: int = 20000           # a round ends here if the plateau fit has not ended it
-    compile: bool = True               # torch.compile the student
+    compile: bool = True               # torch.compile the student (and the teachers, when teacher_bf16)
+    teacher_bf16: bool = True          # teachers under bf16 autocast (+ compile): their fp32 forward was
+                                       # the whole cost of a teacher region
 
     # ------------------------------------------------------------------ derived
     def layout(self):

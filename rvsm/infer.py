@@ -360,6 +360,24 @@ def cascade_for(at_rung, k, o, s, depth, halo=CASCADE_HALO):
 # --------------------------------------------------------------------------- #
 # The teacher pass
 # --------------------------------------------------------------------------- #
+def fast_teacher(net, device, compile=True, mode="max-autotune-no-cudagraphs"):
+    """A teacher module as the producer runs it: bf16 autocast (the teachers load in fp32, and an fp32
+    forward was the whole cost of a teacher region) and, on CUDA, `torch.compile` in `mode`. The raw
+    module stays the caller's: ONNX export for a TensorRT plan wants it uncompiled.
+
+    The compiled forward is traced for the one window shape it sees, so the first region pays the
+    compile (minutes with max-autotune) and every later one runs the tuned kernels."""
+    from rvsm import prep as P
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    run = torch.compile(net, mode=mode, dynamic=False) if (compile and dev.type == "cuda") else net
+
+    def go(x):
+        with torch.no_grad(), P.autocast(dev):
+            return run(x)
+    go.raw = net
+    return go
+
+
 def teacher_fn(net, spec, tta=1):
     """`(B, 1, w, w, w)` CT -> `(B, P, w, w, w)` probability: the teacher's activation, then its
     foreground channel (all channels when `fg_channel` is None)."""
@@ -397,7 +415,7 @@ def teacher_read(ct, lo, size, spec, pyr=None):
 
 def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1, window=None, halo=None,
                    batch=1, engine_dir=None, acc_dtype=torch.float16, net=None, roi=None,
-                   as_tensor=False):
+                   as_tensor=False, fast=None):
     """One teacher over one region: the foreground probability as (Z, Y, X) float32 at RUNG 2.
 
     `lo` / `size` are rung-2 voxels. A teacher whose `level` is 0 (recto) runs on the region as it is. A
@@ -408,7 +426,8 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
 
     `roi` is `teacher_read`'s result when the caller read the CT ahead of time. `as_tensor` returns the
     probability as a float16 tensor ON THE DEVICE instead of a host array, so a producer can fuse and
-    quantise there and move only uint8 across the bus.
+    quantise there and move only uint8 across the bus. `fast` is `fast_teacher(net, ...)`: what the
+    torch path runs when no TensorRT engine is in use.
     """
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if net is None:   # `net` is a teacher the CALLER already loaded: a producer loads each one once
@@ -424,7 +443,7 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
         eng = trt_mod.engine_for(net, spec.name, w, 1, engine_dir or ".", device=str(dev))
         if eng is not None:
             batch = 1
-    fn = teacher_fn(eng if eng is not None else net, spec, tta=tta)
+    fn = teacher_fn(eng if eng is not None else (fast or net), spec, tta=tta)
     lo, size = np.asarray(lo, np.int64), np.asarray(size, np.int64)
     blk, a = teacher_read(ct, lo, size, spec) if roi is None else roi
     odt = torch.float16 if as_tensor else torch.float32

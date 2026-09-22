@@ -200,14 +200,14 @@ rvsm status | stop | ledger --rebuild | umbilicus --ct URL --out umbilicus.json
 `rvsm/config.py` holds ONE `Config` dataclass (TOML via stdlib tomllib, flags override, resolved copy +
 fingerprint frozen in `config.json`). Tunables: `ct, umbilicus, out, size, patch, batch, ckpt_act, gpus,
 mode, rounds, steps, workers, tifxyz, teacher_ckpts, cache_gb`. Fixed recipe (v2 union of §26.6 + §29.9):
-ctx 1-9, rungs 2-11, rung_boost {2: 2}, region 1024, windows_per_region 64, visits_max 64, air_keep 0.1;
+ctx 1-9, rungs 2-11, rung_boost {2: 2}, region 1024, windows_per_region 128, visits_max 64, air_keep 0.1;
 lr 3e-4, warmup 200, rewarm 800, new_param_lr_mult 3, sched wsd (cooldown 10%), ema auto (k 50); aug `full2`
 from scan meta; cascade mix, self-p anneal 0.1->0.7, drop 0.1, noise on; planes radius + meta (5);
 head `[recto, verso | midline, thickness | logvar | affinity 8,16,32 x zyx]` (normals derived) -> cin 21,
 cout 14; loss_excl 0.1, loss_selfcons 0.1, loss_skel 0.05 (iters 4), loss_affinity 0.1, loss_sdist 1.0,
 loss_eikonal 0.1, pair construct (band 1.5, tau 0.5), **loss_ect 0.05 at rung 2 with ect_n 1** (the one
 deliberate deviation from §29.9, which excluded ECT only for attributability); calibrate after every eval;
-infer window 256 halo 32, cascade_depth 3, tta 1; verso_source flip; verso_after_steps 10000; eval_every 500;
+infer window 256 halo 32, cascade_depth 3, tta 1; verso_source flip; verso_after_steps 10000; eval_every 2000;
 held-out 8. The checkpoint stores `asdict(cfg)` + layout + temps; resume compares everything except
 `(steps, eval_every, workers, gpus, rounds)`.
 

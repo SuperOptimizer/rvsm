@@ -432,7 +432,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
               f"({len(miss.missing_keys)} missing, {len(miss.unexpected_keys)} unexpected)", flush=True)
 
     groups, split = param_groups(net, new_param_names(newp, net), cfg.new_param_lr_mult)
-    opt = torch.optim.AdamW(groups, lr=cfg.lr, weight_decay=0.01)
+    opt = torch.optim.AdamW(groups, lr=cfg.lr, weight_decay=0.01, fused=(dev.type == "cuda"))
     warm = int(cfg.rewarm) if init else int(cfg.warmup)
     S, C = wsd_stable_until(nsteps, cfg.cooldown)
     base = lr_lambda(nsteps, warm, sched=cfg.sched, stable_until=S, cooldown=C)

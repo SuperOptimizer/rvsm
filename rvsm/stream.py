@@ -18,7 +18,8 @@ cache is a plain object the producer calls: `fetch_region` before a pass, `relea
 
 What survives verbatim from usrm2 is the part that was load-bearing:
 
-- ONE keep-alive `aiohttp` session with a bounded connection pool, because the origin rewards reuse and
+- ONE keep-alive `aiohttp` session with a bounded pool of 32 connections (on the 5090, 32 gave 21 MiB/s
+  from dl.ash2txt.org with no errors against 8 MiB/s at 16; 64 churning jobs got 3), because the origin rewards reuse and
   punishes bursts;
 - `.part` + `os.replace`, so a killed process never leaves a half shard that decodes as garbage;
 - a per-path lock, so two regions wanting the same shard cost one GET;
@@ -248,7 +249,7 @@ class ShardCache:
     and `release(key)` gives those shards back to the LRU. Every public method is synchronous: the
     asyncio loop and the keep-alive session are this object's private business."""
 
-    def __init__(self, src, root, budget_gb=64.0, jobs=16, retries=4, log=print, seed=None):
+    def __init__(self, src, root, budget_gb=64.0, jobs=32, retries=4, log=print, seed=None):
         self.src = ladder.pyramid_base(str(src))
         self.seed = os.path.abspath(str(seed)) if seed else None
         self._complete = {}
@@ -411,10 +412,17 @@ class ShardCache:
         for arr, keys, _whole in need:
             paths += self._paths(arr, keys)
         t0 = time.time()
+        f = self._f
+        b0, n0, s0 = (f.bytes, f.fetched, f.seeded) if f is not None else (0, 0, 0)
         self._fetch(paths, key=key)
         self.evict()
         if self.remote:
-            self.log(f"rvsm cache: region {key} {len(paths)} shards in {time.time() - t0:.1f}s "
+            f, dt = self._f, max(time.time() - t0, 1e-6)
+            mb = ((f.bytes - b0) if f is not None else 0) / (1 << 20)
+            got = (f.fetched - n0) if f is not None else 0
+            seeded = (f.seeded - s0) if f is not None else 0
+            self.log(f"rvsm cache: region {key} {len(paths)} shards in {dt:.1f}s: {got} fetched "
+                     f"({mb:.0f} MiB, {mb / dt:.1f} MiB/s), {seeded} from the seed "
                      f"({self.cache_bytes / (1 << 30):.1f} GB buffered)")
         return key
 

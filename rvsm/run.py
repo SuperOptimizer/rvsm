@@ -398,6 +398,7 @@ class TeacherBank:
     def __init__(self, cfg, out, device=None, backend="torch"):
         from rvsm import teachers as T
         self.cfg, self.out, self.device, self.backend = cfg, str(out), device, str(backend)
+        self.fast = {}
         names = [n for n in (cfg.teacher_ckpts or {})] or ["recto", "m7"]
         self.items = []
         for n in names:
@@ -413,10 +414,12 @@ class TeacherBank:
             self.items.append([n, spec, str(ckpt), None])
 
     def _net(self, row):
-        from rvsm import teachers as T
+        from rvsm import infer, teachers as T
         if row[3] is None:
             net, spec = T.load_teacher(row[0], row[2], device=self.device or "cpu")
             row[1], row[3] = spec, net
+            self.fast[row[0]] = (infer.fast_teacher(net, self.device or "cpu", compile=self.cfg.compile)
+                                 if self.cfg.teacher_bf16 else None)
         return row[3]
 
     def read(self, ct, lo, size, pyr=None):
@@ -436,6 +439,7 @@ class TeacherBank:
             net = self._net(row)
             ps.append(infer.teacher_region(ct, lo, size, row[1], row[2], device=self.device,
                                            backend=self.backend, net=net, as_tensor=True,
+                                           fast=self.fast.get(row[0]),
                                            roi=(rois[i] if rois is not None else None),
                                            engine_dir=os.path.join(self.out, "ckpt", "trt")))
             names.append(row[0])
@@ -561,8 +565,11 @@ def lookahead(cfg, out, k_active):
     seconds the trainer spends on one region of the walk (it publishes that in state.json). Without
     either, L is its floor -- which is what a cold start wants anyway."""
     extra = int(cfg.lookahead_extra)
-    ps = [float(r["s"]) for r in tail_jsonl(os.path.join(str(out), "logs", "produce.jsonl"), 40)
-          if isinstance(r.get("s"), (int, float))][-10:]
+    # T_produce is the GPU thread's time per unit (its read wait + its passes): the writer and the
+    # fields pool overlap it, so their wall time says nothing about how fast the window advances.
+    ps = [float(r.get("gpu_s", r["s"])) + float(r.get("read_wait_s", 0.0))
+          for r in tail_jsonl(os.path.join(str(out), "logs", "produce.jsonl"), 40)
+          if r.get("kind") in ("teacher", "verso", "self") and isinstance(r.get("s"), (int, float))][-10:]
     tt = float(read_state(out).get("region_s") or 0.0)
     if not ps or tt <= 0:
         return int(k_active + extra)
