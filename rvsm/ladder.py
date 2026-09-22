@@ -119,25 +119,35 @@ def _read_json(path):
 
 
 def _level_names(base):
-    """The integer level names of a pyramid group, from its OME multiscales when it has them and by
-    probing `0, 1, 2, ...` when it does not (the only way to list a directory over plain HTTP)."""
+    """The integer level names of a pyramid group: the union of what its OME multiscales declares and
+    what is actually THERE, never just the declaration.
+
+    A volume's `multiscales` is written once, when the pyramid is built, and coarser levels added later
+    -- exactly what a mirror does, and what the rung ladder lives on -- do not appear in it. Trusting it
+    alone silently drops those levels, and nothing downstream can tell a pyramid that stops at level 5
+    from one that was built that way: `occupancy` then scans a 2.5 Gvox level instead of a 38 Mvox one,
+    which costs a minute and twenty gigabytes at every start. So a local group is listed from the
+    filesystem, and a remote one is probed past the last declared level until a level is missing (the
+    only way to list a directory over plain HTTP). Levels the declaration claims but that carry no
+    `zarr.json` are dropped: an unreadable level is worse than an absent one."""
     j = _read_json(f"{base}/zarr.json") or {}
     at = j.get("attributes", j) if isinstance(j, dict) else {}
     ms = ((at.get("ome") or at).get("multiscales") or [None])[0] if isinstance(at, dict) else None
     names = [str(d["path"]) for d in (ms or {}).get("datasets", [])] if ms else []
     names = [n for n in names if _INT.fullmatch(n)]
-    if names:
-        return sorted(names, key=int)
     if not is_url(base) and os.path.isdir(base):
-        return sorted((d for d in os.listdir(base) if _INT.fullmatch(d) and os.path.isdir(f"{base}/{d}")),
-                      key=int)
-    out = []
-    for l in range(NRUNGS):  # noqa: E741
+        have = {d for d in os.listdir(base) if _INT.fullmatch(d) and os.path.isdir(f"{base}/{d}")}
+        return sorted({n for n in set(names) | have if os.path.exists(f"{base}/{n}/zarr.json")}, key=int)
+    out = [n for n in sorted(names, key=int) if _read_json(f"{base}/{n}/zarr.json") is not None]
+    l = (int(out[-1]) + 1) if out else 0  # noqa: E741
+    while l < NRUNGS:  # noqa: E741
         if _read_json(f"{base}/{l}/zarr.json") is None:
             if out:
                 break
+            l += 1  # noqa: E741
             continue
         out.append(str(l))
+        l += 1  # noqa: E741
     return out
 
 

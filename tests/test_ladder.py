@@ -41,6 +41,26 @@ def test_rungs_url_matches_local(ct_origin):
     assert np.array_equal(a, b)
 
 
+def test_a_level_the_multiscales_never_learned_about_is_still_found(tmp_path, ct_origin):
+    """A mirror grows coarser levels after the group's `multiscales` was written. Trusting the
+    declaration alone drops them silently, and `occupancy` then scans a level three decades too big."""
+    import json
+    import shutil
+
+    from pathlib import Path
+
+    d = tmp_path / Path(ct_origin.path).name
+    shutil.copytree(ct_origin.path, d)
+    j = json.loads((d / "zarr.json").read_text())
+    ds = j["attributes"]["ome"]["multiscales"][0]["datasets"]
+    top = max(int(x["path"]) for x in ds)
+    j["attributes"]["ome"]["multiscales"][0]["datasets"] = [x for x in ds if int(x["path"]) < top]
+    (d / "zarr.json").write_text(json.dumps(j))      # the top level is on disk but no longer declared
+    L.clear_caches()
+    assert sorted(L.rungs(str(d))) == sorted(L.rungs(ct_origin.path))
+    L.clear_caches()
+
+
 def test_read_rung_matches_the_level(ct_origin):
     pyr = L.rungs(ct_origin.path)
     lo, p = (16, 32, 48), 32
