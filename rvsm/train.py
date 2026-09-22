@@ -509,8 +509,11 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     if cfg.cascade in ("self", "mix"):
         casnet = M.build(cfg.size, cin=layout.cin, cout=layout.cout, verbose=False).to(dev)
         casnet.eval()
+    casfwd = None
+    if casnet is not None and cfg.compile and dev.type == "cuda":
+        casfwd = torch.compile(casnet, mode="max-autotune-no-cudagraphs", dynamic=False)
     cas = prep.Cascade(cfg.cascade, self_p=cfg.self_p_lo, drop=cfg.cascade_drop,
-                       noise=cfg.cascade_noise, net=casnet)
+                       noise=cfg.cascade_noise, net=casnet, fwd=casfwd)
     casval = prep.Cascade("self" if cfg.cascade in ("self", "mix") else "mask", self_p=1.0, drop=0.0,
                           noise=False, net=evnet)
 
@@ -584,6 +587,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         ph.mark("aug")
         nvox += int(np.prod(ct.shape[2:])) * ct.shape[0]
 
+        if net.ckpt_act and not ct.requires_grad:
+            ct.requires_grad_()    # here, not in forward(): requires_grad_ inside it is a graph break
         with prep.autocast(dev):
             pred = model(ct)
             outs = [o.float() for o in pred] if isinstance(pred, (list, tuple)) else [pred.float()]

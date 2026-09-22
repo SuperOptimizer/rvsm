@@ -207,10 +207,14 @@ class Cascade:
     `drop`: probability that a sample's channel is zeroed altogether, so inference WITHOUT a coarse
     prediction stays in distribution. The top rung is always zero: there is no rung above it."""
 
-    def __init__(self, mode="off", self_p=0.5, drop=0.1, noise=True, net=None, seed=None):
+    def __init__(self, mode="off", self_p=0.5, drop=0.1, noise=True, net=None, seed=None, fwd=None):
         self.mode = str(mode or "off")
         assert self.mode in CASCADE_MODES, f"cascade {mode}: one of {CASCADE_MODES}"
         self.self_p, self.drop, self.noise, self.net = float(self_p), float(drop), bool(noise), net
+        # `fwd`: a compiled forward of `net` (the self pass is a whole extra 256^3 forward; eager it was
+        # the largest single cost of a training step on the A100). `net` stays the module whose
+        # state_dict `sync` copies the EMA into: a compiled wrapper renames every key.
+        self.fwd = fwd
         self.gen = None if seed is None else torch.Generator().manual_seed(int(seed))
         # (B,) 1 where the last `channel()` call took the SELF source for that sample. The cascade
         # self-consistency loss scores ONLY those: the `mask` source is the coarse TARGET, so a
@@ -285,7 +289,7 @@ class Cascade:
         was = self.net.training
         self.net.eval()
         with autocast(dev):
-            y = self.net(x.to(memory_format=M.memfmt()))
+            y = (self.fwd or self.net)(x.to(memory_format=M.memfmt()))
         self.net.train(was)
         y = y[0] if isinstance(y, (list, tuple)) else y
         p = torch.sigmoid(y.float())[:, :1].to(dtype)

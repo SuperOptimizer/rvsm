@@ -1295,7 +1295,7 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     try:
         for _ in range(max(int(cfg.rounds), 1)):
             ck = TR.train(cfg, out=out, init=init, resume=resume, patches_factory=patches_factory,
-                          device=dev, val_items=val, hook=hook, ckpt=ckpt)
+                          device=dev, val_items=val, hook=hook, ckpt=ckpt, accum=cfg.accum)
             init, resume = None, True
             if state["stop"]:
                 break

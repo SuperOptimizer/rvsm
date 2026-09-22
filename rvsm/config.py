@@ -162,7 +162,9 @@ class Config:
     out: str = "out"                   # the run directory; everything else is derived from it
     size: str = "30m6"                 # student preset (1m, 5m, 15m, 30m6, 60m)
     patch: int = 256                   # training patch edge, in rung-k voxels
-    batch: int = 2                     # patches per optimiser step per GPU
+    batch: int = 2                     # patches per forward per GPU
+    accum: int = 1                     # forwards accumulated per optimiser step (batch 1 x accum 2 is
+                                       # batch 2's step at half the activation memory)
     ckpt_act: int = 1                  # activation-checkpointing level (0 = off, higher = more recompute)
     gpus: tuple = (0,)                 # CUDA device ordinals available to the run
     mode: str = "auto"                 # auto | resident (one big card) | timeshare (alternating phases)
