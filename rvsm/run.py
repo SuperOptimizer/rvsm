@@ -1170,7 +1170,7 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     out = ctx["out"]
     found = cards(cfg.gpus)
     place = choose_mode(cfg.mode, found)
-    bud = budget(place)
+    bud = budget(place, table={"train": float(cfg.vram_train_gb), "produce": float(cfg.vram_produce_gb)})
     jlog(out, "sched", {"kind": "start", "mode": place["mode"], "phases": place["phases"],
                         "gpus": [g for g, _ in found], "budget_gb": {k: v["gb"] for k, v in bud.items()},
                         "regions": len(ctx["records"]), "heldout": len(ctx["heldout"])})
