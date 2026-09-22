@@ -98,6 +98,7 @@ BUDGET_GB = {"train": 46.0, "produce": 30.0}
 REFERENCE_GB = 80.0
 HEADROOM_GB = 4.0
 RESIDENT_MIN_GB = 70.0      # one card at least this big runs every role resident
+RESIDENT_SLACK = 0.05       # resident roles may get up to 5 % less than the table before the run refuses
 
 
 # --------------------------------------------------------------------------- #
@@ -258,9 +259,14 @@ def budget(place, table=None, headroom=HEADROOM_GB):
         return {r: {"gb": 0.0, "fraction": 0.0} for r in table}
     scale = total / REFERENCE_GB
     if place["mode"] == "resident":
-        want = {r: v * scale for r, v in table.items()}
-        if sum(want.values()) > total - headroom:
-            raise SystemExit(budget_table(want, total, headroom))
+        # The usable card is split between the roles in the table's proportions. The table sums to
+        # exactly 80 - 4, and an "80 GB" card reports 79.3 GiB, so scaling it by total / 80 and then
+        # demanding the 4 GB headroom on top refused the very card it was written for. A role may get
+        # at most RESIDENT_SLACK less than its table entry; below that the run refuses.
+        fit = (total - headroom) / max(sum(table.values()), 1e-9)
+        if fit < 1.0 - RESIDENT_SLACK:
+            raise SystemExit(budget_table(table, total, headroom))
+        want = {r: v * fit for r, v in table.items()}
         return {r: {"gb": v, "fraction": min(v / total, 1.0)} for r, v in want.items()}
     if place["phases"]:   # alternating on one card: each role may use the whole card in its phase
         v = max(total - headroom, 1.0)

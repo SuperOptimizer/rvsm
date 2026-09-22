@@ -205,6 +205,10 @@ def test_choose_mode_and_the_vram_budget_table():
     b = RUN.budget(big)
     assert b["train"]["gb"] + b["produce"]["gb"] <= 80.0 - RUN.HEADROOM_GB
     assert 0 < b["train"]["fraction"] < 1 and 0 < b["produce"]["fraction"] < 1
+    # what an "80 GB" A100 actually reports: the table must fit it (it used to refuse by 0.03 GB)
+    a100 = RUN.budget({"mode": "resident", "phases": False, "total_gb": 79.25})
+    assert a100["train"]["gb"] + a100["produce"]["gb"] <= 79.25 - RUN.HEADROOM_GB + 1e-9
+    assert a100["train"]["gb"] > 45.0 and a100["produce"]["gb"] > 29.0
     # the same table on a card it cannot fit on: refuse, and print the table
     with pytest.raises(SystemExit) as e:
         RUN.budget({"mode": "resident", "phases": False, "total_gb": 40.0},
