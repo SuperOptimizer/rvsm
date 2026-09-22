@@ -394,3 +394,12 @@ def test_setup_on_a_url_finds_the_regions(small_cfg, ct_origin, tmp_path):
     ref = RUN.setup(replace(small_cfg, out=str(tmp_path / "path_run")), str(tmp_path / "path_run"))
     assert len(ctx["records"]) == len(ref["records"]) > 0
     assert len(ctx["heldout"]) == len(ref["heldout"]) > 0
+
+
+def test_the_walk_sampler_class_pickles_by_name():
+    """The loader's forkserver workers unpickle the dataset by its qualified name; a class built inside
+    a function cannot be found that way (`rvsm run` with workers > 0 died on it on the first GPU run)."""
+    import pickle
+    cls = RUN.walk_patches()
+    assert pickle.loads(pickle.dumps(cls)) is cls
+    assert cls.__module__ == "rvsm.walk"
