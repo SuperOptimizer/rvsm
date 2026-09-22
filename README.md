@@ -27,6 +27,19 @@ rvsm status | stop | ledger --rebuild | umbilicus --ct URL --out umbilicus.json
 Only the skeleton is in place so far (`rvsm.config`, `rvsm.ladder`, `rvsm.axis`, `rvsm.scanmeta`); the
 subcommands land with the modules that drive them.
 
+## Documentation
+
+Everything about *why* rvsm is built this way is under [`docs/`](docs/); each document cites the usrm2
+design sections and the measured runs behind it, so a reviewer can reconstruct any decision.
+
+| document | what it is for |
+|---|---|
+| [`docs/plan.md`](docs/plan.md) | the implementation plan, approved 2026-09-22, verbatim, plus the user decisions it records and a table mapping its 7 commits to the actual history on `main` |
+| [`docs/rationale.md`](docs/rationale.md) | why rvsm exists: the usrm2 pipeline's failure modes with their incidents, the measured numbers a reviewer needs (u1/u3 surface metrics vs the label ceiling, training speeds, store-format facts, the TensorRT findings), and every design decision with its evidence and the alternative rejected |
+| [`docs/recipe.md`](docs/recipe.md) | every fixed default in `rvsm/config.py`, one line of justification each, with a pointer to the research or design section that supports it, and the residual experiment list |
+| [`docs/research/README.md`](docs/research/README.md) | the 18-document research corpus indexed one paragraph at a time, with the consolidated bibliography |
+| [`docs/review_checklist.md`](docs/review_checklist.md) | what to verify before a production run: contracts, store rules, weighting rules, gates, VRAM budgets, resumability, the test covering each, and the known gaps |
+
 ## Install
 
 ```sh
