@@ -707,11 +707,15 @@ def register(name, spec):
 # --------------------------------------------------------------------------- #
 CACHE_DIR = "~/.cache/rvsm"
 MIN_BYTES = 1 << 20   # anything smaller than a megabyte is an error page, not a teacher
+MIN_EXTRA_BYTES = 512  # the companions are JSON: kilobytes, so they get their own floor
 
 
-def _download(url, dest, log=print):
+def _download(url, dest, log=print, min_bytes=MIN_BYTES):
     """Stream `url` to `dest` through `<dest>.part`, so an interrupted fetch is never mistaken for a
-    finished one, and check the result is plausibly a checkpoint before the rename."""
+    finished one, and check the result is plausibly what was asked for before the rename.
+
+    `min_bytes` is the floor: a checkpoint below a megabyte is an error page, but a companion like
+    nnU-Net's `plans.json` is a few kilobytes and has its own (much smaller) floor."""
     import urllib.request
     part = str(dest) + ".part"
     os.makedirs(os.path.dirname(str(dest)) or ".", exist_ok=True)
@@ -728,8 +732,9 @@ def _download(url, dest, log=print):
                 n += len(chunk)
                 if total and n % (1 << 26) < (1 << 22):
                     log(f"[teachers] {os.path.basename(str(dest))}: {n >> 20}/{total >> 20} MiB")
-        if n < MIN_BYTES:
-            raise RuntimeError(f"{url}: {n} bytes is too small to be a checkpoint")
+        if n < min_bytes:
+            raise RuntimeError(f"{url}: {n} bytes is too small (floor {min_bytes}): "
+                               f"an error page, not the file")
         os.replace(part, str(dest))
     except BaseException:
         if os.path.exists(part):
@@ -760,7 +765,7 @@ def fetch_weights(name, cache_dir=CACHE_DIR, extras=False, log=print):
         for u, fn in spec.extra_urls:
             p = os.path.join(d, fn)
             if not os.path.exists(p):
-                _download(u, p, log=log)
+                _download(u, p, log=log, min_bytes=MIN_EXTRA_BYTES)
     if os.path.exists(dest):
         if os.path.getsize(dest) >= MIN_BYTES:
             return dest

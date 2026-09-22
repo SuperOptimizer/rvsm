@@ -225,10 +225,20 @@ def test_fetch_weights_replaces_a_truncated_cache_entry(tmp_path, hf):
 
 def test_fetch_weights_extras(tmp_path, hf):
     hf.served["https://hf.test/w.pth"] = b"z" * (2 << 20)
-    hf.served["https://hf.test/plans.json"] = b"{}" + b" " * (2 << 20)
+    # A companion is JSON, kilobytes not megabytes: the checkpoint floor must not apply to it.
+    hf.served["https://hf.test/plans.json"] = b'{"configurations": {}}' + b" " * 10_000
     teachers.fetch_weights("fetchme", cache_dir=tmp_path, extras=True, log=lambda *a: None)
     assert (tmp_path / "plans.json").exists()         # fetched for a human, never read by rvsm
     assert (tmp_path / "w.pth").exists()
+
+
+def test_an_empty_companion_is_still_rejected(tmp_path, hf):
+    hf.served["https://hf.test/w.pth"] = b"z" * (2 << 20)
+    hf.served["https://hf.test/plans.json"] = b"nope"          # an error page, not a plans file
+    with pytest.raises(RuntimeError):
+        teachers.fetch_weights("fetchme", cache_dir=tmp_path, extras=True, log=lambda *a: None)
+    assert not (tmp_path / "plans.json").exists()
+    assert not (tmp_path / "plans.json.part").exists()
 
 
 def test_a_teacher_without_a_url_says_so(tmp_path, fake_teacher):
