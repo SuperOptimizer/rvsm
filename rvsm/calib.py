@@ -110,13 +110,32 @@ def collect(net, grid_iter, layout=None, device=None, stride=(2, 4, 4)):
     return {k: tuple(torch.cat([q[i] for q in v]) for i in range(3)) for k, v in out.items()}
 
 
-def run(net, grid_iter, layout=None, device=None, all_rungs=False):
+def keep(per, lg, t, w, rung, stride=(2, 4, 4)):
+    """Add one window's channel-0 (logit, target, weight) to a `collect`-style dict, strided the same
+    way `collect` strides it (axes shorter than 64 kept whole). Lets an evaluation that already ran the
+    forward hand its logits to `run(per=...)` instead of calibration running the grid a second time."""
+    sl = (slice(None), slice(0, 1)) + tuple(slice(None, None, int(q) if n >= 64 else 1)
+                                            for q, n in zip(stride, lg.shape[2:]))
+    a, b, c = lg[sl].detach().float().cpu(), t[sl].detach().float().cpu(), w[sl].detach().float().cpu()
+    if float(c.sum()) > 0:
+        per.setdefault(int(rung), []).append((a, b, c))
+    return per
+
+
+def stack(per):
+    """`keep`'s lists -> `collect`'s {rung: (logit, tgt, weight)}."""
+    return {k: tuple(torch.cat([q[i] for q in v]) for i in range(3)) for k, v in per.items()}
+
+
+def run(net, grid_iter, layout=None, device=None, all_rungs=False, per=None):
     """Fit one temperature per rung over `grid_iter` and return `{"temps": {rung: T}, "rungs": [row, ...]}`.
 
     A rung whose target is a pooled FRACTION (`binary_frac` above `BINARY_FRAC`) is reported but NOT
     given a temperature unless `all_rungs`: a temperature fitted against a fraction is not a calibration.
-    The caller writes `temps` into the checkpoint; nothing here touches a file."""
-    per = collect(net, grid_iter, layout=layout, device=device)
+    The caller writes `temps` into the checkpoint; nothing here touches a file. `per` is a precollected
+    `stack(keep(...))` (the trainer's evaluation collects it on its own forward), and then `net` and
+    `grid_iter` are not used."""
+    per = collect(net, grid_iter, layout=layout, device=device) if per is None else per
     rows, temps = [], {}
     for k in sorted(per):
         lg, tg, w = per[k]

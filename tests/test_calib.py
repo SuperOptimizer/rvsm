@@ -86,3 +86,22 @@ def test_collect_drops_weightless_batches():
     t = torch.zeros(1, lay.cout_t, 4, 4, 4)
     per = calib.collect(_Net(lay.cout, 1.0), [(x, t, torch.zeros_like(t), 2)], layout=lay)
     assert per == {}
+
+
+def test_run_on_kept_logits_is_run_on_the_grid():
+    """The trainer calibrates on the logits its evaluation already computed (`keep` / `stack` /
+    `run(per=...)`); that must be the same fit as `run` collecting them itself."""
+    lay = Config(channels=("recto", "verso"), aff_offsets=(8,)).layout()
+    torch.manual_seed(1)
+    grid, kept = [], {}
+    net = _Net(lay.cout, 2.0)
+    for _ in range(4):
+        z = torch.empty(1, 1, 8, 8, 8).uniform_(-6, 6)
+        t = (torch.rand_like(z) < torch.sigmoid(z)).float()
+        x = torch.cat([z, torch.zeros(1, lay.cin - 1, 8, 8, 8)], 1)
+        tt = torch.cat([t] + [torch.zeros_like(t)] * (lay.cout_t - 1), 1)
+        grid.append((x, tt, torch.ones_like(tt), 2))
+        calib.keep(kept, net(x)[:, :lay.cout_t], tt, torch.ones_like(tt), 2)
+    a = calib.run(net, grid, layout=lay)
+    b = calib.run(None, None, layout=lay, per=calib.stack(kept))
+    assert a["temps"] == b["temps"]

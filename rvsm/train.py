@@ -227,7 +227,7 @@ def _rungs_of(b):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev, layout, cascade=None):
+def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
     """bce / dice / mae over the validation grid, plus the metrics the layout makes meaningful.
 
     Every entry is a compact rung sample (`sample.rung_item`), whose input is built on the device by
@@ -263,6 +263,9 @@ def evaluate(net, grid, dev, layout, cascade=None):
                 pch.setdefault(f"mae_{nm}", []).append(
                     float((pv - dec(tg[:, j:j + 1])).abs().mul(wc).sum() / wc.sum()))
         logit, tgt, w = y[:, :ct_t], tg[:, :ct_t], ww[:, :ct_t]
+        if calib_keep is not None:     # the calibration's logits, off THIS forward (see calib.keep)
+            from rvsm import calib as _cal
+            _cal.keep(calib_keep, logit, tgt, w, rung)
         p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tgt >= 0.5).float()
         np_ = layout.nprob
@@ -514,8 +517,13 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         casfwd = torch.compile(casnet, mode="max-autotune-no-cudagraphs", dynamic=False)
     cas = prep.Cascade(cfg.cascade, self_p=cfg.self_p_lo, drop=cfg.cascade_drop,
                        noise=cfg.cascade_noise, net=casnet, fwd=casfwd)
+    # the evaluation net runs compiled too (its forward and its cascade self pass): eager, the grid's
+    # evaluation was ~2 s a window on the A100, ~7 min for four held-out regions
+    evfwd = evnet
+    if cfg.compile and dev.type == "cuda":
+        evfwd = torch.compile(evnet, mode="max-autotune-no-cudagraphs", dynamic=False)
     casval = prep.Cascade("self" if cfg.cascade in ("self", "mix") else "mask", self_p=1.0, drop=0.0,
-                          noise=False, net=evnet)
+                          noise=False, net=evnet, fwd=(evfwd if evfwd is not evnet else None))
 
     acfg = _aug_cfg(cfg)
     model = torch.compile(net) if cfg.compile else net
@@ -534,19 +542,19 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             return
         evnet.load_state_dict(ema)
         te = time.time()
-        rec = {"step": step, **evaluate(evnet, grid, dev, layout, cascade=casval)}
+        kept = {} if cfg.calibrate else None
+        rec = {"step": step, **evaluate(evfwd, grid, dev, layout, cascade=casval, calib_keep=kept)}
         t_ev = time.time() - te
         try:
             (out / "eval").mkdir(parents=True, exist_ok=True)
-            val_png(out / "eval" / f"val_{step:06d}.png", evnet, grid, dev, layout, cascade=casval)
+            val_png(out / "eval" / f"val_{step:06d}.png", evfwd, grid, dev, layout, cascade=casval)
         except Exception as e:   # noqa: BLE001  -- a missing PIL must never stop a run
             print("[train] val_png:", repr(e), flush=True)
         t_png = time.time() - te - t_ev
-        if cfg.calibrate:
+        if cfg.calibrate:        # on the evaluation's own logits: the grid is not run a second time
             from rvsm import calib
             temps = {str(k): v for k, v in
-                     calib.run(evnet, _prepared(grid, dev, layout, cascade=casval),
-                               layout=layout).get("temps", {}).items()}
+                     calib.run(evnet, None, layout=layout, per=calib.stack(kept)).get("temps", {}).items()}
         rec["eval_s"] = {"evaluate": round(t_ev, 1), "val_png": round(t_png, 1),
                          "calibrate": round(time.time() - te - t_ev - t_png, 1)}
         _log(str(out / "logs" / "eval.jsonl"), rec)
