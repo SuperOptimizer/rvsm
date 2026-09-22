@@ -52,7 +52,7 @@ because they have no dependency on the driver.
 | 4 — losses + aug + train | `2a44646` *losses, augmentation, calibration, distance targets and evaluation: the pure ports* (`losses.py`, `aug.py`) | **partial**: the loss and augmentation ports landed; `rvsm/train.py` and `tests/test_train.py` exist in the working tree but are not yet committed |
 | 5 — student inference + verso + distance stores + calib + export | `b6a99c2` (`infer.py`, `export.py`) + `2a44646` (`calib.py`, `targets.py`) | **partial**: the ported pieces are in; the student/verso production path and the `rvsm produce --student` acceptance test are not yet committed |
 | 6 — the driver: `run.py`, supervisor, Producer, lookahead, verso gate, rounds, GPU modes | — | **not started**; `rvsm/run.py` does not exist |
-| 7 — evaluation v2 + pretrain + ladder + status/stop/ledger | `2a44646` (`evalsurf.py`) | **partial**: the evaluation port is in; `pretrain.py`, `rvsm ladder`, `status`/`stop`/`ledger` are not |
+| 7 — evaluation v2 + pretrain + ladder + status/stop/ledger | `2a44646` (`evalsurf.py`) → *evaluation, calibration, the ledger, masked-cube pretraining and the size ladder* | **partial**: `rvsm eval`, `calibrate`, `ledger`, `umbilicus`, `pretrain` and `ladder` / `ladder-report` are in (`rvsm/pretrain.py`, `rvsm/sizeladder.py` — the SIZE ladder needs its own module because `rvsm/ladder.py` is the RUNG ladder); `status` and `stop` belong to the driver (commit 6), which owns `state.json` |
 
 Not yet reached at all: the post-implementation steps at the end of §7 (push, build `libvolcomp.so` on the
 A100 with portable flags, copy the teacher weights, stop u4, first `rvsm run`) and all of §8's verification.
