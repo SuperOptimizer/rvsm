@@ -403,3 +403,20 @@ def test_the_walk_sampler_class_pickles_by_name():
     cls = RUN.walk_patches()
     assert pickle.loads(pickle.dumps(cls)) is cls
     assert cls.__module__ == "rvsm.walk"
+
+
+def test_the_trainer_walks_the_producers_walk(small_cfg, tmp_path):
+    """Both halves must step along the SAME walk: the producer's route comes from `run.walk`, and the
+    trainer's sampler builds its visits and order from the records it is handed. It used to be handed
+    setup's full list (held-out regions included), so the two orders differed."""
+    from dataclasses import replace
+    cfg = replace(small_cfg, out=str(tmp_path / "w"), heldout=1)
+    ctx = RUN.setup(cfg, cfg.out)
+    assert ctx["heldout"]
+    ds = RUN.walk_patches()(cfg, cfg.out, root=cfg.out, ct=ctx["ct"], ax=ctx["ax"], round_=0,
+                            heldout=ctx["heldout"], meta=ctx["meta5"],
+                            region_records=RUN.walk_records(ctx["records"], ctx["heldout"]))
+    ds._open()
+    assert [int(i) for i in ds.order] == [int(i) for i in ctx["order"]]
+    assert [(v["k"], v["lo"], v.get("v")) for v in ds.visits] == \
+        [(v["k"], v["lo"], v.get("v")) for v in ctx["visits"]]

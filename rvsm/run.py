@@ -328,10 +328,19 @@ def heldout_set(out, cfg, recs, ax, write=True):
     return held
 
 
+def walk_records(recs, heldout=()):
+    """The region records the walk is built from: every record not inside a held-out region. The
+    trainer's sampler must be handed THESE, not `setup`'s full list -- it builds its own visits and
+    order from what it is given, and a list that still held the held-out regions gave the trainer a
+    different walk from the producer's (the trainer then waited on regions the producer had no reason
+    to make)."""
+    return [r for r in recs if not _inside_any(r, heldout)]
+
+
 def walk(cfg, recs, heldout=(), seed=0):
     """(visits, order): the deterministic walk both sides step along, from the same inputs."""
     from rvsm import regions as RG
-    recs = [r for r in recs if not _inside_any(r, heldout)]
+    recs = walk_records(recs, heldout)
     visits = RG.region_visits(recs, cfg.visits_max)
     return visits, [int(i) for i in RG.walk_order(visits, seed)]
 
@@ -1276,7 +1285,7 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     def patches_factory():
         ds = walk_patches()(cfg, out, root=out, ct=ctx["ct"], ax=ctx["ax"], round_=state["round"],
                             heldout=ctx["heldout"], meta=ctx["meta5"],
-                            region_records=ctx["records"],
+                            region_records=walk_records(ctx["records"], ctx["heldout"]),
                             lookahead_n=lookahead(cfg, out, k_active))
         return sample.loader(ds, workers=cfg.workers, batch=cfg.batch)
 
