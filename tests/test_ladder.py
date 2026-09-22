@@ -160,3 +160,17 @@ def test_volcomp_level_round_trips(tmp_path, has_volcomp):
     pyr = L.rungs(str(d))
     assert sorted(pyr) == [2]
     assert np.array_equal(L.read_rung(pyr, 2, (0, 0, 0), 128, dtype=np.uint8), v)  # q=0 is exact
+
+
+def test_pool2_is_the_float_mean_floored():
+    """The integer-sum pool2 against the float formula it replaced, odd shapes included."""
+    rng = np.random.default_rng(0)
+    for shape in ((8, 8, 8), (7, 9, 5), (1, 2, 3), (33, 16, 17)):
+        v = rng.integers(0, 256, size=shape, dtype=np.uint8)
+        s = np.array(v.shape, np.int64)
+        n = -(-s // 2)
+        pv = np.pad(v, [(0, int(q)) for q in n * 2 - s])
+        want = pv.reshape(n[0], 2, n[1], 2, n[2], 2).astype(np.float32).mean((1, 3, 5)).astype(np.uint8)
+        assert np.array_equal(L.pool2(v), want), shape
+    v = np.full((4, 4, 4), 255, np.uint8)
+    assert (L.pool2(v) == 255).all()

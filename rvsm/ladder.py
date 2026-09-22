@@ -195,12 +195,21 @@ def shape3(p):
 
 
 def pool2(v):
-    """2x mean pooling of a uint8 volume, zero-padded to an even shape (as `read_rung` pools)."""
+    """2x mean pooling of a uint8 volume, zero-padded to an even shape (as `read_rung` pools).
+
+    The mean of eight uint8 values cast back to uint8 is floor(sum / 8), so it is computed as an
+    integer sum: the same bytes as `astype(float32).mean().astype(uint8)` (test), without the
+    4-bytes-a-voxel float copy of the whole block (a 1 GB region store pooled in ~10 s and 4 GB)."""
     s = np.array(v.shape, np.int64)
     n = -(-s // 2)
     if (s % 2).any():
         v = np.pad(v, [(0, int(q)) for q in n * 2 - s])
-    return v.reshape(n[0], 2, n[1], 2, n[2], 2).astype(np.float32).mean((1, 3, 5)).astype(np.uint8)
+    r = np.ascontiguousarray(v).reshape(n[0], 2, n[1], 2, n[2], 2)
+    t = r[:, 0, :, 0, :, 0].astype(np.uint16)
+    for a, b, c in ((0, 0, 1), (0, 1, 0), (0, 1, 1), (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)):
+        t += r[:, a, :, b, :, c]
+    t >>= 3
+    return t.astype(np.uint8)
 
 
 def _cache_bytes():
