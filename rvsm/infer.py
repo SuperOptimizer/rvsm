@@ -366,7 +366,7 @@ def teacher_fn(net, spec, tta=1):
 
 
 def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1, window=None, halo=None,
-                   batch=1, engine_dir=None, acc_dtype=torch.float16):
+                   batch=1, engine_dir=None, acc_dtype=torch.float16, net=None):
     """One teacher over one region: the foreground probability as (Z, Y, X) float32 at RUNG 2.
 
     `lo` / `size` are rung-2 voxels. A teacher whose `level` is 0 (recto) runs on the region as it is. A
@@ -376,7 +376,10 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
     COARSE air mask (the loader masks again with the fine CT, so a coarse mask here is safe and cheap).
     """
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    net, spec = teachers.load_teacher(spec.name if hasattr(spec, "name") else spec, ckpt, device=dev)
+    if net is None:   # `net` is a teacher the CALLER already loaded: a producer loads each one once
+        net, spec = teachers.load_teacher(spec.name if hasattr(spec, "name") else spec, ckpt, device=dev)
+    elif isinstance(spec, str):
+        spec = teachers.TEACHERS[spec]
     lvl = int(spec.level)
     w = int(window or spec.patch[0])
     h = int(halo if halo is not None else max(1, w // 8))
@@ -483,6 +486,8 @@ def load_student_ckpt(path, map_location="cpu"):
     from rvsm.config import Config, _coerce, _TYPES
     st = torch.load(str(path), map_location=map_location, weights_only=False)
     raw = next((st[k] for k in CKPT_CFG_KEYS if isinstance(st.get(k), dict)), None)
+    if isinstance(raw, dict) and isinstance(raw.get("config"), dict):
+        raw = raw["config"]   # a TRAINER checkpoint stores `cfg.to_json()` = {config, layout, fingerprint}
     assert raw is not None, f"{path}: no config in the checkpoint (looked for {CKPT_CFG_KEYS})"
     cfg = Config(**{k: _coerce(k, v) for k, v in raw.items() if k in _TYPES})
     sd = next((st[k] for k in CKPT_STATE_KEYS if isinstance(st.get(k), dict) and st[k]), None)

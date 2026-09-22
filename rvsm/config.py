@@ -223,6 +223,7 @@ class Config:
     # ------------------------------------------------------------------ fixed recipe: rounds + inference
     verso_source: str = "flip"         # verso stores come from the student run with the radial sign flipped
     verso_after_steps: int = 10000     # round-0 verso starts here if the gate has not already fired
+    verso_gate_dice: float = 0.6       # ... or earlier, once the held-out recto reaches this dice
     eval_every: int = 500              # held-out evaluation cadence, in steps
     calibrate: bool = True             # refit the temperatures after every eval
     infer_window: int = 256            # sliding-window edge at inference
@@ -273,7 +274,13 @@ def _coerce(name, v):
     if isinstance(cur, float):
         return float(v)
     if isinstance(cur, dict):
-        return dict(v)
+        d = dict(v)
+        # TOML keys are always strings; a field whose defaults are keyed by RUNG (`rung_boost`) must
+        # come back keyed by int, or the boost silently applies to nothing (and the fingerprint, which
+        # json-encodes the keys as strings either way, would not show it).
+        if cur and all(isinstance(k, int) for k in cur):
+            d = {int(k): q for k, q in d.items()}
+        return d
     return type(cur)(v)
 
 

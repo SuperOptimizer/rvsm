@@ -397,7 +397,7 @@ def _prepared(grid, dev, layout, cascade=None):
 
 
 def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=None, val_items=None,
-          steps=None, accum=1):
+          steps=None, accum=1, hook=None, ckpt=None):
     """Train the student. Returns the checkpoint path.
 
     `patches_factory()` returns a fresh iterable of samples: either collated batches (what
@@ -406,6 +406,13 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
 
     `val_items` is the held-out grid (a list of rung_items, from `sample.val_grid`); without one the
     evaluation, the PNG and the calibration are skipped and only the checkpoint is written.
+
+    `hook(info)` is called after every evaluation+checkpoint, with `{step, net, opt, ema, temps, out,
+    ckpt}`; returning something truthy ENDS the loop (the checkpoint is already on disk). That is the
+    one seam `rvsm/run.py` needs: the state file, the STOP marker, the timeshare phase swap and the
+    verso / round gates all live there and none of them belong in the step loop. `ckpt` overrides where
+    the checkpoint is written (the driver keeps it at `<out>/ckpt/student.pt`, beside the round
+    teachers).
     """
     out = Path(out or cfg.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -438,7 +445,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     ema = {k: v.detach().clone() for k, v in net.state_dict().items()}
     step, temps = 0, {}
 
-    ck = out / "ckpt.pt"
+    ck = Path(ckpt) if ckpt else out / "ckpt.pt"
+    ck.parent.mkdir(parents=True, exist_ok=True)
     if resume and ck.exists():
         st = torch.load(ck, map_location=dev, weights_only=False)
         got = (st.get("cfg") or {}).get("fingerprint")
@@ -606,6 +614,9 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:
             do_eval()
             save()
+            if hook is not None and hook({"step": step, "net": net, "opt": opt, "ema": ema,
+                                          "temps": temps, "out": str(out), "ckpt": str(ck)}):
+                break
             t0, tw = time.time(), time.time()
     save()
     return str(ck)
