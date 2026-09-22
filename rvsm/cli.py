@@ -440,3 +440,70 @@ def train(argv):
                   device=(f["device"][0] if f.get("device") else None), val_items=val)
     print(f"[train] wrote {ck}", flush=True)
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# `rvsm train`: the trainer alone, on whatever stores already exist (commit 4)
+# --------------------------------------------------------------------------- #
+TRAIN_USAGE = """rvsm train cfg.toml [--out DIR] [--init CKPT] [--resume] [--steps N] [--device cuda]
+
+Trains the student on the region stores under `<out>/stores/round_<r>/`, with the held-out regions
+(`--heldout` of them, stratified by z and radius) kept out of the walk and used as the validation
+grid. Nothing is produced here: this is the trainer of `rvsm run` on its own, for a directory whose
+stores another process (or `rvsm produce`) has already written.
+
+  --out DIR     the run directory (default: the config's `out`)
+  --init CKPT   warm start from another run's weights (copied by tensor NAME; new slots start at zero)
+  --resume      continue `<out>/ckpt.pt`; the config fingerprint must match
+  --steps N     override the config's step budget
+"""
+
+
+def train(argv):
+    """The `train` subcommand. Returns a process exit code."""
+    import json
+
+    from rvsm import axis as AX, config as CFG, ladder, regions as RG, sample
+    from rvsm import train as TR
+
+    argv = list(argv)
+    # the positional config file is whatever comes before the first flag
+    cut = next((i for i, a in enumerate(argv) if str(a).startswith("--")), len(argv))
+    pos, f = argv[:cut], _flags(argv[cut:])
+    if "help" in f or "h" in f:
+        print(TRAIN_USAGE, end="")
+        return 0
+    over = {}
+    if f.get("out"):
+        over["out"] = str(f["out"][0])
+    if f.get("steps"):
+        over["steps"] = int(f["steps"][0])
+    cfg = CFG.load(str(pos[0]) if pos else None, overrides=over)
+    out = str(cfg.out)
+    os.makedirs(out, exist_ok=True)
+
+    # the round is whatever the run's own state says; a bare `rvsm train` on a fresh directory is round 0
+    round_ = 0
+    sp = os.path.join(out, "state.json")
+    if os.path.exists(sp):
+        with open(sp) as fh:
+            round_ = int(json.load(fh).get("round", 0))
+
+    pyr = ladder.rungs(cfg.ct)
+    ax = AX.load(cfg.umbilicus, ct=cfg.ct)
+    recs = RG.region_list(pyr, rungs=cfg.rungs, patch=cfg.patch, region=cfg.region,
+                          boost=cfg.rung_boost, occ_min_fine=cfg.occ_min_fine,
+                          occ_min_coarse=cfg.occ_min_coarse)
+    heldout = RG.held_out(recs, n=cfg.heldout, ax=ax)
+    print(f"[train] round {round_}: {len(recs)} region records, {len(heldout)} held out", flush=True)
+
+    def patches_factory():
+        ds = sample.Patches(cfg, root=out, ct=cfg.ct, ax=ax, round_=round_, heldout=heldout)
+        return sample.loader(ds, workers=cfg.workers, batch=cfg.batch)
+
+    val = sample.val_grid(cfg, heldout, root=out, ct=cfg.ct, ax=ax, round_=round_)
+    ck = TR.train(cfg, out=out, init=(f["init"][0] if f.get("init") else None),
+                  resume="resume" in f, patches_factory=patches_factory,
+                  device=(f["device"][0] if f.get("device") else None), val_items=val)
+    print(f"[train] wrote {ck}", flush=True)
+    return 0

@@ -1,0 +1,611 @@
+"""The student trainer: one process, one device, the whole v2 recipe in one step loop.
+
+Everything the run learns happens here. A step is
+
+    sample  ->  prep.prepare (build the 21-channel stem on the device)
+            ->  aug.apply    (the scan's own augmentation ranges, converted to the sample's rung)
+            ->  forward      (deep supervision when the preset has it)
+            ->  Phase A      deep BCE + soft dice on the probability heads, then the auxiliary terms
+                             (exclusivity, cascade self-consistency, skeleton recall, affinity)
+            ->  Phase B      the signed midline distance and the thickness, with the Eikonal
+                             regulariser and the heteroscedastic log-variance
+            ->  Phase C      the CONSTRUCTED pair: `pair_bands(midline, thickness)` scored against the
+                             recto/verso targets, so the two faces cannot overlap by construction
+            ->  ECT          the topology term, at one rung, on interior sub-blocks only
+            ->  backward / accumulate / clip / step / EMA
+
+and every `eval_every` steps the EMA weights are scored on the held-out grid, a PNG is written, the
+per-rung temperatures are refitted and the checkpoint is replaced atomically.
+
+There is no DDP, no streaming queue and no flag bookkeeping: the run's identity is `Config`, and a
+resume simply asserts that its fingerprint still matches. A head whose store does not exist yet -- the
+verso channel in round 0, the distances before `rvsm.targets` has run -- arrives with weight 0 and
+therefore with no gradient, which is why none of it is special-cased.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from rvsm import aug as A
+from rvsm import losses as L
+from rvsm import model as M
+from rvsm import prep
+
+# --------------------------------------------------------------------------- the schedule
+
+
+def lr_lambda(steps, warmup, lr_floor=0.0, sched="wsd", stable_until=None, cooldown=0):
+    """The `LambdaLR` factor.
+
+    `wsd` (warmup-stable-decay): linear warmup, a FLAT plateau until `stable_until`, then a cosine
+    cooling over `cooldown` steps. Its point is that the step budget need not be committed at run start
+    -- neither the plateau end nor the cooldown length is part of the weights, so a resume may move
+    them and the plateau simply runs longer. The defaults follow the literature's 10 % cooldown.
+
+    `cosine` is kept as an option, unchanged to the last float op: warmup, then one cosine over the
+    whole budget.
+    """
+    if str(sched) != "wsd":
+        return lambda s: min((s + 1) / max(warmup, 1), 1.0) * \
+            (lr_floor + (1 - lr_floor) * 0.5 * (1 + math.cos(math.pi * min(s / max(steps, 1), 1.0))))
+    C = int(cooldown) if cooldown else max(int(round(0.1 * steps)), 1)
+    S = int(stable_until) if stable_until is not None else max(int(steps) - C, 1)
+
+    def f(s):
+        wu = min((s + 1) / max(warmup, 1), 1.0)
+        if s < S:
+            return wu
+        t = min((s - S) / max(C, 1), 1.0)
+        return wu * (lr_floor + (1 - lr_floor) * 0.5 * (1 + math.cos(math.pi * t)))
+    return f
+
+
+def wsd_stable_until(steps, cooldown_frac=0.1, cooldown=None):
+    """The step the WSD plateau ends at, for a run of `steps` with a `cooldown_frac` cooldown."""
+    C = int(cooldown) if cooldown else max(int(round(float(cooldown_frac) * int(steps))), 1)
+    return max(int(steps) - C, 1), C
+
+
+EMA_K = 50   # the averaging window is steps / k, i.e. 2 % of the run at k = 50
+
+
+def ema_auto(steps, k=EMA_K):
+    """`1 - k / steps`, clamped to [0.9, 0.9999] so a very short or very long run stays sane."""
+    return float(min(max(1.0 - float(k) / max(int(steps), 1), 0.9), 0.9999))
+
+
+# --------------------------------------------------------------------------- parameter groups
+
+
+def new_param_names(newp, net):
+    """The subset of `newp` (what `warm_start` could not copy) that are trainable PARAMETERS.
+
+    Parameter groups are per TENSOR, not per row, so a stem convolution that gained input planes or a
+    head that gained rows lands wholly in the boosted group -- that is the standard practical form of
+    the "new parameters take full LR" recipe, and it is cheap here: the head is a 1x1x1 convolution and
+    the stem is one 3x3x3 convolution out of ~200 tensors.
+    """
+    own = {n for n, _ in net.named_parameters()}
+    return {n for n in newp if n in own}
+
+
+def param_groups(net, new_names, mult):
+    """`([groups], split)` for AdamW: two groups when `mult != 1` and something is new, else one."""
+    if float(mult) == 1.0 or not new_names:
+        return [{"params": list(net.parameters())}], False
+    new = [p for n, p in net.named_parameters() if n in new_names]
+    old = [p for n, p in net.named_parameters() if n not in new_names]
+    return [{"params": old}, {"params": new}], bool(new)
+
+
+@torch.no_grad()
+def ema_update(ema, model, decay=0.999):
+    """`e.mul_(decay).add_(v, alpha=1-decay)` per tensor, batched with the foreach kernels: one pair of
+    kernel launches for the whole state instead of two per tensor. Integer buffers are copied."""
+    es, vs = [], []
+    for k, v in model.state_dict().items():
+        e = ema[k]
+        if e.is_floating_point():
+            es.append(e)
+            vs.append(v.detach())
+        else:
+            e.copy_(v)
+    if es:
+        torch._foreach_mul_(es, decay)
+        torch._foreach_add_(es, vs, alpha=1 - decay)
+
+
+# --------------------------------------------------------------------------- the warm start
+
+USRM2_TAIL = ("scale", "rz", "ry", "rx")
+
+
+def usrm2_stem_names(n):
+    """The stem channel names of a usrm2 checkpoint with `n` input planes.
+
+    usrm2's stem is `[CT, ctx_1..ctx_9, (CASCADE), scale, rz, ry, rx]`: 14 channels without the cascade
+    slot and 15 with it. The names are rvsm's own (`Layout.stem_names`), so a 14/15-channel usrm2 stem
+    maps straight onto rvsm's 21-channel one by NAME and the slots rvsm added -- the radius plane and
+    the five scan-metadata planes -- simply stay zero.
+    """
+    n = int(n)
+    cas = 1 if n >= 15 else 0
+    ncube = n - len(USRM2_TAIL) - cas
+    assert ncube >= 1, f"a {n}-channel stem cannot be a usrm2 stem"
+    names = ["CT"] + [f"ctx_{i}" for i in range(1, ncube)]
+    return names + (["cascade"] if cas else []) + list(USRM2_TAIL)
+
+
+def usrm2_head_names(m):
+    """The head names of a usrm2 checkpoint with `m` output rows: cout 1 is recto, cout 2 recto+verso."""
+    base = ["recto", "verso"]
+    return [base[i] if i < len(base) else f"c{i}" for i in range(int(m))]
+
+
+def _names(rec, key, fallback):
+    v = (rec or {}).get(key)
+    return [str(q) for q in v] if v else list(fallback)
+
+
+def warm_start(src_sd, net, layout, src_layout=None):
+    """Adapt another run's weights to this net: `(state_dict, newp)`.
+
+    Every tensor whose NAME and shape the destination already has is copied verbatim. The two tensors
+    that may legitimately change width are the stem convolution (more input planes) and the heads (more
+    output rows), and both are matched by NAME -- `Layout.stem_names()` / `Layout.head_names()` of the
+    source (recorded in its checkpoint's `layout`, or inferred as a usrm2 stem/head from the shapes)
+    against this layout's. A destination slot the source has no name for is left at ZERO: a new input
+    plane then contributes nothing, so the step-0 output is the source's, and a new head row starts at
+    p = 0.5 (a probability) or distance 0 (a regression), which is each encoding's own zero.
+
+    `newp` is the set of tensor names that were NOT copied -- the tensors that hold freshly initialised
+    values. It is what `new_param_names` turns into the boosted parameter group.
+    """
+    own = net.state_dict()
+    src_sd = dict(src_sd)
+    out, newp = {}, set()
+    dst_stem, dst_head = layout.stem_names(), layout.head_names()
+    stem_key = "enc.0.0.weight"
+    head_keys = {k for k in own if k == "head.weight" or k == "head.bias"
+                 or (k.startswith("deep_heads.") and (k.endswith(".weight") or k.endswith(".bias")))}
+    for k, dv in own.items():
+        sv = src_sd.get(k)
+        if sv is None:
+            newp.add(k)
+            continue
+        if tuple(sv.shape) == tuple(dv.shape):
+            out[k] = sv.clone()
+            continue
+        if k == stem_key and sv.ndim == dv.ndim == 5 and sv.shape[0] == dv.shape[0]:
+            s_names = _names(src_layout, "stem", usrm2_stem_names(sv.shape[1]))
+            w = torch.zeros_like(dv)
+            idx = {n: i for i, n in enumerate(s_names)}
+            hit = 0
+            for j, nm in enumerate(dst_stem):
+                if nm in idx and idx[nm] < sv.shape[1]:
+                    w[:, j] = sv[:, idx[nm]]
+                    hit += 1
+            out[k] = w
+            if hit < len(dst_stem):
+                newp.add(k)
+            continue
+        if k in head_keys and sv.shape[0] != dv.shape[0]:
+            s_names = _names(src_layout, "heads", usrm2_head_names(sv.shape[0]))
+            w = torch.zeros_like(dv)
+            idx = {n: i for i, n in enumerate(s_names)}
+            hit = 0
+            for j, nm in enumerate(dst_head):
+                if nm in idx and idx[nm] < sv.shape[0]:
+                    w[j] = sv[idx[nm]]
+                    hit += 1
+            out[k] = w
+            if hit < len(dst_head):
+                newp.add(k)
+            continue
+        newp.add(k)   # a real shape mismatch (another preset, another depth): keep the fresh tensor
+    return out, newp
+
+
+# --------------------------------------------------------------------------- evaluation
+
+
+def _batch(item):
+    """A grid entry -> a collated batch of one, whether it came in collated or not."""
+    return item if item["rung"].ndim else prep.batch1(item)
+
+
+def _rungs_of(b):
+    return [int(v) for v in b["rung"].reshape(-1).tolist()]
+
+
+@torch.no_grad()
+def evaluate(net, grid, dev, layout, cascade=None):
+    """bce / dice / mae over the validation grid, plus the metrics the layout makes meaningful.
+
+    Every entry is a compact rung sample (`sample.rung_item`), whose input is built on the device by
+    `prep.prepare`; its per-voxel weights scale every metric, and each rung is also scored on its own
+    (`dice_r2`, `dice_r3`, ...) with `dice` the mean over the rungs present -- every rung counts the
+    same, whatever share of the grid it holds.
+
+    Per probability channel there is a `dice_<name>` (`dice_recto`, `dice_verso`), computed only over
+    the patches whose WEIGHT says anything about that channel, so the verso channel is silently absent
+    until a verso store covers the held-out boxes. With two probability channels there is also
+    `overlap`, the mean excess `relu(p_recto + p_verso - 1)` -- measured, never a loss term. The
+    DISTANCE heads are a regression and are scored in voxels as `mae_midline` / `mae_thickness`.
+
+    The affinity heads are a training-only head: never scored, never drawn.
+    """
+    was = net.training
+    net.eval()
+    m = torch.zeros(4)
+    per, pch = {}, {}
+    ct_t = layout.cout_t
+    for item in grid:
+        b = _batch(item)
+        x, tg, ww = prep.prepare(b, dev, cascade=cascade)
+        x, rung = x.to(memory_format=M.memfmt()), _rungs_of(b)[0]
+        with prep.autocast(dev):
+            y = net(x)
+        y = (y[0] if isinstance(y, (list, tuple)) else y).float()
+        for j, nm in ((layout.i_mid, "midline"), (layout.i_thick, "thickness")):
+            wc = L.dist_weight(ww[:, j:j + 1])
+            if float(wc.sum()) > 0:
+                dec = L.decode_unsigned if nm == "thickness" else L.decode_signed
+                pv = L.soft_thickness(y[:, j:j + 1]) if nm == "thickness" else y[:, j:j + 1]
+                pch.setdefault(f"mae_{nm}", []).append(
+                    float((pv - dec(tg[:, j:j + 1])).abs().mul(wc).sum() / wc.sum()))
+        logit, tgt, w = y[:, :ct_t], tg[:, :ct_t], ww[:, :ct_t]
+        p = torch.sigmoid(logit)
+        h, t = (p >= 0.5).float(), (tgt >= 0.5).float()
+        np_ = layout.nprob
+        ov = float((p[:, :1] + p[:, 1:2] - 1).clamp_min(0).mean()) if np_ >= 2 else 0.0
+        n = w.sum().clamp_min(1e-6)
+        dice = float(2 * (h * t * w).sum() / ((h * w).sum() + (t * w).sum() + 1))
+        for c in range(np_):
+            wc = w[:, c]
+            if float(wc.sum()) > 0:
+                pch.setdefault(c, []).append(
+                    float(2 * (h[:, c] * t[:, c] * wc).sum() / ((h[:, c] * wc).sum() + (t[:, c] * wc).sum() + 1)))
+        m += torch.tensor([
+            float((F.binary_cross_entropy_with_logits(logit, tgt, reduction="none") * w).sum() / n),
+            dice, float(((p - tgt).abs() * w).sum() / n), ov])
+        per.setdefault(int(rung), []).append(dice)
+    net.train(was)
+    m /= max(len(grid), 1)
+    out = {"bce": m[0].item(), "dice": m[1].item(), "mae": m[2].item()}
+    for k in sorted(per):
+        out[f"dice_r{k}"] = float(np.mean(per[k]))
+    if per:
+        out["dice"] = float(np.mean([out[f"dice_r{k}"] for k in sorted(per)]))
+    names = list(layout.channels)
+    for c in sorted(pch, key=str):
+        if isinstance(c, str):
+            out[c] = float(np.mean(pch[c]))
+        else:
+            out[f"dice_{names[c] if c < len(names) else f'c{c}'}"] = float(np.mean(pch[c]))
+    if layout.nprob >= 2:
+        out["overlap"] = m[3].item()
+    return out
+
+
+def val_png(path, net, grid, dev, layout, cascade=None):
+    """The middle z-slice of the first four validation patches, three tiles wide:
+
+        CT (gray) | recto target red + verso target blue | prediction, the same two colours
+
+    A verso target the held-out box has no store for adds nothing to its tile; overlap comes out purple,
+    which is the fastest way to see the exclusivity term failing. The affinity and distance heads are
+    never drawn.
+    """
+    from PIL import Image
+    rows = []
+    was = net.training
+    net.eval()
+    with torch.no_grad():
+        for item in grid[:4]:
+            b = _batch(item)
+            x, t, _ = prep.prepare(b, dev, cascade=cascade)
+            with prep.autocast(dev):
+                y = net(x.to(memory_format=M.memfmt()))
+            y = (y[0] if isinstance(y, (list, tuple)) else y).float()
+            p = torch.sigmoid(y[:, :layout.nprob])[0].cpu()
+            x, t = x[0].cpu(), t[0].cpu()
+            z = x.shape[1] // 2
+            c = x[0, z].numpy()
+            c = (c - c.min()) / (c.max() - c.min() + 1e-6) * 255 * 0.9
+            gray = np.repeat(c[..., None], 3, -1)
+
+            def overlay(chans, gray=gray):   # channel 0 red, channel 1 blue, mixed on one tile
+                a = [np.clip(v, 0, 1)[..., None] for v in chans]
+                cols = [np.array([255, 40, 40]), np.array([40, 90, 255])]
+                wsum = sum(a)
+                al = np.maximum.reduce(a) * 0.85
+                col = sum(ai * ci for ai, ci in zip(a, cols)) / np.maximum(wsum, 1e-6)
+                return gray * (1 - al) + col * al
+            tt = t[:layout.nprob, z].numpy()
+            pp = p[:, z].numpy()
+            rows.append(np.concatenate([gray, overlay(list(tt)), overlay(list(pp))], 1))
+    net.train(was)
+    Image.fromarray(np.concatenate(rows, 0).astype(np.uint8)).save(path)
+
+
+# --------------------------------------------------------------------------- the loop
+
+
+# The spatial ops that change the METRIC: a rotation, a scaling, a shear, an elastic field or a sheet
+# compression resamples the patch onto a grid on which one voxel is no longer one voxel of the grid the
+# distance and thickness stores were measured on. A probability rides that resampling unharmed, but a
+# distance does not -- the target still says "7.25 voxels" after the augmentation has made the voxel a
+# different length, so it is simply a wrong number (usrm2 docs/unified_design.md section 29.2, which
+# dropped them loudly whenever a distance head was on). The 48 cube symmetries are exact isometries on
+# the voxel grid and are applied by the sampler (`prep.sym_apply_t`), so the geometric variety is kept;
+# every intensity and physics op is untouched.
+NON_ISOMETRIC = ("rot", "scale", "shear", "elastic", "sheetcomp")
+
+
+def aug_for(cfg, meta=None):
+    """The augmentation configuration this recipe may actually use.
+
+    `A.get(cfg.aug, meta)` recentred on the scan's metadata, minus `NON_ISOMETRIC` when the layout has
+    DISTANCE heads and `loss_sdist` is on -- which, in rvsm's fixed recipe, it always is.
+    """
+    acfg = A.get(cfg.aug, meta=meta)
+    layout = cfg.layout()
+    if layout.cout_t > layout.nprob and float(cfg.loss_sdist) > 0:
+        off = [q for q in NON_ISOMETRIC if q in acfg]
+        if off:
+            acfg = {k: v for k, v in acfg.items() if k not in NON_ISOMETRIC}
+            print(f"[train] loss_sdist is on, so the non-isometric spatial augs {off} are dropped from "
+                  f"--aug {cfg.aug}: they resample the grid the distance and thickness targets are "
+                  "measured on. The 48 cube symmetries and every intensity op stay.", flush=True)
+    return acfg
+
+
+def _aug_cfg(cfg):
+    """`aug_for` with the scan's metadata read from beside the CT, when there is any."""
+    meta = None
+    try:
+        from rvsm import scanmeta as SM
+        meta = SM.fetch(cfg.ct)
+    except Exception as e:   # noqa: BLE001  -- no metadata.json beside the CT: the preset's own ranges
+        print(f"[train] scan metadata unavailable ({e!r}); using the preset ranges", flush=True)
+    return aug_for(cfg, meta)
+
+
+def _log(path, rec, echo=True):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    if echo:
+        print(os.path.basename(path), rec, flush=True)
+
+
+def _prepared(grid, dev, layout, cascade=None):
+    """The validation grid as the `(x, t, w, rung)` batches `calib.collect` reads."""
+    for item in grid:
+        b = _batch(item)
+        x, t, w = prep.prepare(b, dev, cascade=cascade)
+        yield x.to(memory_format=M.memfmt()), t, w, _rungs_of(b)[0]
+
+
+def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=None, val_items=None,
+          steps=None, accum=1):
+    """Train the student. Returns the checkpoint path.
+
+    `patches_factory()` returns a fresh iterable of samples: either collated batches (what
+    `sample.loader` yields) or bare `sample.rung_item` dicts, which are batched to one here. Nothing in
+    the loop knows where they came from, so a test can hand it a generator.
+
+    `val_items` is the held-out grid (a list of rung_items, from `sample.val_grid`); without one the
+    evaluation, the PNG and the calibration are skipped and only the checkpoint is written.
+    """
+    out = Path(out or cfg.out)
+    out.mkdir(parents=True, exist_ok=True)
+    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    layout = cfg.layout()
+    nsteps = int(cfg.steps if steps is None else steps)
+    grid = list(val_items or [])
+
+    net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, ckpt_act=cfg.ckpt_act, verbose=False).to(dev)
+    newp = set()
+    if init:
+        st = torch.load(init, map_location="cpu", weights_only=False)
+        sd = st.get("ema") or st.get("model") or st
+        src, newp = warm_start(sd, net, layout, src_layout=st.get("layout"))
+        miss = net.load_state_dict(src, strict=False)
+        print(f"[train] warm start from {init}: {len(src)} tensors copied, {len(newp)} new "
+              f"({len(miss.missing_keys)} missing, {len(miss.unexpected_keys)} unexpected)", flush=True)
+
+    groups, split = param_groups(net, new_param_names(newp, net), cfg.new_param_lr_mult)
+    opt = torch.optim.AdamW(groups, lr=cfg.lr, weight_decay=0.01)
+    warm = int(cfg.rewarm) if init else int(cfg.warmup)
+    S, C = wsd_stable_until(nsteps, cfg.cooldown)
+    base = lr_lambda(nsteps, warm, sched=cfg.sched, stable_until=S, cooldown=C)
+    if split:   # the new rows carry no memory to protect: M x LR through the plateau, then M = 1
+        mult = float(cfg.new_param_lr_mult)
+        end = S if str(cfg.sched) == "wsd" else nsteps
+        base = [base, (lambda s, f=base, m=mult, e=end: f(s) * (m if s < e else 1.0))]
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, base)
+    decay = ema_auto(nsteps, cfg.ema_k) if str(cfg.ema) == "auto" else float(cfg.ema)
+    ema = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    step, temps = 0, {}
+
+    ck = out / "ckpt.pt"
+    if resume and ck.exists():
+        st = torch.load(ck, map_location=dev, weights_only=False)
+        got = (st.get("cfg") or {}).get("fingerprint")
+        assert got == cfg.fingerprint(), \
+            f"resume: the checkpoint's config fingerprint is {got}, this run's is {cfg.fingerprint()}"
+        net.load_state_dict(st["model"])
+        opt.load_state_dict(st["opt"])
+        ema = {k: v.to(dev) for k, v in st["ema"].items()}
+        step, temps = int(st["step"]), dict(st.get("temps") or {})
+        for _ in range(step):
+            sched.step()
+        print(f"[train] resumed {ck} at step {step}", flush=True)
+
+    # CASCADE: one `Cascade` builds the TRAINING channel (stochastic: mix / dropout / noise), another
+    # the validation one (deterministic: self, no noise, no dropout). The self source runs its own copy
+    # of the net on the EMA weights -- never the compiled module, and never with a grad path.
+    evnet = M.build(cfg.size, cin=layout.cin, cout=layout.cout, verbose=False).to(dev)
+    casnet = None
+    if cfg.cascade in ("self", "mix"):
+        casnet = M.build(cfg.size, cin=layout.cin, cout=layout.cout, verbose=False).to(dev)
+        casnet.eval()
+    cas = prep.Cascade(cfg.cascade, self_p=cfg.self_p_lo, drop=cfg.cascade_drop,
+                       noise=cfg.cascade_noise, net=casnet)
+    casval = prep.Cascade("self" if cfg.cascade in ("self", "mix") else "mask", self_p=1.0, drop=0.0,
+                          noise=False, net=evnet)
+
+    acfg = _aug_cfg(cfg)
+    model = torch.compile(net) if cfg.compile else net
+    aux_on = bool(cfg.loss_excl or cfg.loss_selfcons or cfg.loss_skel or cfg.loss_affinity)
+    aux_dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
+
+    def save():
+        tmp = ck.with_suffix(".tmp")
+        torch.save({"model": net.state_dict(), "ema": ema, "opt": opt.state_dict(), "step": step,
+                    "cfg": cfg.to_json(), "layout": layout.to_json(), "temps": temps}, tmp)
+        tmp.replace(ck)
+
+    def do_eval():
+        nonlocal temps
+        if not grid:
+            return
+        evnet.load_state_dict(ema)
+        _log(str(out / "logs" / "eval.jsonl"),
+             {"step": step, **evaluate(evnet, grid, dev, layout, cascade=casval)})
+        try:
+            (out / "eval").mkdir(parents=True, exist_ok=True)
+            val_png(out / "eval" / f"val_{step:06d}.png", evnet, grid, dev, layout, cascade=casval)
+        except Exception as e:   # noqa: BLE001  -- a missing PIL must never stop a run
+            print("[train] val_png:", repr(e), flush=True)
+        if cfg.calibrate:
+            from rvsm import calib
+            temps = {str(k): v for k, v in
+                     calib.run(evnet, _prepared(grid, dev, layout, cascade=casval),
+                               layout=layout).get("temps", {}).items()}
+
+    _log(str(out / "logs" / "train.jsonl"),
+         {"step": step, "size": cfg.size, "patch": cfg.patch, "batch": cfg.batch, "aug": cfg.aug,
+          "cin": layout.cin, "cout": layout.cout, "steps": nsteps, "ema": decay,
+          "fingerprint": cfg.fingerprint()})
+
+    t0, micro, rung_n, wait_s = time.time(), 0, {}, 0.0
+    src = patches_factory() if patches_factory is not None else iter(())
+    loss = bce = dice = None
+    reg_log, aux_log = {}, {}
+    nvox = 0
+    tw = time.time()
+    for item in src:
+        if step >= nsteps:
+            break
+        wait_s += time.time() - tw
+        b = _batch(item)
+        ks = _rungs_of(b)
+        for r in ks:
+            rung_n[r] = rung_n.get(r, 0) + 1
+        if cas.on:
+            cas.sync(ema)   # the self-mode coarse pass always runs on the current EMA weights
+            a0, a1 = float(cfg.self_p_lo), float(cfg.self_p_hi)
+            cas.self_p = a0 + (a1 - a0) * min(step / max(nsteps, 1), 1.0)
+        ct, tg, wt = prep.prepare(b, dev, cascade=cas, layout=layout)
+        casch = ct[:, layout.i_cas:layout.i_cas + 1].detach().clone() if cas.on else None
+        # the weights ride along as extra target channels, so the geometric augs transform them
+        # identically to the fields they weigh
+        ct, tgw = A.apply(ct, torch.cat([tg, wt], 1), acfg, nimg=layout.i_cas, rung=ks)
+        tg, wt = tgw[:, :layout.cout_t], tgw[:, layout.cout_t:]
+        ct = ct.to(memory_format=M.memfmt())
+        nvox += int(np.prod(ct.shape[2:])) * ct.shape[0]
+
+        with prep.autocast(dev):
+            pred = model(ct)
+            outs = [o.float() for o in pred] if isinstance(pred, (list, tuple)) else [pred.float()]
+            bce, dice = L.deep_losses(outs if len(outs) > 1 else outs[0], tg, wt, layout=layout)
+        loss = bce + dice
+        y0 = outs[0]
+        reg_log = {}
+
+        # ---- PHASE B: the signed midline distance, the thickness, the Eikonal regulariser
+        d = y0[:, layout.i_mid:layout.i_mid + 1]
+        td = tg[:, layout.i_mid:layout.i_mid + 1]
+        wd = L.dist_weight(wt[:, layout.i_mid:layout.i_mid + 1])
+        lv = y0[:, layout.i_log:layout.i_log + 1]
+        r = {"sdist": cfg.loss_sdist * L.sdist_loss(d, td, wd, logvar=lv)}
+        if cfg.loss_eikonal:
+            r["eikonal"] = cfg.loss_eikonal * L.eikonal(d, wd, tgt=td)
+        th = L.soft_thickness(y0[:, layout.i_thick:layout.i_thick + 1])
+        r["thick"] = cfg.loss_sdist * L.thickness_loss(
+            th, tg[:, layout.i_thick:layout.i_thick + 1],
+            L.dist_weight(wt[:, layout.i_thick:layout.i_thick + 1]))
+        # ---- PHASE C: `--pair construct`. The pair is BUILT from (midline, thickness), never crossed,
+        # and scored against the same probability targets as the learned rows -- which is what makes the
+        # two faces non-overlapping by construction rather than by a penalty.
+        if layout.nprob >= 2:
+            lr_, lv_ = L.pair_logits(d, th, half=cfg.pair_band, tau=cfg.pair_tau)
+            r["pair_bce"], r["pair_dice"] = L.losses_tw(torch.cat([lr_, lv_], 1), tg[:, :2], wt[:, :2])
+        for k_, v_ in r.items():
+            loss = loss + v_
+        reg_log = {k_: float(v_.detach()) for k_, v_ in r.items()}
+
+        # ---- the topology pilot, at ONE rung, on interior sub-blocks only
+        if cfg.loss_ect:
+            sel = [i for i, k in enumerate(ks) if k == int(cfg.ect_rung)]
+            if sel:
+                idx = torch.tensor(sel, device=y0.device)
+                pr = torch.sigmoid(L.pair_logits(d, th, cfg.pair_band, cfg.pair_tau)[0]) \
+                    if layout.nprob >= 2 else torch.sigmoid(y0[:, :1])
+                e = L.ect_loss(pr[idx], tg[idx, :1], block=cfg.ect_block, nblocks=cfg.ect_n)
+                loss = loss + cfg.loss_ect * e
+                reg_log["ect"] = float(e.detach())
+
+        # ---- PHASE A auxiliaries: every term is computed from tensors this step already holds
+        aux_log = {}
+        if aux_on:
+            cv = (lambda q: None if q is None else q.to(aux_dt))   # noqa: E731
+            ax = L.aux_losses(cv(y0), cv(tg), cv(wt), layout,
+                              w_excl=cfg.loss_excl, w_selfcons=cfg.loss_selfcons,
+                              w_skel=cfg.loss_skel, w_affinity=cfg.loss_affinity,
+                              skel_iters=cfg.skel_iters,
+                              cascade=cv(casch), cascade_self=cas.last_self)
+            if "aux" in ax:
+                loss = loss + ax["aux"].float()
+            aux_log = {k: float(v.detach()) for k, v in ax.items()}
+
+        (loss / max(int(accum), 1)).backward()
+        micro += 1
+        tw = time.time()
+        if micro < int(accum):
+            continue
+        micro = 0
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        sched.step()
+        ema_update(ema, net, decay)
+        step += 1
+
+        if step % 20 == 0:
+            dt = max(time.time() - t0, 1e-6)
+            _log(str(out / "logs" / "train.jsonl"),
+                 {"step": step, "loss": float(loss.detach()), "bce": float(bce.detach()),
+                  "dice": float(dice.detach()), **aux_log, **reg_log,
+                  "lr": sched.get_last_lr()[0], "vox_s": round(nvox / dt),
+                  "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0,
+                  "rung": {str(k): rung_n[k] for k in sorted(rung_n)},
+                  "train_wait_s": round(wait_s, 3)})
+            rung_n, wait_s, nvox, t0 = {}, 0.0, 0, time.time()
+        if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:
+            do_eval()
+            save()
+            t0, tw = time.time(), time.time()
+    save()
+    return str(ck)
