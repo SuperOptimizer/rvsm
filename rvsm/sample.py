@@ -222,6 +222,13 @@ class Patches(torch.utils.data.IterableDataset):
         r = self._region_of(k, lo, shape)
         if r is None:
             return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
+        if k == 3:                           # the store's 2x pool, decoded ONCE per visit (see _pool3)
+            got = self._pool3(chan, r)
+            if got is None:
+                return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
+            o = np.asarray(lo, np.int64) - (np.asarray(r, np.int64) >> 1)
+            v = got[o[0]:o[0] + shape[0], o[1]:o[1] + shape[1], o[2]:o[2] + shape[2]]
+            return v, np.ones(tuple(shape), np.float32)
         if k <= 3:
             a = self.cat.open(chan, r)
             if a is None:
@@ -231,6 +238,24 @@ class Patches(torch.utils.data.IterableDataset):
             v, ins = RG.pooled_window(self.root, chan, r, k, lo, shape, self.round)
         return v, ins.astype(np.float32)
 
+    def _pool3(self, chan, r):
+        """The whole region store of `chan` read at rung 3 (its 2x mean pool), kept for the visit.
+
+        A rung-3 window reads 512^3 voxels of the rung-2 store to pool them, so every window of a
+        visit re-decoded ~8x its own size; the whole region pooled once is 128 MB a channel. Only the
+        current region's pools are kept (a new region drops them)."""
+        key = (str(chan), tuple(int(v) for v in r))
+        if getattr(self, "_p3key", None) != key[1]:
+            self._p3key, self._p3 = key[1], {}
+        if key not in self._p3:
+            a = self.cat.open(chan, r)
+            if a is None:
+                return None
+            S = np.array(a.shape[-3:], np.int64)
+            v, _ins = stores.read_store(a, 3, np.asarray(r, np.int64) >> 1, S >> 1)
+            self._p3[key] = v
+        return self._p3[key]
+
     def _near_axis(self, k, lo, shape):
         """Voxels within `AXIS_R_UM` of the umbilicus: the core, where recto and verso are the same
         sheet seen twice and a distance to a midline means nothing."""
@@ -238,12 +263,26 @@ class Patches(torch.utils.data.IterableDataset):
         a = AX.axis_at(self.ax, k)
         z = np.arange(shape[0]) + int(lo[0])
         cy, cx = np.interp(z, a[0], a[1]), np.interp(z, a[0], a[2])
-        dy = (np.arange(shape[1]) + int(lo[1]))[None, :, None] - cy[:, None, None]
-        dx = (np.arange(shape[2]) + int(lo[2]))[None, None, :] - cx[:, None, None]
-        return (dy * dy + dx * dx) < (AXIS_R_UM / ladder.rung_um(k)) ** 2
+        r2 = (AXIS_R_UM / ladder.rung_um(k)) ** 2
+        ys, xs = np.arange(shape[1]) + int(lo[1]), np.arange(shape[2]) + int(lo[2])
+        # the nearest point of each z-slice's (y, x) box to the axis: when even that is outside the
+        # radius at every z -- nearly every window of a scroll -- no voxel is near, and the 16 M-voxel
+        # float64 test below is skipped (it was a large share of a draw on the trainer's workers)
+        ny = np.clip(cy, ys[0], ys[-1]) - cy
+        nx = np.clip(cx, xs[0], xs[-1]) - cx
+        if bool(((ny * ny + nx * nx) >= r2).all()):
+            return np.zeros(shape, bool)
+        dy = ys[None, :, None] - cy[:, None, None]
+        dx = xs[None, None, :] - cx[:, None, None]
+        return (dy * dy + dx * dx) < r2
 
     def _rung_target(self, k, lo, ct):
-        """(target, weight) at rung k as uint8 (255 = 1.0), one row per channel of `target_channels`."""
+        """(target, weight) at rung k as uint8 (255 = 1.0), one row per channel of `target_channels`.
+
+        The weight is `rint(255 * fraction * air * [code != 0] * ~near * rw)`. It is computed in
+        uint8 and bool, not float64: a store's fraction is 0/1 at rungs 2-6 (so `255 * fraction * rw`
+        IS the rw code) and the coarse coverage is quantised once. Same bytes as the float formula
+        (test), a fraction of the time -- the float64 temporaries were ~800 ms of a rung-2 draw."""
         p = tuple(int(v) for v in self.patch)
         tg = np.zeros((len(self.channels),) + p, np.uint8)
         w = np.zeros_like(tg)
@@ -251,25 +290,31 @@ class Patches(torch.utils.data.IterableDataset):
             return tg, w
         air = ct > 0
         near = None
-        rwv = None
+        rw8 = None
         r = self._region_of(k, lo)
         if r is not None and int(k) <= 6 and self.cat.done(RW, r):
-            rwv = self._source(RW, k, lo, p)[0].astype(np.float32) / 255.0
+            rw8 = self._source(RW, k, lo, p)[0]
         for c, chan in enumerate(self.channels):
             dist = chan in DIST_CHANNELS
             if dist and int(k) > DIST_MAX_RUNG:
                 continue                      # a distance is never pooled: no target here, so weight 0
             v, frac = self._source(chan, k, lo, p)
             np.copyto(tg[c], v, where=air)    # masked CT: air carries no surface
-            ok = frac * air
+            m = air.copy()
             if dist:
-                ok = ok * (v != 0)            # code 0 IS the store's no-data marker
+                m &= v != 0                   # code 0 IS the store's no-data marker
             if chan in NEAR_AXIS_ZERO:
                 near = self._near_axis(k, lo, p) if near is None else near
-                ok = ok * ~near
-            if rwv is not None and not dist:
-                ok = ok * rwv
-            w[c] = np.clip(np.rint(255.0 * ok), 0, 255).astype(np.uint8)
+                m &= ~near
+            if int(k) <= 6:                   # a fraction of 0 or 1: the weight is 255, or the rw code
+                m &= frac > 0
+                if rw8 is not None and not dist:
+                    np.copyto(w[c], rw8, where=m)
+                else:
+                    w[c][m] = 255
+            else:                             # the coarse coverage fraction, quantised once
+                q = np.rint(frac * np.float32(255.0))
+                np.copyto(w[c], np.clip(q, 0, 255).astype(np.uint8), where=m)
         return tg, w
 
     def _target_block(self, chan, k, lo, shape):

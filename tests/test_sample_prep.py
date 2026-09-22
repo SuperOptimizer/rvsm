@@ -326,3 +326,78 @@ def test_the_visit_super_cube_is_ladder_context_bit_for_bit(synth_run):
     lo = np.array(rec["lo"], np.int64)
     assert all(np.array_equal(a, b) for a, b in zip(
         ladder.context(ds.ct, lo, p, ds.ctx, rung=2), [ds._ctx_cube(rec, 2, d, lo, p) for d in ds.ctx]))
+
+
+def _old_rung_target(ds, k, lo, ct):
+    """The float64 formula `_rung_target` replaced, with the store read directly (no visit cache)."""
+    from rvsm import stores
+    from rvsm.sample import DIST_CHANNELS, DIST_MAX_RUNG, NEAR_AXIS_ZERO, RW
+
+    def src(chan):
+        r = ds._region_of(k, lo, ds.patch)
+        if r is None:
+            return np.zeros(tuple(ds.patch), np.uint8), np.zeros(tuple(ds.patch), np.float32)
+        a = ds.cat.open(chan, r)
+        if a is None:
+            return np.zeros(tuple(ds.patch), np.uint8), np.zeros(tuple(ds.patch), np.float32)
+        v, ins = stores.read_store(a, k, lo, ds.patch)
+        return v, ins.astype(np.float32)
+
+    p = tuple(int(v) for v in ds.patch)
+    tg = np.zeros((len(ds.channels),) + p, np.uint8)
+    w = np.zeros_like(tg)
+    air = ct > 0
+    r = ds._region_of(k, lo)
+    rwv = src(RW)[0].astype(np.float32) / 255.0 if (r is not None and ds.cat.done(RW, r)) else None
+    shape = p
+    a = __import__("rvsm.axis", fromlist=["x"]).axis_at(ds.ax, k)
+    z = np.arange(shape[0]) + int(lo[0])
+    cy, cx = np.interp(z, a[0], a[1]), np.interp(z, a[0], a[2])
+    dy = (np.arange(shape[1]) + int(lo[1]))[None, :, None] - cy[:, None, None]
+    dx = (np.arange(shape[2]) + int(lo[2]))[None, None, :] - cx[:, None, None]
+    from rvsm.sample import AXIS_R_UM
+    near = (dy * dy + dx * dx) < (AXIS_R_UM / ladder.rung_um(k)) ** 2
+    for c, chan in enumerate(ds.channels):
+        dist = chan in DIST_CHANNELS
+        if dist and int(k) > DIST_MAX_RUNG:
+            continue
+        v, frac = src(chan)
+        np.copyto(tg[c], v, where=air)
+        ok = frac * air
+        if dist:
+            ok = ok * (v != 0)
+        if chan in NEAR_AXIS_ZERO:
+            ok = ok * ~near
+        if rwv is not None and not dist:
+            ok = ok * rwv
+        w[c] = np.clip(np.rint(255.0 * ok), 0, 255).astype(np.uint8)
+    return tg, w
+
+
+def test_the_uint8_targets_are_the_float_formula(synth_run):
+    """`_rung_target` (uint8 weights, the rung-3 pool decoded once per visit, the near-axis early out)
+    against the float64 formula it replaced, over windows at rungs 2 and 3 -- including the ones on
+    the scroll axis, where the near-axis mask is not empty."""
+    ds = _patches(synth_run, seed=5)
+    ds._open()
+    rng = np.random.default_rng(2)
+    p = ds.patch
+    n = near = 0
+    for rec in [v for v in ds.visits if int(v["k"]) in (2, 3)][:8]:
+        k = int(rec["k"])
+        rlo, rsz = np.array(rec["lo"], np.int64), np.array(rec["size"], np.int64)
+        hi = np.maximum(rlo + rsz - p, rlo)
+        cands = [rng.integers(np.minimum(rlo, hi), hi + 1) for _ in range(3)]
+        from rvsm import axis as AX
+        ak = AX.axis_at(ds.ax, k)                      # and one window centred on the scroll axis
+        zc = int(rlo[0]) + int(p[0]) // 2
+        on = np.array([zc, np.interp(zc, ak[0], ak[1]), np.interp(zc, ak[0], ak[2])]) - p // 2
+        cands.append(np.clip(on.astype(np.int64), np.minimum(rlo, hi), hi))
+        for lo in cands:
+            ct = ladder.read_rung(ds.pyr, k, lo, p, dtype=np.uint8)
+            a, b = ds._rung_target(k, lo, ct), _old_rung_target(ds, k, lo, ct)
+            assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1]), (k, lo)
+            n += int(a[1].any())
+            near += int(ds._near_axis(k, lo, p).any())
+    assert n > 0, "no window carried any weight: the comparison proved nothing"
+    assert near > 0, "no window touched the axis: the near-axis path went untested"

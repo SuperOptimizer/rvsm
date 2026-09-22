@@ -40,7 +40,7 @@ from rvsm import ladder, stores
 
 OCC_VOX = 64 << 20     # the occupancy check reads the finest CT level with at most this many voxels
 COARSE_RUNGS = (7, 8, 9, 10, 11)
-COARSE_CHUNK = 32
+COARSE_CHUNK = 128     # was 32: a 256^3 coarse window touched 512 chunks per array (~0.8 s a draw)
 COARSE_MIN = 5         # rungs >= this use the coarse occupancy threshold
 TTL = 30.0             # seconds a MISSING store stays missing in a catalog (the producer writes as we train)
 
