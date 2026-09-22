@@ -272,3 +272,30 @@ def test_a_spilled_val_grid_is_the_grid_and_is_reused(synth_run, tmp_path):
     m = os.path.getmtime(d / "grid.json")
     g2 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
     assert len(g2) == len(g) and os.path.getmtime(d / "grid.json") == m
+
+
+def test_the_cascade_self_pass_takes_a_module_without_len(small_cfg):
+    """A compiled module (torch's OptimizedModule) raises on len() -- and so on bool() -- so the self
+    pass must choose its forward with `is not None`, never `or` (it did, and the first compiled GPU
+    run died in its first self pass)."""
+    class NoBool(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.calls = 0
+
+        def __len__(self):
+            raise TypeError("no len")
+
+        def forward(self, x):
+            self.calls += 1
+            return self.inner(x)
+
+    L = small_cfg.layout()
+    b = prep.batch1(_fake_item(nctx=L.nctx, p=8, k=2))
+    x = torch.zeros((1, L.cin, 8, 8, 8))
+    net = M.build("1m", cin=L.cin, cout=L.cout, verbose=False)
+    f = NoBool(net)
+    c = prep.Cascade("self", self_p=1.0, drop=0.0, noise=False, net=net, fwd=f, seed=1)
+    out = c.channel(b, x, b["norm"], torch.float32)
+    assert out.shape == (1, 1, 8, 8, 8) and f.calls == 1

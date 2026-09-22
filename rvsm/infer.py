@@ -443,7 +443,7 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
         eng = trt_mod.engine_for(net, spec.name, w, 1, engine_dir or ".", device=str(dev))
         if eng is not None:
             batch = 1
-    fn = teacher_fn(eng if eng is not None else (fast or net), spec, tta=tta)
+    fn = teacher_fn(eng if eng is not None else (fast if fast is not None else net), spec, tta=tta)
     lo, size = np.asarray(lo, np.int64), np.asarray(size, np.int64)
     blk, a = teacher_read(ct, lo, size, spec) if roi is None else roi
     odt = torch.float16 if as_tensor else torch.float32

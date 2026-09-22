@@ -302,7 +302,7 @@ class Cascade:
         was = self.net.training
         self.net.eval()
         with autocast(dev):
-            y = (self.fwd or self.net)(x.to(memory_format=M.memfmt()))
+            y = (self.fwd if self.fwd is not None else self.net)(x.to(memory_format=M.memfmt()))
         self.net.train(was)
         y = y[0] if isinstance(y, (list, tuple)) else y
         p = torch.sigmoid(y.float())[:, :1].to(dtype)
