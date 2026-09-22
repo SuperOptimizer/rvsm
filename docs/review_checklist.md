@@ -68,11 +68,11 @@ written on the A100 records that build's hash.
 
 | check | rule | where |
 |---|---|---|
-| Round 0 trains **recto only** (verso weight 0 everywhere) until the gate fires | plan §1 | `rvsm/run.py` — **not yet built** |
-| The verso gate is `recall@4` **and** continuity against the fused-teacher reference **within the bootstrap CI**, or `verso_after_steps = 10000` as an unconditional fallback | a 2-point move on the val box is not evidence; the 95 % CIs are 4-10 points wide (§25.6) | `rvsm/config.py:verso_after_steps`; `rvsm/run.py` |
-| Round r+1 requires: plateau fit < 2 % remaining gain (or `round_steps`), **and** `merge_frac` and `betti0_err` not worse than the round-0 reference beyond the CI, **and** `recall@4` within CI | plan §1 | `rvsm/run.py` |
-| A round failing the gate is **discarded** — previous teacher kept, training extended (WSD makes extension free) | plan §1; §26.2 | `rvsm/run.py` |
-| At most **two rounds live on disk**; round-r stores are deleted per region once superseded **and unreferenced** | plan §1 | `rvsm/run.py` |
+| Round 0 trains **recto only** (verso weight 0 everywhere) until the gate fires | plan §1 | `rvsm/run.py:run` (the producer writes no `verso` store until `state.json` says `verso_on`, and a channel with no store carries weight 0) — `tests/test_run_e2e.py::test_rvsm_run_two_rounds_end_to_end` |
+| The verso gate is `recall@4` **and** continuity against the fused-teacher reference **within the bootstrap CI**, or `verso_after_steps = 10000` as an unconditional fallback | a 2-point move on the val box is not evidence; the 95 % CIs are 4-10 points wide (§25.6) | `rvsm/config.py:verso_after_steps`, `verso_gate_dice`; `rvsm/run.py:verso_gate` — **deviation**: recall@4 and continuity are MESH metrics and the reference is a store, so the gate uses `compare_stores` dice (recall side) and betti0 against the reference-vs-itself baseline (continuity side), with the same bootstrap over regions; recorded in `run.py`'s docstring — `tests/test_run_e2e.py::test_the_verso_gate_needs_the_dice_and_the_betti_baseline` |
+| Round r+1 requires: plateau fit < 2 % remaining gain (or `round_steps`), **and** `merge_frac` and `betti0_err` not worse than the round-0 reference beyond the CI, **and** `recall@4` within CI | plan §1 | `rvsm/run.py:round_gate` (`evalsurf.fit_curve` on `logs/eval.jsonl`, then `precision` and `betti0_err` against what the round-0 gate measured; round 0 itself has no earlier round to be worse than, so its only condition is the plateau) — `tests/test_run_e2e.py::test_the_round_gate_wants_a_plateau_and_then_the_quality` |
+| A round failing the gate is **discarded** — previous teacher kept, training extended (WSD makes extension free) | plan §1; §26.2 | `rvsm/run.py:round_gate` returns False and the round is not bumped; no teacher snapshot is written — `tests/test_run_e2e.py::test_the_round_gate_wants_a_plateau_and_then_the_quality` |
+| At most **two rounds live on disk**; round-r stores are deleted per region once superseded **and unreferenced** | plan §1 | `rvsm/run.py:_clean_old_rounds` — `tests/test_run_e2e.py::test_old_rounds_are_deleted_only_once_superseded` |
 | Every metric is quoted as `value (reference) [CI]`; per-surface rows are inspected before a pooled mean is believed | §25.7 | `rvsm/evalsurf.py` |
 
 Supporting tests that exist today: `tests/test_evalsurf.py::test_bootstrap_ci_contains_the_point_estimate`,
@@ -116,7 +116,7 @@ used for exact 2× upsampling, not `F.interpolate` (backward 1762 → 651 ms, §
 
 | check | rule | test |
 |---|---|---|
-| The **only** mutable metadata is `<out>/state.json` (walk cursor, round, phase, verso gate), written atomically by the trainer, plus the `PHASE` and `STOP` markers | plan §1 | — (`run.py` gap) |
+| The **only** mutable metadata is `<out>/state.json` (walk cursor, round, phase, verso gate), written atomically by the trainer, plus the `PHASE` and `STOP` markers | plan §1 | `tests/test_run_e2e.py::test_state_and_markers_are_atomic_and_readable_by_anyone`, `::test_rvsm_stop_ends_the_run_within_one_unit` |
 | Region state is **derived**: `rvsm ledger --rebuild` is a directory scan and must reproduce the ledger exactly | plan §1 | — (gap) |
 | A resume compares `fingerprint()` and refuses a different config | `rvsm/config.py` | `tests/test_train.py::test_resume_continues_and_refuses_a_different_config` |
 | A warm start copies by name, zero-inits the rest, and **reports** the new tensors; probability rows come out bit-identical | §26.1, §29.2 | `tests/test_train.py::test_warm_start_reproduces_the_source_and_reports_the_new_tensors`, `::test_warm_start_from_a_usrm2_checkpoint_maps_by_name` |
@@ -162,13 +162,13 @@ Before the production run, the plan requires:
 
 **Unbuilt at the time of writing** (see [`plan.md`](plan.md) "Progress"):
 
-- `rvsm/run.py` does not exist: the supervisor, the `Producer` loop, the lookahead window, the verso gate,
-  the round driver and the GPU-mode logic are **all unwritten**. Everything in §5 and the first two rows of
-  §7 is therefore unverifiable today, and `test_run_e2e` (plan §6) does not exist.
-- `rvsm/pretrain.py`, `rvsm ladder`, and `rvsm status` / `stop` / `ledger --rebuild` are unbuilt (plan
-  commit 7). Experiments 11 and 12 of [`recipe.md`](recipe.md) §8 cannot be run.
-- `rvsm/train.py` and `tests/test_train.py` exist in the working tree but are **not committed**; verify
-  they are on `main` before reviewing against them.
+- `rvsm/run.py` is built and `test_run_e2e` passes, but it has only ever run on the CPU on a 256³
+  fixture: the **spawned** producer process, `CUDA_VISIBLE_DEVICES` per role, the per-process memory
+  fraction, the one-card `PHASE` timeshare and the silent-producer restart have no test and no GPU
+  hours behind them. The end-to-end test runs `mode = cpu`, where the producer is a thread.
+- The gates have never fired on a metric, only on their step fallbacks (`verso_after_steps`,
+  `round_steps`): a 20-step student on a synthetic slab cannot pass an honest gate. The metric halves
+  are unit-tested on rows, not end to end.
 
 **Exercised only partially:**
 

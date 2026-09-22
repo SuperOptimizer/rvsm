@@ -24,7 +24,7 @@ rvsm ladder   cfg.toml --sizes 15m,30m6,60m
 rvsm status | stop | ledger --rebuild | umbilicus --ct URL --out umbilicus.json
 ```
 
-Status: commits 1-3 of the plan plus the pure ports are on main; the trainer, student inference, driver, pretraining and ladder are landing (see docs/plan.md for the progress table).
+Status: every commit of the plan is on main, and the whole suite runs on the CPU. Nothing has run on a GPU or on a real scroll yet: see the progress table in docs/plan.md and the known gaps in docs/review_checklist.md before trusting any of it in production.
 subcommands land with the modules that drive them.
 
 ## Documentation
@@ -82,3 +82,4 @@ range-capable HTTP server so the ladder is exercised over the network as well as
 | `ladder.py` | the rung ladder: one CT pyramid, read at any rung, coarse rungs pooled from the top |
 | `axis.py` | the umbilicus (parse, derive, write) and the radial/radius/scale channels built from it |
 | `scanmeta.py` | the upstream `metadata.json`, flattened, as five conditioning planes and augmentation ranges |
+| `run.py` | the driver: the supervisor, the producer loop, the lookahead window, the verso and round gates, the rounds and the GPU modes |
