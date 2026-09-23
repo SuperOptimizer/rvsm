@@ -848,3 +848,197 @@ def test_the_walk_leases_its_homes_and_waits_for_an_evicted_one(tmp_path, monkey
     th.join(5.0)
     assert got == [2, 1, 0, 3]
     assert (384, 0, 0) in RUN.cursor_leases(str(out))   # held while its windows are drawn
+
+
+# --------------------------------------------------------------------------- O10: producer supervision
+
+class _FakeProc:
+    """A producer process stand-in: `alive` until killed (or forever, `unkillable`)."""
+
+    def __init__(self, alive=True, exitcode=None, unkillable=False, pid=None):
+        self.alive, self.exitcode, self.unkillable = alive, exitcode, unkillable
+        self.pid = pid
+        self.calls = []
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.calls.append("terminate")
+        if not self.unkillable:
+            self.alive, self.exitcode = False, -15
+
+    def kill(self):
+        self.calls.append("kill")
+        if not self.unkillable:
+            self.alive, self.exitcode = False, -9
+
+    def join(self, t=None):
+        self.calls.append("join")
+
+
+def _watch(tmp_path, first, clock):
+    out = str(tmp_path / "sup")
+    os.makedirs(os.path.join(out, "workers"), exist_ok=True)
+    spawned = []
+
+    def respawn():
+        p = _FakeProc()
+        spawned.append(p)
+        return p
+    procs = {"produce": first}
+    w = RUN.ProducerWatch(out, procs, respawn, log=lambda m: None, clock=lambda: clock[0], join_s=0.0)
+    return out, procs, spawned, w
+
+
+def test_a_dead_producer_is_restarted_at_once_then_with_backoff(tmp_path):
+    """O10: liveness is the process, not the heartbeat's age -- an immediate crash used to stall the run
+    for SILENT_MAX_S. The first restart is immediate, a producer that keeps dying is restarted with a
+    doubling, bounded delay, and a long healthy life resets that."""
+    clock = [1000.0]
+    out, procs, spawned, w = _watch(tmp_path, _FakeProc(alive=False, exitcode=1), clock)
+    RUN._write_json(os.path.join(out, "workers", "produce.json"), {"last_ts": clock[0]})
+    assert w.check() == "restart" and len(spawned) == 1       # at once, the stamp is fresh
+    assert RUN._read_json(os.path.join(out, "workers", "produce.json"))["phase"] == "spawning"
+    spawned[0].alive, spawned[0].exitcode = False, 1           # dies again straight away
+    assert w.check() == "backoff" and len(spawned) == 1
+    clock[0] += RUN.RESTART_MIN_S + 0.1
+    assert w.check() == "restart" and len(spawned) == 2
+    spawned[1].alive = False
+    clock[0] += RUN.RESTART_MIN_S + 0.1                        # the delay has doubled
+    assert w.check() == "backoff"
+    clock[0] += RUN.RESTART_MIN_S
+    assert w.check() == "restart" and len(spawned) == 3
+    for _ in range(20):                                        # bounded
+        procs["produce"].alive = False
+        clock[0] += RUN.RESTART_MAX_S + 0.1
+        assert w.check() == "restart"
+    assert w.fails >= RUN.RESTART_FATAL
+    assert any(r.get("kind") == "producer_fatal" for r in RUN.tail_jsonl(os.path.join(out, "logs",
+                                                                                       "sched.jsonl")))
+    # a producer that lives RESTART_RESET_S has earned a fresh start
+    RUN._write_json(os.path.join(out, "workers", "produce.json"), {"last_ts": clock[0]})
+    clock[0] += RUN.RESTART_RESET_S + 1
+    RUN._write_json(os.path.join(out, "workers", "produce.json"), {"last_ts": clock[0]})
+    assert w.check() is None and w.fails == 0
+    procs["produce"].alive = False
+    assert w.check() == "restart"                              # immediate again
+
+
+def test_a_silent_producer_is_replaced_only_once_it_has_exited(tmp_path):
+    """A silent producer is terminated (then killed); a new one is spawned only once the old one has
+    EXITED -- one that will not die is reported, never duplicated -- and a producer THREAD (cpu mode),
+    which cannot be stopped, is never restarted while it lives. A healthy one is left alone."""
+    clock = [5000.0]
+    hung = _FakeProc(unkillable=True)
+    out, procs, spawned, w = _watch(tmp_path, hung, clock)
+    hb = os.path.join(out, "workers", "produce.json")
+    RUN._write_json(hb, {"last_ts": clock[0] - 10})
+    assert w.check() is None and not hung.calls                # healthy
+    RUN._write_json(hb, {"last_ts": clock[0] - RUN.SILENT_MAX_S - 1})
+    assert w.check() == "stuck" and not spawned
+    assert "terminate" in hung.calls and "kill" in hung.calls
+    assert procs["produce"] is hung
+    hung.unkillable = False                                    # it finally responds to a signal
+    assert w.check() == "restart" and len(spawned) == 1 and procs["produce"] is spawned[0]
+    assert hung.calls.count("terminate") == 2
+
+    class _Thread:                                             # no terminate(): cannot be stopped
+        def is_alive(self):
+            return True
+    procs["produce"] = _Thread()
+    RUN._write_json(hb, {"last_ts": clock[0] - RUN.SILENT_MAX_S - 1})
+    assert w.check() == "silent_thread" and len(spawned) == 1
+
+
+def _sleep_forever():
+    time.sleep(3600)
+
+
+def _producer_with_a_pool():
+    import multiprocessing as mp
+    kid = mp.get_context("fork").Process(target=_sleep_forever, daemon=False)
+    kid.start()
+    time.sleep(3600)
+
+
+def test_a_silent_producer_is_killed_with_its_process_tree(tmp_path):
+    """A real process tree: the silent producer and its child (the fields pool) are both gone before
+    the replacement is spawned."""
+    import multiprocessing as mp
+    pr = mp.get_context("fork").Process(target=_producer_with_a_pool)
+    pr.start()
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 10 and not RUN.proc_tree(pr.pid):
+            time.sleep(0.05)
+        tree = RUN.proc_tree(pr.pid)
+        assert len(tree) == 1
+        clock = [time.time()]
+        out, procs, spawned, w = _watch(tmp_path, pr, clock)
+        w.join_s = 10.0
+        RUN._write_json(os.path.join(out, "workers", "produce.json"),
+                        {"last_ts": clock[0] - RUN.SILENT_MAX_S - 1})
+        assert w.check() == "restart" and len(spawned) == 1
+        assert not pr.is_alive()
+        kid = tree[0][0]
+        t0 = time.time()
+        while time.time() - t0 < 10 and _running(kid):
+            time.sleep(0.05)
+        assert not _running(kid), "the producer's child outlived it"
+    finally:
+        if pr.is_alive():
+            pr.kill()
+
+
+def _running(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            st = f.read()
+    except OSError:
+        return False
+    return st[st.rindex(")") + 2] != "Z"
+
+
+def _orphan_parent(q):
+    import multiprocessing as mp
+    from rvsm import targets as TG
+
+    def child():
+        TG.die_with_parent()
+        time.sleep(3600)
+    kid = mp.get_context("fork").Process(target=child)
+    kid.start()
+    q.put(kid.pid)
+    time.sleep(0.5)
+    os._exit(0)                                                # dies without reaping or killing it
+
+
+def test_a_fields_pool_worker_dies_with_its_parent():
+    """`targets.die_with_parent` (the fields pool's initializer): when the parent goes, so does the
+    worker, whatever killed the parent."""
+    import multiprocessing as mp
+    ctx = mp.get_context("fork")
+    q = ctx.Queue()
+    p = ctx.Process(target=_orphan_parent, args=(q,))
+    p.start()
+    kid = q.get(timeout=10)
+    p.join(10)
+    t0 = time.time()
+    while time.time() - t0 < 10 and _running(kid):
+        time.sleep(0.05)
+    assert not _running(kid)
+
+
+def test_the_heartbeat_ticker_stamps_during_a_long_unit():
+    """The producer's own stamping thread: the loop stamps between units only, and a unit longer than
+    SILENT_MAX_S (a first TensorRT compile) got a healthy producer restarted."""
+    stop = threading.Event()
+    n = []
+    t = threading.Thread(target=RUN.hb_ticker, args=(lambda: n.append(1), stop, 0.02), daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(2.0)
+    assert not t.is_alive() and len(n) >= 5
+    assert RUN.HB_TICK_S < RUN.SILENT_MAX_S / 10

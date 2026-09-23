@@ -463,7 +463,24 @@ def _block_in(arg):
     return _block(task)
 
 
+def die_with_parent():
+    """Ask the kernel to SIGKILL this process when its parent dies (Linux `PR_SET_PDEATHSIG`; a no-op
+    elsewhere). A fields-pool worker's parent is the pool's forkserver, which exits when the producer
+    does -- so a producer the supervisor kills (or that crashes) no longer leaves its pool computing
+    EDTs beside the producer that replaces it."""
+    try:
+        import ctypes
+        import signal
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, int(signal.SIGKILL), 0, 0, 0)      # 1 = PR_SET_PDEATHSIG
+        if os.getppid() == 1:                              # the parent died before the prctl
+            os._exit(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _nice():
+    die_with_parent()
     try:
         os.nice(10)       # the fields are background work: the trainer's loader keeps the cores it needs
     except OSError:
@@ -475,7 +492,7 @@ def field_pool(jobs):
 
     `forkserver`, not `fork`: the producer that owns it has CUDA and several threads, and a forked child
     of a threaded process can inherit a lock some other thread held at the fork. The workers run at
-    nice 10."""
+    nice 10 and die with their parent (`die_with_parent`)."""
     import concurrent.futures as cf
     import multiprocessing as mp
     return cf.ProcessPoolExecutor(max_workers=int(jobs), mp_context=mp.get_context("forkserver"),

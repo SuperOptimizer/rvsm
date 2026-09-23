@@ -87,6 +87,11 @@ RAM_RESUME_FRAC = 0.75      # MemTotal pauses the producer; below this share it 
 RAM_CHECK_S = 5.0           # the guard looks this often (the paris4 OOM went 90 % -> 99.5 % in 4 s)
 HEARTBEAT_S = 30.0          # how often the supervisor stamps workers.json / logs/sched.jsonl
 SILENT_MAX_S = 1800.0       # a producer that has not stamped its heartbeat for this long is restarted
+HB_TICK_S = 60.0            # the producer's own stamping thread: alive while a long unit runs
+RESTART_MIN_S = 10.0        # a dead producer is restarted AT ONCE; a second death waits this long, doubling
+RESTART_MAX_S = 600.0       # ... up to this
+RESTART_RESET_S = 1800.0    # a producer that has lived this long has earned a fresh backoff
+RESTART_FATAL = 6           # this many restarts without a healthy run in between is shouted as FATAL
                             # (it stamps once per unit; one teacher region with its first engine
                             # builds is ~10 min on an A100, so the margin is 3x that)
 WAIT_S = 5.0                # the trainer's sleep when nothing in the lookahead window is ready
@@ -628,9 +633,28 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     if mem_frac:
         set_memory_fraction(mem_frac, 0)
 
+    import threading
     t_start = time.time()
     hb = os.path.join(out, "workers", "produce.json")
-    _write_json(hb, {"pid": os.getpid(), "phase": "start", "last_ts": time.time()})
+    hb_rec, hb_lock, hb_stop = {}, threading.Lock(), threading.Event()
+
+    def stamp(rec):
+        """The loop's heartbeat: what it is doing, `last_ts` (alive) and `progress_ts` (the loop itself
+        got here). One lock for this and the ticker: both write the same file through the same tmp."""
+        with hb_lock:
+            now = time.time()
+            hb_rec.clear()
+            hb_rec.update(rec, pid=os.getpid(), last_ts=now, progress_ts=now)
+            _write_json(hb, dict(hb_rec))
+
+    def tick():
+        with hb_lock:
+            if hb_rec:
+                hb_rec["last_ts"] = time.time()
+                _write_json(hb, dict(hb_rec))
+
+    stamp({"phase": "start"})
+    threading.Thread(target=hb_ticker, args=(tick, hb_stop), name="rvsm-hb", daemon=True).start()
 
     cache = stream.ShardCache(cfg.ct, out, budget_gb=cfg.cache_gb, seed=cfg.ct_seed or None,
                               log=lambda m: jlog(out, "produce", {"kind": "cache", "msg": str(m)},
@@ -682,7 +706,6 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     # A region with a unit in the writer or the fields queue is BUSY: its stores are not on disk yet,
     # so the disk-derived state machine would hand out the same unit again.
     import concurrent.futures as cf
-    import threading
     reader = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-read")
     writer = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-write")
     fielder = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fields")
@@ -784,7 +807,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             if time.time() - t_reest > REEST_S:
                 L, t_reest = lookahead(cfg, out, k_active), time.time()
             leased = follow_leases(round_)
-            _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "last_ts": time.time(),
+            stamp({"phase": f"round{round_}", "last_ts": time.time(),
                              "L": L, "cursor": cursor, "head": head})
 
             # one-card timeshare: no PHASE file means nobody is taking turns
@@ -792,7 +815,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 time.sleep(IDLE_S)
                 continue
             if producer_paused(out):        # the supervisor's host-RAM guard: no new unit
-                _write_json(hb, {"pid": os.getpid(), "phase": "paused_ram", "last_ts": time.time(),
+                stamp({"phase": "paused_ram", "last_ts": time.time(),
                                  "L": L, "cursor": cursor})
                 time.sleep(IDLE_S)
                 continue
@@ -833,7 +856,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if job in ("verso", "self") and slot.get(round_, st.get("teacher")) is None:
                     break
                 t0 = time.time()
-                _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "job": job,
+                stamp({"phase": f"round{round_}", "job": job,
                                  "region": list(lo), "last_ts": t0, "L": L, "cursor": cursor})
                 prefetch(lo, job)
                 try:
@@ -907,7 +930,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             cache.close()
         except Exception:  # noqa: BLE001
             pass
-        _write_json(hb, {"pid": os.getpid(), "phase": "exit", "last_ts": time.time()})
+        hb_stop.set()
+        stamp({"phase": "exit"})
         jlog(out, "produce", {"kind": "exit", "pid": os.getpid()})
     settle()
     return 0
@@ -1506,10 +1530,151 @@ def ram_guard(out, pid=None, mem=None, rss=None, log=print):
     return rec
 
 
+def hb_ticker(tick, stop_ev, every=None):
+    """The producer's stamping thread: `tick()` every `HB_TICK_S` until `stop_ev`. A unit may take far
+    longer than the supervisor's silence limit (a first TensorRT compile, a 1024^3 teacher pass on a
+    slow card); the loop stamps only between units, so without this a healthy producer was restarted."""
+    every = HB_TICK_S if every is None else float(every)
+    while not stop_ev.wait(every):
+        try:
+            tick()
+        except Exception:  # noqa: BLE001  -- a full disk must not kill the thread that proves liveness
+            pass
+
+
+def proc_tree(pid):
+    """[(pid, start time)] of every descendant of `pid` (not `pid` itself), from /proc. The start time
+    makes a later kill safe against pid reuse."""
+    kids, start = {}, {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    for d in names:
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                st = f.read()
+            rest = st[st.rindex(")") + 2:].split()
+            kids.setdefault(int(rest[1]), []).append(int(d))
+            start[int(d)] = int(rest[19])
+        except (OSError, ValueError, IndexError):
+            continue
+    out, todo, seen = [], list(kids.get(int(pid), [])), set()
+    while todo:
+        q = todo.pop()
+        if q in seen:
+            continue
+        seen.add(q)
+        out.append((q, start.get(q)))
+        todo += kids.get(q, [])
+    return out
+
+
+def kill_tree(tree, sig=None):
+    """SIGKILL every (pid, start time) of `proc_tree` that is still that same process."""
+    import signal
+    sig = signal.SIGKILL if sig is None else sig
+    n = 0
+    for pid, t0 in tree:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                st = f.read()
+            if int(st[st.rindex(")") + 2:].split()[19]) != t0:
+                continue                 # the pid now belongs to someone else
+            os.kill(pid, sig)
+            n += 1
+        except (OSError, ValueError, IndexError):
+            continue
+    return n
+
+
+class ProducerWatch:
+    """The supervisor's producer supervision, one `check()` per tick (review O10).
+
+    LIVENESS is the process itself: `is_alive()` / `exitcode`. A producer that has died is restarted at
+    the next tick, not after `SILENT_MAX_S` of silence (an immediate crash stalled a run for half an
+    hour). SILENCE -- alive but no heartbeat for `SILENT_MAX_S`, which the producer's own stamping
+    thread makes a frozen process rather than a long unit -- gets terminate, then kill, and its whole
+    process tree (the fields pool) is killed with it. A new producer is spawned only once the old one
+    has EXITED: one that survives even SIGKILL (a D-state hang) is left alone and reported every tick,
+    never duplicated, and a producer THREAD (cpu mode) cannot be stopped at all, so a silent one is
+    reported, not restarted. Restarts back off: the first is immediate, the next waits `RESTART_MIN_S`,
+    doubling to `RESTART_MAX_S`; a producer that lives `RESTART_RESET_S` resets that, and
+    `RESTART_FATAL` restarts in a row are shouted in the log."""
+
+    def __init__(self, out, procs, respawn, log=print, clock=time.time, join_s=30.0):
+        self.out, self.procs, self.respawn, self.log = str(out), procs, respawn, log
+        self.clock, self.join_s = clock, float(join_s)
+        self.fails, self.next_at, self.born = 0, 0.0, clock()
+        self.restarts = 0
+
+    def _hb(self):
+        return _read_json(os.path.join(self.out, "workers", "produce.json")) or {}
+
+    def check(self):
+        """One look. Returns what happened: None (healthy / nothing to do), "restart", "backoff",
+        "stuck" (will not exit) or "silent_thread"."""
+        pr = self.procs.get("produce")
+        if pr is None or stop_requested(self.out):
+            return None
+        now = self.clock()
+        if pr.is_alive():
+            age = now - float(self._hb().get("last_ts") or now)
+            if age <= SILENT_MAX_S:
+                if self.fails and now - self.born > RESTART_RESET_S:
+                    self.fails = 0
+                return None
+            if not hasattr(pr, "terminate"):
+                jlog(self.out, "sched", {"kind": "producer_silent_thread", "age_s": round(age)})
+                return "silent_thread"
+            jlog(self.out, "sched", {"kind": "restart", "reason": "producer silent", "age_s": round(age),
+                                     "pid": getattr(pr, "pid", None)})
+            tree = proc_tree(pr.pid) if getattr(pr, "pid", None) else []
+            for stop in ("terminate", "kill"):
+                try:
+                    getattr(pr, stop)()
+                    pr.join(self.join_s)
+                except Exception:  # noqa: BLE001
+                    pass
+                if not pr.is_alive():
+                    break
+            kill_tree(tree)
+            if pr.is_alive():
+                jlog(self.out, "sched", {"kind": "producer_stuck", "pid": getattr(pr, "pid", None)})
+                self.log(f"!!!! [supervisor] producer pid {getattr(pr, 'pid', None)} is silent and will "
+                         f"not exit: NOT starting another one !!!!")
+                return "stuck"
+            reason = "silent"
+        else:
+            reason = f"exit {getattr(pr, 'exitcode', None)}"
+        if now < self.next_at:
+            return "backoff"
+        self.fails += 1
+        self.restarts += 1
+        self.next_at = now + min(RESTART_MIN_S * 2 ** (self.fails - 1), RESTART_MAX_S)
+        rec = {"kind": "restart", "reason": reason, "restarts": self.restarts, "fails": self.fails,
+               "next_after_s": round(self.next_at - now, 1)}
+        jlog(self.out, "sched", rec, echo=False)
+        if self.fails >= RESTART_FATAL:
+            jlog(self.out, "sched", {**rec, "kind": "producer_fatal"}, echo=False)
+            self.log(f"!!!! [supervisor] FATAL: the producer has died {self.fails} times in a row "
+                     f"({reason}); see logs/produce.jsonl -- still retrying every "
+                     f"{min(RESTART_MIN_S * 2 ** (self.fails - 1), RESTART_MAX_S):.0f} s !!!!")
+        _write_json(os.path.join(self.out, "workers", "produce.json"),
+                    {"pid": None, "phase": "spawning", "last_ts": now})
+        self.procs["produce"] = self.respawn()
+        self.born = now
+        return "restart"
+
+
 def heartbeat(out, place, stop_ev, procs, respawn):
     """The supervisor's own thread: stamp `workers.json` and `logs/sched.jsonl` (with the run's
-    process-tree RSS and the host's memory), restart a producer that has gone silent for longer than
-    `SILENT_MAX_S` (plan §1), and run the host-RAM guard every `RAM_CHECK_S` (`ram_guard`)."""
+    process-tree RSS and the host's memory), supervise the producer (`ProducerWatch`: a dead one is
+    restarted at the next tick, a silent one after `SILENT_MAX_S`) and run the host-RAM guard, both
+    every `RAM_CHECK_S`."""
+    watch = ProducerWatch(out, procs, respawn, log=lambda m: print(m, flush=True))
     while not stop_ev.is_set():
         mem = ram_guard(out, log=lambda m: print(m, flush=True))
         w = {"mode": place["mode"], "phases": bool(place["phases"]), "t": time.time(),
@@ -1522,24 +1687,18 @@ def heartbeat(out, place, stop_ev, procs, respawn):
                                                     ("step", "round", "cursor")},
                             "produce_phase": p.get("phase"),
                             "produce_age_s": round(time.time() - float(p.get("last_ts") or 0), 1),
+                            "produce_progress_age_s": round(time.time() - float(p.get("progress_ts")
+                                                                                or p.get("last_ts") or 0), 1),
                             **{k: v for k, v in mem.items() if k != "action"},
                             "producer_paused": producer_paused(out)},
              echo=False)
-        age = time.time() - float(p.get("last_ts") or time.time())
-        pr = procs.get("produce")
-        if pr is not None and age > SILENT_MAX_S and not stop_requested(out):
-            jlog(out, "sched", {"kind": "restart", "reason": "producer silent", "age_s": round(age)})
-            try:
-                pr.terminate()
-                pr.join(30)
-            except Exception:  # noqa: BLE001
-                pass
-            procs["produce"] = respawn()
+        watch.check()
         t_next = time.time() + HEARTBEAT_S
         while not stop_ev.is_set() and time.time() < t_next:
             stop_ev.wait(min(RAM_CHECK_S, max(t_next - time.time(), 0.0)))
             if not stop_ev.is_set() and time.time() < t_next:
                 ram_guard(out, log=lambda m: print(m, flush=True))
+                watch.check()
 
 
 def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
@@ -1715,7 +1874,10 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
             except Exception:  # noqa: BLE001
                 pass
             if hasattr(pr, "terminate") and getattr(pr, "is_alive", lambda: False)():
+                tree = proc_tree(pr.pid)        # its fields pool goes with it
                 pr.terminate()
+                pr.join(30)
+                kill_tree(tree)
         jlog(out, "sched", {"kind": "exit", "round": state["round"],
                             "step": int(read_state(out).get("step", 0)), "ckpt": ck})
     return ck
