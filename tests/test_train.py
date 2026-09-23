@@ -554,3 +554,25 @@ def test_a_nonfinite_gradient_skips_the_step_and_a_run_of_them_aborts(tiny_cfg, 
     rows = [json.loads(q) for q in (Path(cfg2.out) / "logs" / "train.jsonl").read_text().splitlines()]
     bad = [r for r in rows if r.get("kind") == "nonfinite_grad"]
     assert [r["consecutive"] for r in bad] == [1, 2, 3] and all(r["step"] == 0 for r in bad)
+
+
+def test_the_augmentation_reads_the_frozen_metadata(full_cfg, tmp_path, monkeypatch):
+    """With a run directory's frozen metadata.json the augmentation ranges come from it and never
+    from the (altered, or unreachable) source beside the CT (pass-3 review P3-13)."""
+    import pathlib
+    from rvsm import run as RUN, scanmeta as SM
+    ex = pathlib.Path(__file__).resolve().parent.parent / "docs" / "example_metadata.json"
+    vol = tmp_path / "vol.zarr"
+    vol.mkdir()
+    (vol / "metadata.json").write_text(ex.read_text())
+    out = tmp_path / "run"
+    out.mkdir()
+    RUN.frozen_meta(str(out), str(vol))
+    cfg = replace(full_cfg, ct=str(vol))
+    before = TR._aug_cfg(cfg, out)
+    raw = json.loads(ex.read_text())                      # the source changes after the freeze ...
+    raw["scan"]["tomo"]["acquisition"]["energy"] = 12.0
+    (vol / "metadata.json").write_text(json.dumps(raw))
+    assert TR.aug_for(cfg, SM.fetch(str(vol))) != before   # the altered source WOULD change it
+    monkeypatch.setattr(SM, "fetch", lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetched")))
+    assert TR._aug_cfg(cfg, out) == before                 # ... the augmentation does not

@@ -541,8 +541,16 @@ def aug_for(cfg, meta=None):
     return acfg
 
 
-def _aug_cfg(cfg):
-    """`aug_for` with the scan's metadata read from beside the CT, when there is any."""
+def _aug_cfg(cfg, out=None):
+    """`aug_for` with the scan's metadata. A run directory's FROZEN `<out>/metadata.json` (written once
+    by `run.frozen_meta`) is used when there is one, so the augmentation ranges cannot change on a
+    resume because the source changed or was unreachable that day (pass-3 review P3-13); only a
+    standalone `rvsm train` without it reads the metadata beside the CT."""
+    import json
+    fz = os.path.join(str(out), "metadata.json") if out is not None else None
+    if fz and os.path.exists(fz):
+        with open(fz) as f:
+            return aug_for(cfg, json.load(f))
     meta = None
     try:
         from rvsm import scanmeta as SM
@@ -747,7 +755,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     casmask = prep.Cascade("mask", self_p=0.0, drop=0.0, noise=False) \
         if cfg.cascade in ("self", "mix") else None
 
-    acfg = _aug_cfg(cfg)
+    acfg = _aug_cfg(cfg, out)
     model = torch.compile(net) if cfg.compile else net
     aux_on = bool(cfg.loss_excl or cfg.loss_selfcons or cfg.loss_skel or cfg.loss_affinity)
     aux_dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
