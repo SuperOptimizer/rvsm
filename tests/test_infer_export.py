@@ -850,3 +850,20 @@ def test_a_constant_region_comes_back_constant_at_the_corners():
     assert int((code.int() - want).abs().max()) <= 1
     for c in ((0, 0, 0), (n - 1, n - 1, n - 1), (0, n - 1, 0)):
         assert abs(int(code[c]) - want) <= 1, c
+
+    # a REGRESSION plane (a midline distance at the +-31.75-voxel cap) must not overflow: scaled into
+    # fp16 it came back inf (pass-3 P3-11). Unbounded planes accumulate in fp32; beside a probability
+    # plane in the same pass, both come back right, corners included, within one q0.25 code.
+    def fn2(x):
+        s = tuple(x.shape[2:])
+        return torch.stack([torch.full((x.shape[0],) + s, 0.6), torch.full((x.shape[0],) + s, 31.75),
+                            torch.full((x.shape[0],) + s, -31.75)], 1)
+    out = infer.run_region(fn2, Const(), (n, n, n), W, H, planes=3, acc_dtype=torch.float16,
+                           out_dtype=torch.float16, bounded=[True, False, False])
+    assert bool(torch.isfinite(out).all())
+    assert int((infer.u8_t(out[0].float()).int() - want).abs().max()) <= 1
+    for v, pl in ((31.75, out[1]), (-31.75, out[2])):
+        err = (pl.float() - v).abs()
+        assert float(err.max()) <= 0.25, (v, float(err.max()))
+        for c in ((0, 0, 0), (n - 1, n - 1, n - 1), (0, n - 1, 0)):
+            assert abs(float(pl[c]) - v) <= 0.25, c

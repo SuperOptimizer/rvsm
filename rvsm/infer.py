@@ -269,44 +269,62 @@ class StudentInputs(Inputs):
 # The region pass
 # --------------------------------------------------------------------------- #
 def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torch.float16,
-               prep_dtype=torch.float32, offs=None, out_dtype=torch.float32):
+               prep_dtype=torch.float32, offs=None, out_dtype=torch.float32, bounded=None):
     """The blended output of one region: (planes, Z, Y, X) with `size` = (Z, Y, X).
 
     `fn(x)` takes a (B, C, w, w, w) tensor and returns (B, planes, w, w, w). Windows whose CT is all air
     are skipped, and the result is zeroed wherever the CT is 0, so what comes back is defined exactly
-    where the scroll is. The accumulators are `acc_dtype` (fp16 by default: see the module docstring);
-    the division is done in fp32."""
+    where the scroll is.
+
+    ACCUMULATION. The Gaussian weight sum is always fp32. `bounded[i]` says plane i is a probability in
+    [0, 1] (default: every plane -- the teachers' and the recto passes'); only those may use an
+    `acc_dtype` fp16 accumulator, with the Gaussian scaled by 2^12 so a window corner (~1.5e-6
+    unscaled, an fp16 subnormal) is a normal fp16 and <= 8 overlapping centres stay <= 32768. Any
+    other plane -- a distance, a thickness, a log-variance -- accumulates in fp32 unscaled: scaled in
+    fp16, a 31.75-voxel midline overflowed to inf (pass-3 review P3-11). The division is fp32."""
     w, dev = int(window), inputs.dev
-    # the Gaussian is SCALED by 2^12 before it meets an fp16 accumulator: at a window corner it is
-    # ~1.5e-6 (sigma = w/6, three axes), an fp16 subnormal with ~5 significant bits, and a region
-    # corner that only one window's corner covers came out as a ratio of two such numbers. Scaled,
-    # the corner is ~6e-3 (a normal fp16) and the sum of the <= 8 overlapping centres stays <= 32768.
-    # The scale cancels in acc / wsum.
-    g = (gauss_t(w, dev, torch.float32) * (GAUSS_SCALE if acc_dtype == torch.float16 else 1.0)).to(acc_dtype)
+    P = int(planes)
+    bnd = [True] * P if bounded is None else [bool(b) for b in bounded]
+    assert len(bnd) == P, (bnd, P)
+    half = acc_dtype == torch.float16
+    ib = [k for k in range(P) if bnd[k]] if half else []
+    iu = [k for k in range(P) if k not in ib]
+    g32 = gauss_t(w, dev, torch.float32)
+    g16 = (g32 * GAUSS_SCALE).to(torch.float16) if ib else None
     todo = [o for o in (offsets(inputs.shape, w, halo) if offs is None else offs) if inputs.window_any(o)]
-    acc = torch.zeros((int(planes),) + tuple(inputs.shape), dtype=acc_dtype, device=dev)
-    wsum = torch.zeros(tuple(inputs.shape), dtype=acc_dtype, device=dev)
+    acc_b = torch.zeros((len(ib),) + tuple(inputs.shape), dtype=torch.float16, device=dev) if ib else None
+    acc_u = torch.zeros((len(iu),) + tuple(inputs.shape), dtype=torch.float32, device=dev) if iu else None
+    wsum = torch.zeros(tuple(inputs.shape), dtype=torch.float32, device=dev)
     for i in range(0, len(todo), max(1, int(batch))):
         ob = todo[i:i + max(1, int(batch))]
         x = torch.cat([inputs.prep(o, prep_dtype) for o in ob])
         with torch.no_grad():
-            p = fn(x).to(acc_dtype)
+            p = fn(x)
         del x
         for o, pj in zip(ob, p):
-            acc[:, o[0]:o[0] + w, o[1]:o[1] + w, o[2]:o[2] + w] += pj * g
-            wsum[o[0]:o[0] + w, o[1]:o[1] + w, o[2]:o[2] + w] += g
+            sl = (slice(o[0], o[0] + w), slice(o[1], o[1] + w), slice(o[2], o[2] + w))
+            if ib:
+                acc_b[(slice(None),) + sl] += pj[ib].to(torch.float16) * g16
+            if iu:
+                acc_u[(slice(None),) + sl] += pj[iu].float() * g32
+            wsum[sl] += g32
         del p
     Z, Y, X = (int(v) for v in size)
     # normalised in z-slabs straight into the output dtype: the whole-volume float32 temporaries of
     # `where(keep, acc / wsum)` were 4 GB per plane on top of the accumulators (20+ GB for five heads)
-    out = torch.empty((int(planes), Z, Y, X), dtype=out_dtype, device=dev)
+    out = torch.empty((P, Z, Y, X), dtype=out_dtype, device=dev)
     for z in range(0, Z, 64):
         e = min(z + 64, Z)
-        ws = wsum[z:e, :Y, :X]
-        keep = (ws > 0) & (inputs.roi[z:e, :Y, :X] > 0)
-        q = acc[:, z:e, :Y, :X].float() / ws.float().clamp_min(1e-6)[None]
-        out[:, z:e] = torch.where(keep[None], q, torch.zeros((), device=dev)).to(out_dtype)
-    del acc, wsum
+        ws = wsum[z:e, :Y, :X].clamp_min(1e-30)
+        keep = (wsum[z:e, :Y, :X] > 0) & (inputs.roi[z:e, :Y, :X] > 0)
+        zero = torch.zeros((), device=dev)
+        if ib:
+            q = acc_b[:, z:e, :Y, :X].float() / (ws * GAUSS_SCALE)[None]
+            out[ib, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
+        if iu:
+            q = acc_u[:, z:e, :Y, :X] / ws[None]
+            out[iu, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
+    del acc_b, acc_u, wsum
     return out
 
 
@@ -726,7 +744,9 @@ def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, 
     fn = st.plane_fn(names, int(rung))
     if int(tta) > 1:
         fn = flips_chan(fn, int(tta), radial=True)
+    bounded = [n in set(str(c) for c in st.layout.channels) or n == "conf" for n in names]
     out = run_region(fn, inp, tuple(int(v) for v in ladder.shape3(size)), w, h, batch=batch,
+                     bounded=bounded,
                      planes=len(names), offs=inp.offs, acc_dtype=acc_dtype,
                      out_dtype=(torch.float16 if as_tensor else torch.float32))
     if as_tensor:
