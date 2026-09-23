@@ -136,3 +136,38 @@ def test_a_seed_mirror_is_linked_and_only_its_gaps_are_fetched(ct_origin, tmp_pa
     os.remove(os.path.join(cache.base, rel[1]))      # what eviction does
     assert os.path.exists(shards[1])
     cache.close()
+
+
+def test_a_failed_shard_aborts_the_unit_and_books_nothing(ct_origin, tmp_path):
+    """One `fail` (retries exhausted) raises FetchFailed before anything is charged or held, counts
+    the failed unit and logs it; an absent shard (no file) is never charged either (review D01)."""
+    logs = []
+    cache = stream.ShardCache(ct_origin.url, str(tmp_path / "c"), budget_gb=1, log=logs.append)
+    cache.levels()
+    good = os.path.join(cache.base, "0", "c", "0", "0", "0")
+    bad = os.path.join(cache.base, "0", "c", "0", "0", "1")
+    absent = os.path.join(cache.base, "0", "c", "99", "0", "0")
+
+    class Fake:
+        async def get(self, p):
+            if p == bad:
+                return "fail", 0
+            if p == absent:
+                return "absent", 0
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "wb").write(b"x" * 10)
+            return "new", 10
+
+    async def fake_fetcher():
+        return Fake()
+    cache._fetcher = fake_fetcher
+    before = (cache.cache_bytes, dict(cache.hold), dict(cache.regions))
+    with pytest.raises(stream.FetchFailed) as e:
+        cache._fetch([good, bad, absent], key="r1")
+    assert e.value.paths == [bad] and cache.failed_units == 1
+    assert (cache.cache_bytes, dict(cache.hold), dict(cache.regions)) == before
+    assert any("FAILED unit r1" in m for m in logs)
+    cache._fetch([good, absent], key="r2")                  # the retry: the absent one is not held
+    assert good in cache.regions["r2"] and absent not in cache.regions["r2"]
+    assert absent not in cache.size
+    cache.close()

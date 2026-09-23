@@ -241,6 +241,14 @@ async def fetch_group_meta(f, base):
 
 # ------------------------------------------------------------------ the cache
 
+class FetchFailed(RuntimeError):
+    """A region unit's shards did not all arrive: the unit is aborted and retried later."""
+
+    def __init__(self, key, paths):
+        super().__init__(f"{len(paths)} shard(s) failed for {key}: {paths[:3]}")
+        self.key, self.paths = key, list(paths)
+
+
 class ShardCache:
     """The run's CT, mirrored one shard at a time under `<root>/ct/<vol>.zarr`.
 
@@ -372,14 +380,27 @@ class ShardCache:
         return out
 
     def _fetch(self, paths, pin=False, key=None):
-        """Fetch `paths` (local mirror paths) concurrently, book them, and bind them to `key`."""
+        """Fetch `paths` (local mirror paths) concurrently, book them, and bind them to `key`.
+
+        Every status is inspected: one `fail` (retries exhausted) raises `FetchFailed` BEFORE anything
+        is booked, so the unit that asked is aborted -- no store is written from a CT with holes in it,
+        and the region is retried on a later pass -- and `failed_units` counts it. A path that does not
+        exist on disk (an `absent` shard, the origin's 404) is never charged or held."""
         paths = list(dict.fromkeys(paths))
         if self.remote and paths:
             async def go():
                 f = await self._fetcher()
                 return await asyncio.gather(*[f.get(p) for p in paths])
-            self._run(go())
+            got = self._run(go()) or []
+            bad = [p for p, r in zip(paths, got) if (r[0] if isinstance(r, tuple) else r) == "fail"]
+            if bad:
+                self.failed_units = getattr(self, "failed_units", 0) + 1
+                self.log(f"rvsm cache: FAILED unit {key or '(pin)'}: {len(bad)} of {len(paths)} shards "
+                         f"did not arrive (failed units so far: {self.failed_units}); nothing booked")
+                raise FetchFailed(key, bad)
         for p in paths:
+            if not os.path.exists(p):
+                continue
             if pin:
                 self.pin.add(p)
                 self.size.setdefault(p, os.path.getsize(p) if os.path.exists(p) else 0)

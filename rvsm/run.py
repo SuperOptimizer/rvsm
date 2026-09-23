@@ -813,7 +813,15 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "job": job,
                                  "region": list(lo), "last_ts": t0, "L": L, "cursor": cursor})
                 prefetch(lo, job)
-                got = pre.pop((lo, job)).result()
+                try:
+                    got = pre.pop((lo, job)).result()
+                except stream.FetchFailed as e:
+                    # a shard did not arrive: nothing was booked and no store is written; the region
+                    # stays unfinished, so a later pass over the window retries it
+                    jlog(out, "produce", {"kind": "fetch_failed", "region": list(lo), "job": job,
+                                          "shards": len(e.paths),
+                                          "failed_units": int(getattr(cache, "failed_units", 0))})
+                    continue
                 t_in = time.time() - t0
                 if i + 1 < len(gpu_units):
                     prefetch(*gpu_units[i + 1])    # the next unit's read overlaps this unit's pass
