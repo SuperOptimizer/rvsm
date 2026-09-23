@@ -48,6 +48,9 @@ def offsets(shape, window, halo):
     return [(z, y, x) for z in ss[0] for y in ss[1] for x in ss[2]]
 
 
+GAUSS_SCALE = float(1 << 12)
+
+
 def gauss_t(w, dev, dtype=torch.float32):
     """The separable Gaussian window weight (sigma = w/6), as a (w, w, w) tensor."""
     g = torch.exp(-0.5 * ((torch.arange(w, device=dev, dtype=torch.float64) - (w - 1) / 2) / (w / 6)) ** 2)
@@ -274,7 +277,12 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     where the scroll is. The accumulators are `acc_dtype` (fp16 by default: see the module docstring);
     the division is done in fp32."""
     w, dev = int(window), inputs.dev
-    g = gauss_t(w, dev, acc_dtype)
+    # the Gaussian is SCALED by 2^12 before it meets an fp16 accumulator: at a window corner it is
+    # ~1.5e-6 (sigma = w/6, three axes), an fp16 subnormal with ~5 significant bits, and a region
+    # corner that only one window's corner covers came out as a ratio of two such numbers. Scaled,
+    # the corner is ~6e-3 (a normal fp16) and the sum of the <= 8 overlapping centres stays <= 32768.
+    # The scale cancels in acc / wsum.
+    g = (gauss_t(w, dev, torch.float32) * (GAUSS_SCALE if acc_dtype == torch.float16 else 1.0)).to(acc_dtype)
     todo = [o for o in (offsets(inputs.shape, w, halo) if offs is None else offs) if inputs.window_any(o)]
     acc = torch.zeros((int(planes),) + tuple(inputs.shape), dtype=acc_dtype, device=dev)
     wsum = torch.zeros(tuple(inputs.shape), dtype=acc_dtype, device=dev)

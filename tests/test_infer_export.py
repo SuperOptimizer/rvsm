@@ -823,3 +823,30 @@ def test_the_device_fuse_is_the_host_fuse_to_one_code():
     assert np.abs(P.numpy().astype(int) - stores.u8(p).astype(int)).max() <= 1
     assert np.abs(W.numpy().astype(int) - stores.u8(w).astype(int)).max() <= 1
     assert (P.numpy() == stores.u8(p)).mean() > 0.999
+
+
+def test_a_constant_region_comes_back_constant_at_the_corners():
+    """A 256-window / 32-halo pass of a constant probability over a region whose corners are covered by
+    a single window corner each must reproduce the constant's uint8 code within 1 everywhere -- the
+    corners included, where the unscaled Gaussian was an fp16 subnormal (review item INF-01)."""
+    W, H, n = 256, 32, 320
+
+    class Const(infer.Inputs):
+        def __init__(self):
+            self.dev, self.window = torch.device("cpu"), W
+            self.roi = torch.ones((n, n, n), dtype=torch.uint8)
+            self.shape = (n, n, n)
+
+        def prep(self, o, out_dtype=torch.float32):
+            return torch.zeros((1, 1, W, W, W), dtype=out_dtype)
+
+        def window_any(self, o):
+            return True
+
+    fn = lambda x: torch.full((x.shape[0], 1) + tuple(x.shape[2:]), 0.6)   # noqa: E731
+    out = infer.run_region(fn, Const(), (n, n, n), W, H, acc_dtype=torch.float16)[0]
+    code = infer.u8_t(out)
+    want = int(round(0.6 * 255))
+    assert int((code.int() - want).abs().max()) <= 1
+    for c in ((0, 0, 0), (n - 1, n - 1, n - 1), (0, n - 1, 0)):
+        assert abs(int(code[c]) - want) <= 1, c
