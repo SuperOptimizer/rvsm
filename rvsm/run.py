@@ -1260,6 +1260,28 @@ def walk_patches():
 # --------------------------------------------------------------------------- #
 # the supervisor
 # --------------------------------------------------------------------------- #
+def frozen_meta(out, ct):
+    """(metadata dict, the five conditioning values) of the run, FROZEN on the first successful setup.
+
+    A resume loads `<out>/metadata.json` and `<out>/meta5.json` and never rewrites them: the scan
+    planes are a network input, and a resume that fetched them again -- or fell back to the defaults
+    because the fetch failed that day -- would silently change what the checkpoint was trained on. On
+    a fresh run a metadata.json that cannot be read is an ERROR, not the defaults."""
+    from rvsm import scanmeta as SM
+    mp, m5 = os.path.join(str(out), "metadata.json"), os.path.join(str(out), "meta5.json")
+    meta, meta5 = _read_json(mp), _read_json(m5)
+    if meta and meta5 and not meta.get("missing"):
+        return meta, [float(v) for v in meta5]
+    meta = SM.fetch(ct)
+    if meta.get("missing"):
+        raise SystemExit(f"rvsm run: no readable metadata.json beside {ct}; the scan planes would be "
+                         f"defaults. Put the volume's metadata.json there (or fix the network) and retry.")
+    meta5 = [float(v) for v in SM.scan_planes(meta)]
+    _write_json(mp, meta)
+    _write_json(m5, meta5)
+    return meta, meta5
+
+
 def setup(cfg, out=None):
     """Freeze what the run is, once: config.json (asserted on a resume), umbilicus.json, metadata.json,
     the CT mirror and the held-out set. Returns the context both halves need."""
@@ -1278,10 +1300,7 @@ def setup(cfg, out=None):
     _write_json(cp, cfg.to_json())
 
     AX.ensure(out, cfg.umbilicus, ct=cfg.ct)
-    meta = SM.fetch(cfg.ct)
-    _write_json(os.path.join(out, "metadata.json"), meta)
-    meta5 = [float(v) for v in SM.scan_planes(meta)]
-    _write_json(os.path.join(out, "meta5.json"), meta5)
+    meta, meta5 = frozen_meta(out, cfg.ct)
 
     mirror = stream.ShardCache(cfg.ct, out, budget_gb=cfg.cache_gb, seed=cfg.ct_seed or None)
     try:

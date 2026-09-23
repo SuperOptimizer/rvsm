@@ -623,3 +623,26 @@ def test_round_r_student_passes_use_the_frozen_round_teacher(tmp_path, monkeypat
     assert slot.get(1, str(tp)) == str(tp) and slot.sha == hashlib.sha256(b"frozen").hexdigest()
     (out / "ckpt" / "student.pt").write_bytes(b"live, newer")          # training moves on ...
     assert slot.get(1, str(tp)) == str(tp) and loads.count(str(tp)) == 1  # ... round 1 does not
+
+
+def test_the_scan_metadata_is_frozen_on_the_first_setup(tmp_path):
+    """metadata.json / meta5.json are written once and a resume never refetches or overwrites them;
+    on a fresh run an unreadable metadata.json is an error, never the defaults (review O13)."""
+    import pathlib
+    ex = pathlib.Path(__file__).resolve().parent.parent / "docs" / "example_metadata.json"
+    vol = tmp_path / "vol.zarr"
+    vol.mkdir()
+    (vol / "metadata.json").write_text(ex.read_text())
+    out = tmp_path / "run"
+    out.mkdir()
+    meta, m5 = RUN.frozen_meta(str(out), str(vol))
+    assert not meta.get("missing") and len(m5) == 5
+    frozen = (out / "meta5.json").read_text()
+    (vol / "metadata.json").unlink()                       # the source is gone (or changed) ...
+    meta2, m52 = RUN.frozen_meta(str(out), str(vol))       # ... the resume keeps the frozen copy
+    assert m52 == m5 and (out / "meta5.json").read_text() == frozen
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    with pytest.raises(SystemExit, match="metadata.json"):
+        RUN.frozen_meta(str(fresh), str(vol))
+    assert not (fresh / "meta5.json").exists()
