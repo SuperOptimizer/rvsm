@@ -22,45 +22,55 @@ unit vector away from the umbilicus, z component 0): the same axis interpolation
 radial input channel, the sign of the target here and the sign of the exported normal, so they cannot
 disagree about where the axis is. The RECTO face of a sheet is its OUTWARD face (larger radius), the
 VERSO face its inward one: `losses.pair_bands` puts the recto band at m = +t/2 and the verso band at
-m = -t/2, and `infer`'s verso trick (`sign=-1` negates only the radial input channels, so a
-recto-trained student marks the other face) is the same statement from the network's side. Along the
-radial direction, a sheet with its recto face at a and its verso face at a - t gives, for a voxel at
-radial coordinate x,
+m = -t/2, `export.SIGN_CONVENTION` points the normal from verso to recto (radially outward), and
+`infer`'s verso trick (`sign=-1` negates only the radial input channels, so a recto-trained student
+marks the other face) is the same statement from the network's side. Along the radial direction, a
+sheet with its recto face at a and its verso face at a - t gives, for a voxel at radial coordinate x,
 
     d_r = x - a        d_v = x - (a - t)        so   m = (d_r + d_v) / 2   and   t = d_v - d_r > 0
 
-outside the sheet on either side and inside it alike. A negative d_v - d_r therefore means the two
-nearest faces are NOT the two faces of one sheet.
+outside the sheet on either side and inside it alike. Both signed distances INCREASE outward, so the
+face normals n = grad d of the two faces of one sheet point the SAME way (outward): n_r . n_v ~ +1.
 
-THE TARGET DEFINITION (`TARGET_DEF = "paired-v2"`; the fix of review findings T01-T04, see
+THE TARGET DEFINITION (`TARGET_DEF = "paired-v3"`; review findings T01-T04 and pass-3 P3-06..08; see
 docs/recipe.md "Distance-field targets"). Per block, from the recto and verso probability stores at the
-store's rung, over core + `halo`:
+store's rung, over core + `halo`, with REACH, TMAX in rung-2 voxels divided by 2^(rung-2) and TMIN = 3
+voxels at every rung (rung 2: 24 / 3 / 24, rung 3: 12 / 3 / 12, rung 4: 6 / 3 / 6):
 
-1. The recto and verso FACES are the medial surfaces of the thresholded bands; `d_r`, `d_v` are RAW
-   (unclipped) signed Euclidean distances to them. Clamping to +-31.75 happens only at encoding (T02:
-   clipping first made both distances saturate to one sign far from a sheet, and the thickness collapsed
-   to the old TMIN floor over most of a block).
-2. REACH. A voxel's d_r is valid only if its nearest recto face voxel is within `reach` (default 24
-   voxels of the store's rung; `reach < halo` is asserted, so the nearest face found in the halo'd box
-   IS the nearest face anywhere); likewise d_v. A block with no recto face anywhere in core + halo is
-   code 0 everywhere (T01: it used to be written as a valid zero distance). There is NO `midline = d_r`
-   fallback: without a verso store, or with an empty verso band, midline and thickness are code 0
-   (T04). A midline store always means the midline of a PAIRED sheet.
-3. PAIRING (T03). The two faces must belong to the same sheet. The pair is valid iff the raw thickness
-   t = d_v - d_r lies in [tmin, tmax] (defaults 2 and 24 RUNG-2 voxels, divided by 2^(rung-2) at
-   rungs 3 and 4), AND the straight segment from the voxel's nearest recto point to its nearest verso
-   point crosses no OTHER recto face. The segment is sampled at <= 1-voxel steps; a sample whose own
-   signed recto distance is > `CROSS` (+1.5 voxels) lies OUTWARD of some recto face although the walk
-   left the voxel's recto face inward, i.e. a second sheet's recto face sits between the two faces (a
-   missing verso segment pairing one sheet's recto with the next sheet's verso). Negative or
-   implausible thickness is REJECTED, never clamped up to tmin.
-4. Over the valid paired voxels only: midline = (d_r + d_v) / 2, thickness = d_v - d_r, encoded as
-   above. Everything else is code 0 (no data), and so is everything within `axis_r_um` microns of the
-   umbilicus axis, where the core is crushed and "which side is recto" is close to a coin flip.
+1. FACES. The recto and verso faces are the medial surfaces of the thresholded bands; `d_r`, `d_v` are
+   RAW (unclipped) signed Euclidean distances to them. Clamping to +-31.75 happens only at encoding.
+2. REACH AND COVERAGE. `d_r` is valid only if the nearest recto face voxel is within REACH (`REACH <
+   halo` is asserted), likewise `d_v`. A block with no recto face within reach is code 0 (T01); no verso
+   store or an empty verso band is code 0 for both fields, never `midline = d_r` (T04). The voxel must
+   also be further than max(|d_r|, |d_v|) + COVER_MARGIN from the edge of the REGION's stores: outside
+   them nothing is observed (zero-filled air is not background), so a nearer face could hide there.
+3. THICKNESS. t = d_v - d_r must lie in [TMIN, TMAX]. TMIN = 3 is the decoder's own floor
+   (`losses.soft_thickness` = 3 + softplus at every rung, and the constructed bands have half-width 1.5,
+   so a thinner pair is unrepresentable). A thinner or negative pair is REJECTED, never clamped. The
+   coarse rungs therefore deliberately lose thin-sheet support: a 10-voxel rung-2 sheet is 2.5 voxels at
+   rung 4 and has no field target there.
+4. SAME-SHEET PAIRING. With p_r the voxel's nearest recto face point and p_v its nearest verso point:
+   (a) RECIPROCAL: p_v's nearest recto point lies in the same connected recto BAND component as p_r
+       (26-connected) or within sqrt(3) of it, and likewise p_r's nearest verso point against p_v;
+   (b) NORMALS: n_r = grad d_r at p_r and n_v = grad d_v at p_v (central differences of the distances
+       smoothed with a sigma-1.5 Gaussian; magnitude at least NORMAL_MIN, else degenerate) satisfy
+       n . radial >= 0.5 for both and n_r . n_v >= 0.95 (both point outward, see THE SIGN);
+   (c) NO INTERVENING FACE: walking the segment p_r -> p_v at <= 0.5-voxel spacing against BOTH bands,
+       the walk leaves the recto band once and enters the verso band once: re-entering a recto band,
+       or leaving a verso band after entering one, is another observed face in between. The bands, not
+       the medial surfaces, are walked, because a digital medial surface of a curved sheet has gaps a
+       segment can slip through; there is no distance threshold.
+5. STENCIL AND GRADIENT. midline = (d_r + d_v) / 2 and thickness = d_v - d_r are kept only where the
+   voxel and all six face neighbours pass 1-4 (the full central-difference stencil the Eikonal term
+   uses) and the unquantised midline gradient norm lies in [0.8, 1.2]. Everything else is code 0, and
+   so is everything within `axis_r_um` microns of the umbilicus axis.
 
-Each store's attrs record `target_def`, `reach_vox`, `tmin_vox`, `tmax_vox` and a `support` count of
-why core voxels were rejected. A done field store written under another definition or other parameters,
-or written before the region's verso store existed, is RECOMPUTED rather than reused.
+Every field store records `target_def`, the per-rung `reach_vox` / `tmin_vox` / `tmax_vox`, `thr`, the
+`recto_digest` / `verso_digest` of the source stores it was built from, a `support` histogram of why
+core voxels were rejected (`SUPPORT`) and the same histogram per block (`support_blocks`). `_current`
+is the single "is this field store up to date" predicate: `region_fields` skips on it and the producer's
+scheduler (`run._next_job`) asks `fields_current`, so a store from an older definition, other
+parameters or other source stores is regenerated, through `stores.write`'s tmp-dir-then-rename.
 
 UNITS ARE VOXELS OF THAT RUNG, so a distance field is NEVER pooled: a 2x mean pool of a distance field
 is not the distance field of the pooled mask (it is a distance in the FINE rung's voxels, halved by
@@ -78,11 +88,13 @@ and likewise `thickness`, `thickness_r3`, `thickness_r4`. Each store records its
 `voxel_um` in its attrs, and `region_fields` never pools one into another -- the suffix is there so that
 a reader cannot accidentally take a rung-3 field for a rung-2 one by opening the wrong directory.
 
-COST AND DETERMINISM. Two scipy EDTs per block per rung plus the pairing walk over the candidate core
+COST AND DETERMINISM. Two scipy EDTs per block per rung plus the pairing checks over the candidate
 voxels, CPU only; `jobs > 1` spreads the blocks over worker processes. Every block is computed from the
 stores alone, with a `halo` of context, and the parent assembles the cores, so the bytes written do not
 depend on how the blocks were handed out: `jobs=4` is byte-identical to `jobs=1`.
 """
+import hashlib
+import json
 import os
 
 import numpy as np
@@ -92,17 +104,25 @@ from rvsm import axis as AX, ladder, stores
 UNIT = 0.25          # voxels per code step
 OFF = 128            # the code of distance 0
 CAP = 31.75          # +-CAP voxels is the representable range (codes 1..255); applied at ENCODING only
-TMIN = 2.0           # RUNG-2 voxels: a thinner raw pair is rejected (never clamped); / 2^(rung-2) above
-TMAX = 24.0          # RUNG-2 voxels: a thicker raw pair is not one sheet; / 2^(rung-2) above
-REACH = 24.0         # voxels OF THE STORE'S RUNG: a face further than this from a voxel is not its face
-CROSS = 1.5          # voxels: a pairing-walk sample this far OUTWARD of a recto face has crossed one
-TARGET_DEF = "paired-v2"   # recorded in every field store; a done store under another one is recomputed
+TMIN = 3.0           # voxels AT EVERY RUNG: the decoder's thickness floor (3 + softplus); thinner = code 0
+TMAX = 24.0          # RUNG-2 voxels (57.6 um): a thicker raw pair is not one sheet; / 2^(rung-2) above
+REACH = 24.0         # RUNG-2 voxels (57.6 um): a face further than this is not the voxel's face; / 2^(rung-2)
+COVER_MARGIN = 2.0   # voxels: the nearest-face ball must stay this far inside the region's stores
+RECIPROCAL = 3 ** 0.5    # voxels: a reciprocal nearest point off the face's component may be this close
+NORMAL_SIGMA = 1.5   # voxels: the Gaussian the signed distances are smoothed with before a face normal
+NORMAL_MIN = 0.4     # |grad d| at a face point below this is a degenerate (tangent / crossing) face
+NORMAL_RADIAL = 0.5  # n . radial >= this for both faces
+NORMAL_AGREE = 0.95  # n_r . n_v >= this (both signed-distance normals point outward)
+GRAD = (0.8, 1.2)    # the unquantised midline gradient norm a kept voxel must have
+TARGET_DEF = "paired-v3"   # recorded in every field store; a done store under another one is regenerated
 AXIS_R_UM = 400.0    # microns around the umbilicus axis that are dropped
 MAX_RUNG = 4         # no distance target above this rung
 BLOCK = 128          # the core a single EDT pair covers: exactly one store chunk
 HALO = 48            # context voxels on every side; must exceed REACH (asserted)
 KINDS = ("midline", "thickness")
-SUPPORT = ("voxels", "no_recto", "no_verso", "thickness", "crossing", "valid")
+SUPPORT = ("voxels", "no_recto", "no_verso", "coverage", "thickness", "reciprocal", "normal",
+           "crossing", "stencil", "gradient", "valid")
+_REASON = {k: i for i, k in enumerate(SUPPORT[1:-1], start=1)}     # reason code per rejection
 
 
 def channel(kind, rung):
@@ -110,10 +130,17 @@ def channel(kind, rung):
     return str(kind) if int(rung) == 2 else f"{kind}_r{int(rung)}"
 
 
-def thickness_bounds(rung, tmin=TMIN, tmax=TMAX):
-    """(tmin, tmax) in RUNG-`rung` voxels, from the rung-2 values."""
+def rung_params(rung, reach=REACH, tmin=TMIN, tmax=TMAX):
+    """(reach, tmin, tmax) in RUNG-`rung` voxels: `reach` and `tmax` are given in rung-2 voxels and scale
+    with the rung (the same microns at every rung); `tmin` is the decoder's floor, the same number of
+    voxels at every rung."""
     f = float(2 ** (int(rung) - 2))
-    return float(tmin) / f, float(tmax) / f
+    return float(reach) / f, float(tmin), float(tmax) / f
+
+
+def thickness_bounds(rung, tmin=TMIN, tmax=TMAX):
+    """(tmin, tmax) in RUNG-`rung` voxels (see `rung_params`)."""
+    return rung_params(rung, REACH, tmin, tmax)[1:]
 
 
 # ------------------------------------------------------------------------------------ the encoding
@@ -178,8 +205,8 @@ def face_distance(surf, dy, dx):
     radial vector is the one the model gets as an input channel, so "positive" means the same thing in
     the target, in the stem's radial channels and in the exported normal (`dot(n, radial) > 0`).
 
-    Where the displacement is exactly perpendicular to the radial direction the side is arbitrary; that
-    is a measure-zero set on a sheet roughly perpendicular to the radius, and it is resolved to +."""
+    Where the displacement is exactly perpendicular to the radial direction the side is arbitrary
+    (resolved to +); such a face has a degenerate normal and is rejected by the pairing checks."""
     from scipy import ndimage as ndi
     if not surf.any():
         return None
@@ -189,68 +216,160 @@ def face_distance(surf, dy, dx):
     u = u.astype(np.float32)
     d = np.where(gy * dy + gx * dx < 0, -u, u).astype(np.float32)
     if max(surf.shape) < 2 ** 15:
-        ix = ix.astype(np.int16)        # both blocks' indices are held at once by `block_fields`
+        ix = ix.astype(np.int16)        # both faces' indices are held at once by `block_fields`
     return d, u, ix
 
 
-def _crossed(dr, ixr, ixv, sel):
-    """For the flat voxel indices `sel`: does the straight segment from each one's nearest recto point to
-    its nearest verso point pass OUTWARD of a recto face (signed recto distance > CROSS) anywhere
-    strictly between its ends? Sampled at <= 1-voxel steps; every sample lies inside the box, because
-    both ends are voxels of it."""
-    out = np.zeros(sel.size, bool)
-    if not sel.size:
-        return out
-    Y, X = dr.shape[1], dr.shape[2]
-    pr = ixr.reshape(3, -1)[:, sel].astype(np.float32)
-    seg = ixv.reshape(3, -1)[:, sel].astype(np.float32) - pr
-    n = int(np.ceil(float(np.sqrt((seg * seg).sum(0)).max()))) + 1
-    drf = dr.reshape(-1)
-    for i in range(1, n):
-        q = np.rint(pr + (i / n) * seg).astype(np.int64)
-        out |= drf[(q[0] * Y + q[1]) * X + q[2]] > CROSS
-    return out
+def _grad_at(d, p):
+    """Central-difference gradient (3, n) of the field `d` at the integer points `p` (3, n); one-sided at
+    the array border."""
+    g = np.empty(p.shape, np.float32)
+    for a in range(3):
+        hi, lo = p.copy(), p.copy()
+        hi[a] = np.minimum(p[a] + 1, d.shape[a] - 1)
+        lo[a] = np.maximum(p[a] - 1, 0)
+        g[a] = (d[tuple(hi)] - d[tuple(lo)]) / np.maximum(hi[a] - lo[a], 1)
+    return g
 
 
-def block_fields(recto, verso, dy, dx, thr=0.5, reach=REACH, tmin=TMIN, tmax=TMAX, mask=None):
-    """(midline, thickness, valid, support) of one block, `tmin` / `tmax` / `reach` in THIS block's voxels.
+def _pair_checks(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx):
+    """Rule 4 for the flat voxel indices `sel`: a reason code per voxel (0 = a same-sheet pair). `br` /
+    `bv` are the thresholded BANDS (solid, unlike a digital medial surface, which fragments on a curved
+    sheet and would let a segment slip through its gaps)."""
+    from scipy import ndimage as ndi
+    cube = np.ones((3, 3, 3), bool)
+    lr, lv = ndi.label(br, cube)[0].reshape(-1), ndi.label(bv, cube)[0].reshape(-1)
+    pr = ixr.reshape(3, -1)[:, sel].astype(np.int64)
+    pv = ixv.reshape(3, -1)[:, sel].astype(np.int64)
+    fr = np.ravel_multi_index(tuple(pr), shape)
+    fv = np.ravel_multi_index(tuple(pv), shape)
+    # (a) reciprocal nearest points: same band component, or a 26-neighbour
+    back_r = ixr.reshape(3, -1)[:, fv].astype(np.int64)
+    back_v = ixv.reshape(3, -1)[:, fr].astype(np.int64)
+    fbr = np.ravel_multi_index(tuple(back_r), shape)
+    fbv = np.ravel_multi_index(tuple(back_v), shape)
+    ok_rec = ((lr[fbr] == lr[fr]) | (np.sqrt(((back_r - pr) ** 2).sum(0)) <= RECIPROCAL + 1e-6)) & \
+             ((lv[fbv] == lv[fv]) | (np.sqrt(((back_v - pv) ** 2).sum(0)) <= RECIPROCAL + 1e-6))
+    # (b) face normals from the SMOOTHED signed distances (a digital face is jagged at one voxel):
+    # stable, radial, and the two faces of one sheet facing the same (outward) way
+    z, y, x = np.unravel_index(sel, shape)
+    ry = np.broadcast_to(dy, shape)[z, y, x].astype(np.float32)
+    rx = np.broadcast_to(dx, shape)[z, y, x].astype(np.float32)
+    rn = np.maximum(np.sqrt(ry * ry + rx * rx), 1e-6)
+    ry, rx = ry / rn, rx / rn
+    nr = _grad_at(ndi.gaussian_filter(dr, NORMAL_SIGMA, mode="nearest"), pr)
+    nv = _grad_at(ndi.gaussian_filter(dv, NORMAL_SIGMA, mode="nearest"), pv)
+    mr, mv = np.sqrt((nr * nr).sum(0)), np.sqrt((nv * nv).sum(0))
+    nr, nv = nr / np.maximum(mr, 1e-6), nv / np.maximum(mv, 1e-6)
+    ok_n = (mr >= NORMAL_MIN) & (mv >= NORMAL_MIN) & \
+           (nr[1] * ry + nr[2] * rx >= NORMAL_RADIAL) & (nv[1] * ry + nv[2] * rx >= NORMAL_RADIAL) & \
+           ((nr * nv).sum(0) >= NORMAL_AGREE)
+    code = np.where(~ok_rec, _REASON["reciprocal"], np.where(~ok_n, _REASON["normal"], 0)).astype(np.uint8)
+    # (c) the ordered walk p_r -> p_v at <= 0.5-voxel spacing: leave the own recto band once, enter the
+    # verso band once and stay in it. Re-entering a recto band, or leaving a verso band after entering
+    # one, is another observed face on the segment.
+    w = np.flatnonzero(code == 0)
+    if w.size:
+        a, b = pr[:, w].astype(np.float32), pv[:, w].astype(np.float32)
+        seg = b - a
+        n = max(1, int(np.ceil(2.0 * float(np.sqrt((seg * seg).sum(0)).max()))))
+        left_r = np.zeros(w.size, bool)
+        in_v = np.zeros(w.size, bool)
+        hit = np.zeros(w.size, bool)
+        for i in range(n + 1):
+            qi = tuple(np.rint(a + (i / n) * seg).astype(np.int64))
+            rr, vv = br[qi], bv[qi]
+            hit |= left_r & rr & ~vv
+            left_r |= ~rr
+            hit |= in_v & ~vv
+            in_v |= vv
+        code[w[hit]] = _REASON["crossing"]
+    return code
 
-    `recto` / `verso` are uint8 probability blocks (verso may be None); `mask` restricts the voxels that
-    can be valid (the caller passes the core minus the axis exclusion; default: all). The faces are the
-    medial surfaces of the bands at `thr`; the rules are the module docstring's 1-4. `midline` and
-    `thickness` are raw float voxels and meaningful only where `valid`; `support` counts, over `mask`,
-    the first rule each rejected voxel failed (`SUPPORT`)."""
+
+def block_fields(recto, verso, dy, dx, thr=0.5, reach=REACH, tmin=TMIN, tmax=TMAX, core=None,
+                 cover=None):
+    """(midline, thickness, valid, support) of one block; `reach` / `tmin` / `tmax` in THIS block's voxels.
+
+    `recto` / `verso` are uint8 probability blocks (verso may be None). `core` marks the voxels whose
+    result is wanted (default: all); the rules (module docstring, 1-5) are evaluated on `core` plus its
+    six-neighbour ring, which the stencil rule needs. `cover`, when given, is each voxel's distance to
+    the edge of the observed stores (rule 2). `midline` / `thickness` are raw float voxels, meaningful
+    only where `valid`; `support` counts, over `core`, the first rule each rejected voxel failed."""
+    from scipy import ndimage as ndi
     shape = recto.shape
-    mask = np.ones(shape, bool) if mask is None else np.asarray(mask, bool)
-    sup = dict.fromkeys(SUPPORT, 0)
-    sup["voxels"] = int(mask.sum())
+    core = np.ones(shape, bool) if core is None else np.asarray(core, bool)
+    ev = ndi.binary_dilation(core)
+    reason = np.zeros(shape, np.uint8)
+
+    def fail(bad, key):
+        reason[(reason == 0) & ev & bad] = _REASON[key]
+
+    def result(m, t):
+        valid = (reason == 0) & core
+        cnt = np.bincount(reason[core], minlength=len(SUPPORT) - 1)
+        sup = {"voxels": int(core.sum()), "valid": int(valid.sum())}
+        sup.update({k: int(cnt[i]) for k, i in _REASON.items()})
+        z = np.float32(0)
+        return np.where(valid, m, z).astype(np.float32), np.where(valid, t, z).astype(np.float32), valid, sup
+
     zero = np.zeros(shape, np.float32)
     lvl = int(round(thr * 255))
-    fr = face_distance(medial(recto >= lvl), dy, dx)
+    br = recto >= lvl
+    fr = face_distance(medial(br), dy, dx)
     if fr is None:
-        sup["no_recto"] = sup["voxels"]
-        return zero, zero, np.zeros(shape, bool), sup
+        fail(np.ones(shape, bool), "no_recto")
+        return result(zero, zero)
     dr, ur, ixr = fr
-    rok = mask & (ur <= reach)
-    sup["no_recto"] = sup["voxels"] - int(rok.sum())
-    fv = None if verso is None else face_distance(medial(verso >= lvl), dy, dx)
+    fail(ur > reach, "no_recto")
+    bv = None if verso is None else verso >= lvl
+    fv = None if bv is None else face_distance(medial(bv), dy, dx)
     if fv is None:
-        sup["no_verso"] = int(rok.sum())
-        return zero, zero, np.zeros(shape, bool), sup
+        fail(np.ones(shape, bool), "no_verso")
+        return result(zero, zero)
     dv, uv, ixv = fv
-    ok = rok & (uv <= reach)
-    sup["no_verso"] = int(rok.sum()) - int(ok.sum())
+    fail(uv > reach, "no_verso")
+    if cover is not None:
+        fail(cover <= np.maximum(ur, uv) + COVER_MARGIN, "coverage")
     t = dv - dr
-    cand = ok & (t >= tmin) & (t <= tmax)
-    sup["thickness"] = int(ok.sum()) - int(cand.sum())
-    sel = np.flatnonzero(cand)
-    bad = _crossed(dr, ixr, ixv, sel)
-    valid = cand.copy()
-    valid.reshape(-1)[sel[bad]] = False
-    sup["crossing"] = int(bad.sum())
-    sup["valid"] = int(valid.sum())
-    m = np.where(valid, 0.5 * (dr + dv), 0.0).astype(np.float32)
-    return m, np.where(valid, t, 0.0).astype(np.float32), valid, sup
+    fail((t < tmin) | (t > tmax), "thickness")
+    sel = np.flatnonzero((reason == 0) & ev)
+    if sel.size:
+        reason.reshape(-1)[sel] = _pair_checks(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx)
+    pair = (reason == 0) & ev
+    m = np.where(pair, 0.5 * (dr + dv), 0.0).astype(np.float32)
+    full = pair.copy()
+    for a in range(3):
+        for s in (1, -1):
+            nb = np.zeros(shape, bool)
+            src = [slice(None)] * 3
+            dst = [slice(None)] * 3
+            src[a], dst[a] = (slice(1, None), slice(None, -1)) if s == 1 else (slice(None, -1), slice(1, None))
+            nb[tuple(dst)] = pair[tuple(src)]
+            full &= nb
+    fail(pair & ~full, "stencil")
+    g2 = np.zeros(shape, np.float32)
+    for a in range(3):
+        g = np.zeros(shape, np.float32)
+        hi, lo, mid = [slice(None)] * 3, [slice(None)] * 3, [slice(None)] * 3
+        hi[a], lo[a], mid[a] = slice(2, None), slice(None, -2), slice(1, -1)
+        g[tuple(mid)] = 0.5 * (m[tuple(hi)] - m[tuple(lo)])
+        g2 += g * g
+    gn = np.sqrt(g2)
+    fail(full & ((gn < GRAD[0]) | (gn > GRAD[1])), "gradient")
+    return result(m, t)
+
+
+def cover_distance(lo, shape, extent):
+    """Each voxel's distance to the nearest voxel OUTSIDE the stores (0 outside them), for a box at
+    store-local corner `lo` of `shape`, the stores spanning [0, extent) per axis."""
+    out = None
+    for a in range(3):
+        c = np.arange(int(shape[a]), dtype=np.float32) + float(lo[a])
+        d = np.where((c >= 0) & (c < extent[a]), np.minimum(c + 1, float(extent[a]) - c), 0.0)
+        d = d.reshape([-1 if i == a else 1 for i in range(3)])
+        out = d if out is None else np.minimum(out, d)
+    return np.broadcast_to(out, tuple(int(v) for v in shape)).astype(np.float32)
 
 
 # ------------------------------------------------------------------------- reading a rung out of a store
@@ -311,7 +430,7 @@ def _block(task):
     """One core block: (rung, lo, core shape) -> (rung, lo, midline u8, thickness u8, support).
 
     `lo` is the core corner in GLOBAL rung-`rung` voxels; the store is read with a `halo` of context on
-    every side so that a distance measured inside the core sees every face within `reach` of it."""
+    every side so that a distance measured inside the core sees every face within reach of it."""
     k, lo, n = task
     halo = _CTX["halo"]
     rec_a, ver_a = _arr("recto"), _arr("verso")
@@ -321,13 +440,14 @@ def _block(task):
     rsh = tuple(int(v) + 2 * halo for v in n)
     sl = tuple(slice(halo, halo + int(v)) for v in n)
     dy, dx, r = axis_offsets(_axis_at(k), np.asarray(lo, np.int64) - halo, rsh)
-    mask = np.zeros(rsh, bool)
-    mask[sl] = r[sl] >= (_CTX["axis_r_um"] / ladder.rung_um(k))   # the crushed core carries no sign
+    core = np.zeros(rsh, bool)
+    core[sl] = r[sl] >= (_CTX["axis_r_um"] / ladder.rung_um(k))   # the crushed core carries no sign
+    ext = np.asarray(rec_a.shape[-3:], np.int64) >> (int(k) - 2)
     rec = read_pooled(rec_a, k, rlo, rsh)
     ver = None if ver_a is None else read_pooled(ver_a, k, rlo, rsh)
-    tmin, tmax = thickness_bounds(k, _CTX["tmin"], _CTX["tmax"])
-    m, t, ok, sup = block_fields(rec, ver, dy, dx, thr=_CTX["thr"], reach=_CTX["reach"], tmin=tmin,
-                                 tmax=tmax, mask=mask)
+    reach, tmin, tmax = rung_params(k, _CTX["reach"], _CTX["tmin"], _CTX["tmax"])
+    m, t, ok, sup = block_fields(rec, ver, dy, dx, thr=_CTX["thr"], reach=reach, tmin=tmin, tmax=tmax,
+                                 core=core, cover=cover_distance(rlo, rsh, ext))
     return k, tuple(int(v) for v in lo), encode_signed(m[sl], ok[sl], _CTX["cap"]), \
         encode_unsigned(t[sl], ok[sl]), sup
 
@@ -374,31 +494,55 @@ def _pad128(n):
     return int(-(-int(n) // stores.CHUNK) * stores.CHUNK)
 
 
+# ------------------------------------------------------------------------------ generation identity
+
+def source_digest(path):
+    """The identity of a finished source store ("" when it is not done): sha256 over its `zarr.json`
+    (shape, codec and attrs, which carry the producer, checkpoint and step) and the relative path and
+    size of every data file. Not a content hash -- reading every shard on each scheduler poll is not
+    affordable -- but any rewrite by a different producer or generation changes it."""
+    if not stores.is_done(path):
+        return ""
+    h = hashlib.sha256()
+    with open(os.path.join(path, "zarr.json"), "rb") as f:
+        h.update(f.read())
+    for d, dirs, files in sorted(os.walk(path)):
+        dirs.sort()
+        for fn in sorted(files):
+            if fn == "zarr.json" and d == path:
+                continue
+            p = os.path.join(d, fn)
+            h.update(f"{os.path.relpath(p, path)}:{os.path.getsize(p)};".encode())
+    return h.hexdigest()[:16]
+
+
+def _want(root, lo, round_, rung, reach, tmin, tmax, thr):
+    rk, tn, tx = rung_params(rung, reach, tmin, tmax)
+    return {"target_def": TARGET_DEF, "reach_vox": rk, "tmin_vox": tn, "tmax_vox": tx, "thr": float(thr),
+            "recto_digest": source_digest(stores.store_path(root, "recto", lo, round_)),
+            "verso_digest": source_digest(stores.store_path(root, "verso", lo, round_))}
+
+
 def _current(path, want):
-    """A done field store that `region_fields` may reuse: written by `region_fields` under the same
-    definition and parameters (`want`), or written by something else entirely (a student pass's own
-    rung-2 field head, which records no `field`). Anything else -- an older definition, other
-    parameters, or a store built before the region's verso existed -- is recomputed."""
+    """THE predicate for "this field store is up to date", shared by `region_fields` (skip) and the
+    producer's scheduler (`fields_current`): done, and either written by `region_fields` under exactly
+    `want` (definition, per-rung parameters, threshold and source-store digests) or written by something
+    else entirely (a student pass's own rung-2 field head, which records no `field`)."""
     if not stores.is_done(path):
         return False
-    a = stores.open_store(path).attrs
+    with open(os.path.join(path, "zarr.json")) as f:
+        a = json.load(f).get("attributes", {})
     if "field" not in a:
         return True
     return all(a.get(key) == v for key, v in want.items())
 
 
-def _want(root, lo, round_, rung, tmin, tmax, reach):
-    tk = thickness_bounds(rung, tmin, tmax)
-    return {"target_def": TARGET_DEF, "reach_vox": float(reach), "tmin_vox": tk[0], "tmax_vox": tk[1],
-            "verso": stores.is_done(stores.store_path(root, "verso", lo, round_))}
-
-
-def fields_current(root, lo, round_=0, rungs=(2, 3, 4), tmin=TMIN, tmax=TMAX, reach=REACH):
-    """True iff every field store of the region at `rungs` is done AND current (`_current`): exactly the
-    test `region_fields` skips a rung on. A scheduler that asks "are this region's fields built?" should
-    ask this rather than `stores.is_done`, or a store from an older target definition is never rebuilt."""
+def fields_current(root, lo, round_=0, rungs=(2, 3, 4), reach=REACH, tmin=TMIN, tmax=TMAX, thr=0.5):
+    """True iff every field store of the region at `rungs` is `_current`: exactly the test
+    `region_fields` skips a rung on. The scheduler must ask this, not `stores.is_done`, or a store from an
+    older definition or older source stores is never rebuilt."""
     return all(_current(stores.store_path(root, channel(kind, k), lo, round_),
-                        _want(root, lo, round_, k, tmin, tmax, reach))
+                        _want(root, lo, round_, k, reach, tmin, tmax, thr))
                for k in rungs for kind in KINDS)
 
 
@@ -412,13 +556,13 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     write. The region's `recto` store must be done; `verso` may be missing, in which case both fields
     are no-data (code 0) everywhere: there is no recto-only midline (module docstring, rule 2).
 
-    `tmin` / `tmax` are in RUNG-2 voxels (scaled per rung by `thickness_bounds`); `reach` is in voxels of
-    each store's own rung and must be below `halo`.
+    `reach` / `tmax` are in RUNG-2 voxels and `tmin` in voxels of every rung (`rung_params`); `reach`
+    must be below `halo`.
 
-    Returns a report dict, with a per-rung `support` count of why core voxels were rejected. A rung whose
-    two stores are already `done` under the current definition is skipped (`force` recomputes), which is
-    what makes this resumable at region granularity. `pool` is a `field_pool` the caller keeps alive
-    across regions (a producer); without one, `jobs > 1` forks a pool for this call.
+    Returns a report dict, with a per-rung `support` histogram of why core voxels were rejected. A rung
+    whose two stores are `_current` is skipped (`force` recomputes), which is what makes this resumable
+    at region granularity. `pool` is a `field_pool` the caller keeps alive across regions (a producer);
+    without one, `jobs > 1` forks a pool for this call.
 
     A pooled rung whose shape is not a multiple of 128 is padded up to one, because a store's shape must
     be; the padding is code 0, i.e. no data. For the production region (1024 at rung 2) rungs 3 and 4 are
@@ -437,7 +581,7 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     for k in sorted(int(q) for q in rungs):
         assert 2 <= k <= MAX_RUNG, f"no distance target at rung {k} (2..{MAX_RUNG} only)"
         paths = {kind: stores.store_path(root, channel(kind, k), lo, round_) for kind in KINDS}
-        want = _want(root, lo, round_, k, tmin, tmax, reach)
+        want = _want(root, lo, round_, k, reach, tmin, tmax, thr)
         if not force and all(_current(p, want) for p in paths.values()):
             rep["rungs"][k] = {"skipped": "done"}
             continue
@@ -452,12 +596,14 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     out = {k: {kind: np.zeros(tuple(_pad128(v) for v in Sk), np.uint8) for kind in KINDS}
            for k, Sk, _, _ in todo}
     sup = {k: dict.fromkeys(SUPPORT, 0) for k, _, _, _ in todo}
+    per_block = {k: [] for k, _, _, _ in todo}
 
     def take(res):
         k, blo, m, t, s = res
         _store_block(out[k], k, blo, origin2, m, t)
         for key in SUPPORT:
             sup[k][key] += int(s[key])
+        per_block[k].append([int(v) for v in blo] + [int(s[key]) for key in SUPPORT])
 
     if pool is not None and len(tasks) >= 2:
         for res in pool.map(_block_in, [(init, t) for t in tasks], chunksize=1):
@@ -480,7 +626,9 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
                          attrs={"field": kind, "unit_vox": UNIT, "offset": OFF if kind == "midline" else 0,
                                 "cap_vox": float(cap), "axis_r_um": float(axis_r_um),
                                 "shape_true": [int(v) for v in Sk], "source_round": int(round_),
-                                "support": sup[k], **want})
+                                "verso": bool(vp), "support": sup[k],
+                                "support_blocks": {"columns": ["z", "y", "x", *SUPPORT],
+                                                   "rows": per_block[k]}, **want})
         rep["rungs"][k] = {"shape": [int(v) for v in Sk], "blocks": sum(1 for t in tasks if t[0] == k),
                            "support": sup[k], "written": [paths[kind] for kind in KINDS]}
     return rep

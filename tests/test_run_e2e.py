@@ -259,10 +259,11 @@ def test_the_producer_job_order_is_the_state_machine(tmp_path, has_volcomp):
     cat = RG.Catalog(out, 0, ttl=0.0)
     assert RUN._next_job(cat, lo, 0, True, out) == "fields"
     for k in (2, 3, 4):
-        stores.write(stores.store_path(out, TG.channel("midline", k), lo, 0),
-                     blk[:128 >> (k - 2), :128 >> (k - 2), :128 >> (k - 2)] if k == 2 else
-                     np.zeros((128,) * 3, np.uint8), lo, rung=k,
-                     channels=(TG.channel("midline", k),), q=0)
+        for kind in TG.KINDS:              # `targets.fields_current`: every field store at every rung
+            stores.write(stores.store_path(out, TG.channel(kind, k), lo, 0),
+                         blk[:128 >> (k - 2), :128 >> (k - 2), :128 >> (k - 2)] if k == 2 else
+                         np.zeros((128,) * 3, np.uint8), lo, rung=k,
+                         channels=(TG.channel(kind, k),), q=0)
     cat = RG.Catalog(out, 0, ttl=0.0)
     assert RUN._next_job(cat, lo, 0, True, out) is None
     # round 1 is one multi-head pass, then the pooled fields

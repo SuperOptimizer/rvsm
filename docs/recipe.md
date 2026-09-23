@@ -147,7 +147,7 @@ the easiest to switch off (`loss_ect = 0.0`).
 
 Two rules that are not weights but change what the losses see, and which the review checklist calls out:
 
-- **Weight 0 within 400 µm of the umbilicus axis** (`rvsm/targets.py:100 AXIS_R_UM = 400.0`) and above
+- **Weight 0 within 400 µm of the umbilicus axis** (`rvsm/targets.py:118 AXIS_R_UM = 400.0`) and above
   rung 4 for distance channels: near the axis the sheet geometry degenerates and the distance target is
   meaningless (§29.1, "weight 0 within 400 um of the axis / above rung 4").
 - **A distance voxel counts only at full weight.** Spatial augmentations resample the target and the
@@ -163,45 +163,85 @@ Two rules that are not weights but change what the losses see, and which the rev
   `scale`, `shear`, `elastic`) and `SHEETCOMP` (`rvsm/aug.py:618-624`), and nothing removes them although
   `loss_sdist = 1.0` is a default. See [`review_checklist.md`](review_checklist.md) §10.
 
-### Distance-field targets (`paired-v2`)
+### Distance-field targets (`paired-v3`)
 
-The `midline` / `thickness` field stores (`rvsm/targets.py`, q0, code 0 = no data) are built per block
-from the region's recto and verso probability stores at each rung 2-4 (rungs 3-4 recomputed from the
-pooled bands, never pooled), with the existing 48-voxel halo. This definition was approved by the user
-on 2026-09-23 to fix review findings T01-T04 (`docs/production_readiness_review.md`):
+The `midline` and `thickness` field stores (`rvsm/targets.py`, q0, code 0 = no data) are built per block
+from the region's recto and verso probability stores. They exist at rungs 2-4. Rungs 3-4 are
+recomputed from the pooled bands, never pooled. Each block uses the existing 48-voxel halo. The user
+approved this definition on 2026-09-23 as the fix for review findings T01-T04
+(`docs/production_readiness_review.md`). Pass-3 findings P3-06, P3-07 and P3-08
+(`docs/paris4_pass3_review.md`) tightened it.
 
 **Orientation.** Signs are pinned to `axis.radial`, the unit vector pointing away from the umbilicus.
 The recto face is the **outward** face of a sheet (larger radius) and the verso face is the inward one.
-Three places already use this convention: `losses.pair_bands` (recto band at `m = +t/2`),
-`export.SIGN_CONVENTION` (normal from verso to recto = radially outward) and `infer`'s verso trick
-(`sign = -1` negates only the radial inputs). Take a sheet with its recto face at radial coordinate `a`
-and its verso face at `a - t`. Then `d_r = x - a` and `d_v = x - (a - t)`, so `t = d_v - d_r > 0` on
-either side of the sheet and inside it.
+Three places already use this convention:
+
+- `losses.pair_bands` puts the recto band at `m = +t/2`.
+- `export.SIGN_CONVENTION` points the normal from verso to recto, i.e. radially outward.
+- `infer`'s verso trick (`sign = -1`) negates only the radial inputs.
+
+Take a sheet with its recto face at radial coordinate `a` and its verso face at `a - t`. Then
+`d_r = x - a` and `d_v = x - (a - t)`. So `t = d_v - d_r > 0` on either side of the sheet and inside
+it. Both signed distances increase outward, so the two faces' normals `∇d` point the **same** way:
+`n_r · n_v ≈ +1`.
+
+**Per-rung bounds** (rung voxels):
+
+| rung | REACH | TMIN | TMAX |
+|---|---|---|---|
+| 2 | 24 | 3 | 24 |
+| 3 | 12 | 3 | 12 |
+| 4 | 6 | 3 | 6 |
+
+REACH and TMAX are both 57.6 µm at every rung. TMIN is the decoder's own floor at every rung, because
+`soft_thickness = 3 + softplus` and the constructed bands have half-width 1.5.
 
 1. **Raw distances.** `d_r` and `d_v` are unclipped signed EDTs to the medial surfaces of the two bands,
    over core + halo. The ±31.75 cap is applied **only by the encoders**, after all geometry.
-2. **Reach.** `d_r` is valid only where the nearest recto face is within `REACH = 24` voxels at the
-   store's rung, and likewise `d_v` for the nearest verso face. The code asserts `REACH < halo`, so the
-   nearest face found in the box is the nearest face anywhere. A block with no recto face in core +
-   halo is code 0 everywhere. A region with no verso store, or with an empty verso band, is code 0 for
-   **both** fields: there is no `midline = d_r` fallback.
-3. **Same-sheet pairing.** A voxel is valid only if both of these hold:
-   - `TMIN ≤ t ≤ TMAX`, where TMIN and TMAX are 2 and 24 rung-2 voxels, halved for each rung above 2.
-   - The straight segment from its nearest recto point to its nearest verso point crosses no other
-     recto face. The segment is sampled at ≤ 1-voxel steps. Any sample more than 1.5 voxels on the
-     outward side of a recto face counts as a crossing.
+2. **Reach and coverage.** A face counts only within REACH of the voxel, and the code asserts
+   `REACH < halo`.
+   - A block with no recto face within reach is code 0.
+   - A region with no verso store, or with an empty verso band, is code 0 for **both** fields. There is
+     no `midline = d_r` fallback.
+   - The voxel must also be more than `max(|d_r|, |d_v|) + 2` voxels inside the region's stores.
+     Zero-filled air outside the stores is unobserved, not background, so a nearer face could hide
+     there.
+3. **Thickness.** `TMIN ≤ t ≤ TMAX` must hold. A voxel outside that range is **rejected** (code 0),
+   never clamped. Coarse rungs therefore deliberately lose thin-sheet support. For example, a 10-voxel
+   rung-2 sheet is 2.5 voxels at rung 4 and gets no field target there.
+4. **Same-sheet pairing.** Let `p_r` and `p_v` be the voxel's nearest recto and verso points. All three
+   checks must pass:
+   - **Reciprocal.** The nearest recto point of `p_v` must be in the same 26-connected recto band
+     component as `p_r`, or within √3 of it. The same test applies to the nearest verso point of `p_r`
+     against `p_v`.
+   - **Normals.** Take the central-difference gradients of σ = 1.5-smoothed `d_r` and `d_v` at `p_r`
+     and `p_v`. Each gradient's magnitude must be ≥ 0.4, `n · radial` must be ≥ 0.5 for both, and
+     `n_r · n_v` must be ≥ 0.95.
+   - **No intervening face.** Walk the segment `p_r → p_v` at ≤ 0.5-voxel spacing against both
+     **bands**. The walk may leave the recto band once and enter the verso band once. Re-entering a
+     recto band, or leaving a verso band after entering one, means another observed face lies in
+     between. No distance threshold is involved. The walk uses the bands because a digital medial
+     surface of a curved sheet has gaps a segment can slip through.
+5. **Stencil and gradient.** `midline = (d_r + d_v)/2` and `thickness = d_v - d_r` are kept only if two
+   conditions hold. First, the voxel and all six of its face neighbours pass rules 1-4, which is the full
+   stencil the Eikonal term uses. Second, the unquantised midline gradient norm is within [0.8, 1.2].
+   Everything else is code 0, and so is everything inside the 400 µm axis exclusion.
 
-   Negative or implausible thickness is **rejected**, never clamped up to `TMIN`.
-4. Over valid paired voxels only: `midline = (d_r + d_v)/2` and `thickness = d_v - d_r`. Everything else
-   is code 0, and so is everything inside the 400 µm axis exclusion.
+**Generation identity.** Each store records:
 
-Each store records `target_def`, `reach_vox`, `tmin_vox`, `tmax_vox` and `verso`. It also records a
-`support` count of why core voxels were rejected (`no_recto`, `no_verso`, `thickness`, `crossing`).
-Code changes alone do not repair cached labels. So a done store is **recomputed**, not reused, if it was
-written under an older definition, with other parameters or before the verso existed. The next producer
-pass rebuilds stale stores.
+- `target_def`, the per-rung `reach_vox`, `tmin_vox` and `tmax_vox`, and `thr`;
+- `recto_digest` and `verso_digest`: the source stores' `zarr.json` plus each shard's relative path and
+  size. This identifies a store; it is not a content hash;
+- a `support` histogram of why core voxels were rejected, with the same histogram per block in
+  `support_blocks`.
 
-**Why.** These are the review's CPU reproductions:
+`targets._current` is the one up-to-date predicate. `region_fields` skips a store on it, and the
+producer's scheduler (`run._next_job`) asks `targets.fields_current`. A store from an older definition,
+with other parameters, or from other source stores (a new verso generation, say) is therefore
+regenerated through `stores.write`'s tmp-dir-then-rename. Code changes alone do not repair cached
+labels, so this is how stale stores get rebuilt.
+
+**Why.** These are the reviews' CPU reproductions:
 
 - **T01:** an all-air recto block was written as code 128 over the whole block, i.e. as a *valid* zero
   distance.
@@ -210,20 +250,39 @@ pass rebuilds stale stores.
   x = `[0, 75, 120]`. Far from the sheet both distances saturated to the same value, so their difference
   was 0, and the old `TMIN = 3` replaced it.
 - **T03:** with recto at x = 50 and 80 and verso at x = 40 and 70 (two sheets), x = 65 got `midline 5,
-  thickness 3`. The inputs were `d_r = 15` to the first sheet and `d_v = -5` to the second, and the
-  negative difference was silently clamped to `TMIN`. The nearest real paired midline is x = 75, at
-  signed distance -10. Under `paired-v2`, that voxel is either code 0 or `-10 / 10`.
+  thickness 3`. The inputs were `d_r = 15` to one sheet and `d_v = -5` to the other, and the negative
+  difference was silently clamped to `TMIN`. The nearest real paired midline is x = 75, at signed
+  distance -10. That voxel is now either code 0 or `-10 / 10`.
 - **T04:** without verso, the stored "midline" was the recto-face distance, so m = 0 lay **on** the
   recto face. The pair construction instead places the recto face at `m = +t/2`. The two objectives are
   incompatible, so midline supervision now requires paired geometry.
+- **P3-06:** `paired-v2` admitted thickness 2 / 1 / 0.5 at rungs 2 / 3 / 4. Those values are below
+  the decoder's 3-voxel floor and cannot be represented.
+- **P3-07:** `paired-v2` accepted two bad pairs:
+  - Touching wraps (recto x = 20 and 22, verso x = 18) paired the outer recto through the inner one.
+    The +1.5 signed-distance threshold missed the 1-voxel gap.
+  - An orthogonal pair (recto x = 20, verso y = 10, radial +x) passed, with a target midline gradient
+    norm of 0.707.
+
+  Both are now code 0; the tests `test_touching_wraps_are_code_zero` and
+  `test_orthogonal_faces_are_not_a_pair` cover them.
+- **P3-08:** the scheduler checked only `is_done` on the highest-rung midline, so a stale definition
+  was never regenerated. A region's zero-filled edge was also treated as observed background. Now
+  `_next_job` shares the writer's predicate, and the coverage rule applies. The tiling test compares
+  one 256-wide region with two 128-wide ones, with a competing wrap across the seam. Wherever the
+  tiling has a value, it equals the whole-volume value.
 
 **Known limits.**
-- At a region's outermost voxel layer, the air outside the store cuts the medial surface. Distances
-  there can be off by up to ~1.5 voxels or fall beyond reach.
-- The pairing test does not check for a second **verso** face between the pair.
-- On strongly curved sheets, the nearest-point segment is not exactly radial.
-- The target `TMIN = 2` is below `losses.TMIN = 3`, the floor of the constructed thickness. The head
-  therefore cannot exactly match a target thickness of 2-3 voxels.
+
+- Code-0 fields remove only the direct field, thickness and Eikonal supervision. The constructed-pair
+  loss still sends gradients into `m`/`t` wherever recto has weight
+  (`docs/review_evidence/pass3_pair_validity.py`). Gating that loss on paired support is a training
+  objective decision, not a target one.
+- On a curved sheet, the digital medial surfaces fragment. Thickness on the analytic annulus is within
+  ~2 voxels, the midline within 1, and about 92 % of the ideal support survives.
+- The coverage rule drops a band about REACH wide along every region face. Stitching neighbouring
+  regions' labels would recover it.
+- The source digest identifies stores by metadata and shard sizes, not content.
 
 ---
 

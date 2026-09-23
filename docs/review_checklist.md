@@ -46,7 +46,7 @@ written on the A100 records that build's hash.
 
 | check | rule | where | test |
 |---|---|---|---|
-| Voxels within **400 µm of the umbilicus axis get weight 0** | near the axis the sheet geometry degenerates and a distance target is meaningless (§29.1) | `rvsm/targets.py:100 AXIS_R_UM = 400.0` | `tests/test_targets.py::test_near_axis_voxels_get_weight_zero`; `tests/test_sample_prep.py::test_weight_is_zero_near_the_umbilicus_for_verso` |
+| Voxels within **400 µm of the umbilicus axis get weight 0** | near the axis the sheet geometry degenerates and a distance target is meaningless (§29.1) | `rvsm/targets.py:118 AXIS_R_UM = 400.0` | `tests/test_targets.py::test_near_axis_voxels_get_weight_zero`; `tests/test_sample_prep.py::test_weight_is_zero_near_the_umbilicus_for_verso` |
 | **`code 0` means weight 0**, everywhere a distance channel is read | code 0 is the contract's no-data marker and decodes to −32 voxels, not to "nothing" | `rvsm/losses.py:dist_weight`; `rvsm/sample.py` | `tests/test_sample_prep.py::test_code_zero_means_weight_zero_for_a_distance_channel`; `tests/test_losses.py::test_sdist_and_thickness_decode_the_store_encoding` |
 | A distance voxel whose resampled weight is **< 0.95 is dropped**, not down-weighted | interpolating *across* code 0 gives a number that is simply wrong (§29.2) | `rvsm/losses.py:dist_weight` | `tests/test_losses.py::test_dist_weight_drops_partially_resampled_voxels` |
 | Distance channels are **rungs 2-4 only** and are **never pooled** | a pooled distance is not a distance (plan §3) | `rvsm/targets.py` | `tests/test_targets.py::test_coarse_rungs_are_recomputed_and_never_pooled`, `::test_a_rung_above_four_is_refused` |

@@ -1,9 +1,11 @@
-"""The distance stores: the paired-v2 target definition (raw distances, reach, same-sheet pairing, no
-recto-only fallback), the encoding, the axis exclusion, and `jobs` determinism.
+"""The distance stores: the paired-v3 target definition (raw distances, reach and coverage, the decoder's
+thickness floor, same-sheet pairing, stencil/gradient validity, no recto-only fallback), the
+encoding, the axis exclusion, generation identity and `jobs` determinism.
 
-The geometry is analytic throughout: planes perpendicular to x with the umbilicus far away in -x, so the
-radial direction is +x everywhere, a recto face at a and a verso face at a - t give d_r = x - a,
-d_v = x - (a - t), midline x - (a - t/2) and thickness t exactly (see `rvsm.targets`, THE SIGN)."""
+The geometry is analytic: planes perpendicular to x with the umbilicus far away in -x, so the radial
+direction is +x everywhere, a recto face at a and a verso face at a - t give d_r = x - a,
+d_v = x - (a - t), midline x - (a - t/2) and thickness t exactly (see `rvsm.targets`, THE SIGN); plus a
+curved (annulus) sheet around an axis inside the box."""
 import filecmp
 import os
 
@@ -25,6 +27,7 @@ def _bands(n, rectos, versos, half=1, zy=4):
     """(recto u8, verso u8, dy, dx) of a (zy, zy, n) box with one 2*half+1 voxel band per face and the
     radial direction +x everywhere."""
     x = np.arange(n)
+
     def band(cs):
         b = np.zeros(n, bool)
         for c in cs:
@@ -32,6 +35,13 @@ def _bands(n, rectos, versos, half=1, zy=4):
         return np.broadcast_to(np.where(b, np.uint8(255), np.uint8(0)), (zy, zy, n)).copy()
     shape = (zy, zy, n)
     return band(rectos), band(versos), np.zeros(shape, np.float32), np.ones(shape, np.float32)
+
+
+def _stencil(ok1d):
+    """A 1-D pair-validity row -> the voxels whose full +-1 stencil is valid (array ends excluded)."""
+    out = np.zeros_like(ok1d)
+    out[1:-1] = ok1d[:-2] & ok1d[1:-1] & ok1d[2:]
+    return out
 
 
 # ------------------------------------------------------------------------------------------ encoding
@@ -55,10 +65,12 @@ def test_medial_of_a_slab_is_one_voxel_thick():
     assert m.sum(2).max() == 1 and set(np.unique(np.nonzero(m)[2])) == {8}
 
 
-def test_thickness_bounds_scale_with_the_rung():
-    assert targets.thickness_bounds(2) == (2.0, 24.0)
-    assert targets.thickness_bounds(3) == (1.0, 12.0)
-    assert targets.thickness_bounds(4) == (0.5, 6.0)
+def test_rung_parameters_are_the_same_microns_and_the_decoder_floor():
+    """P3-06: reach and tmax are 57.6 um at every rung; tmin is the decoder's 3-voxel floor everywhere."""
+    assert targets.rung_params(2) == (24.0, 3.0, 24.0)
+    assert targets.rung_params(3) == (12.0, 3.0, 12.0)
+    assert targets.rung_params(4) == (6.0, 3.0, 6.0)
+    assert targets.thickness_bounds(4) == (3.0, 6.0)
 
 
 # ------------------------------------------------------------------------- the definition, analytic
@@ -68,12 +80,12 @@ def test_parallel_planes_thickness_is_exact_everywhere_valid_even_past_the_old_c
     """T02. Raw distances: the thickness is the face separation at EVERY valid voxel, including voxels
     where a face distance exceeds the +-31.75 encoding cap (the old code clipped both distances first,
     so there it wrote a wrong thickness, or TMIN once both saturated); validity is exactly "both faces
-    within reach"."""
+    within reach, over the full stencil"."""
     n, a, reach = 160, 100, 40.0
     rec, ver, dy, dx = _bands(n, [a], [a - sep])
     m, t, ok, sup = targets.block_fields(rec, ver, dy, dx, reach=reach)
     x = np.arange(n)
-    want_ok = (np.abs(x - a) <= reach) & (np.abs(x - (a - sep)) <= reach)
+    want_ok = _stencil((np.abs(x - a) <= reach) & (np.abs(x - (a - sep)) <= reach))
     assert np.array_equal(ok[2, 2], want_ok)
     assert np.all(t[ok] == sep)
     assert np.allclose(m[2, 2][want_ok], (x - (a - sep / 2.0))[want_ok])
@@ -86,7 +98,8 @@ def test_parallel_planes_thickness_is_exact_everywhere_valid_even_past_the_old_c
     assert (want_ok & far).any() == (sep < 12)                 # |m| stays <= 30 at sep 20, reach 40
     assert set(mm[want_ok & far].tolist()) <= {1, 255}          # the midline clamps at ENCODING only
     assert int(mm[~want_ok].max()) == 0
-    assert sup["valid"] == int(ok.sum()) and sup["crossing"] == 0 and sup["thickness"] == 0
+    assert sup["valid"] == int(ok.sum())
+    assert sup["crossing"] == sup["thickness"] == sup["normal"] == sup["reciprocal"] == 0
 
 
 def test_two_sheets_never_pair_faces_of_different_sheets():
@@ -94,10 +107,8 @@ def test_two_sheets_never_pair_faces_of_different_sheets():
     gave midline 5 / thickness 3 at x = 65 (recto 50 of one sheet against verso 70 of the other). Every
     valid voxel must carry one sheet's own pair; inter-sheet voxels whose nearest faces disagree are
     no-data."""
-    n = 128
-    rec, ver, dy, dx = _bands(n, [50, 80], [40, 70])
+    rec, ver, dy, dx = _bands(128, [50, 80], [40, 70])
     m, t, ok, sup = targets.block_fields(rec, ver, dy, dx, reach=24.0)
-    x = np.arange(n)
     row_ok, row_m, row_t = ok[2, 2], m[2, 2], t[2, 2]
     assert np.all(row_t[row_ok] == 10)
     for xi in np.nonzero(row_ok)[0]:
@@ -109,19 +120,70 @@ def test_two_sheets_never_pair_faces_of_different_sheets():
     assert sup["thickness"] > 0                                 # rejected, not clamped
 
 
-def test_a_segment_across_another_recto_face_is_rejected():
-    """Pairing rule 3, second half: sheet 2 (recto 64) has lost its verso, so a voxel just outside it has
-    recto 64 and sheet 1's verso 40 as nearest faces: t = 24 is within [tmin, tmax] and only the walk
-    across sheet 1's recto (50) rejects it."""
-    n = 128
-    rec, ver, dy, dx = _bands(n, [50, 64], [40])
+def test_a_recto_without_its_verso_never_borrows_the_next_sheets_verso():
+    """Sheet 2 (recto 64) has lost its verso, so a voxel just outside it has recto 64 and sheet 1's
+    verso 40 as nearest faces: t = 24 is within [tmin, tmax]; the reciprocal test (verso 40's nearest
+    recto is sheet 1's, another band component) rejects it."""
+    rec, ver, dy, dx = _bands(128, [50, 64], [40])
     m, t, ok, sup = targets.block_fields(rec, ver, dy, dx, reach=30.0)
     row = ok[2, 2]
-    x = np.arange(n)
-    assert np.array_equal(row[x <= 56], (x >= 20)[x <= 56])     # sheet 1's own support
-    assert np.all(t[2, 2][x <= 56][(x >= 20)[x <= 56]] == 10)
-    assert not row[58:].any()                                   # recto 64 + verso 40: never paired
-    assert sup["crossing"] >= 13 * 16                           # x = 58..70 on every (z, y)
+    assert row[45] and t[2, 2, 45] == 10
+    assert np.all(t[2, 2][row] == 10)
+    assert not row[58:].any()
+    assert sup["reciprocal"] > 0
+
+
+def test_a_segment_through_another_face_of_the_same_component_is_a_crossing():
+    """Two recto planes (x = 20 and 26) joined by a bridge at the y = 0 edge are ONE band component, so
+    the reciprocal test passes; the ordered walk from recto 26 to verso 12 re-enters a recto band at 20
+    and rejects the pair."""
+    n = 48
+    rec, ver, dy, dx = _bands(n, [20, 26], [12], zy=16)
+    rec[:, 0:2, 20:27] = 255
+    m, t, ok, sup = targets.block_fields(rec, ver, dy, dx, reach=24.0)
+    assert not ok[8, 8, 27:].any()                              # recto 26 never pairs with verso 12
+    assert ok[8, 8, 16] and t[8, 8, 16] == 8.0                   # sheet 1's own pair survives
+    assert sup["crossing"] > 0
+
+
+def test_touching_wraps_are_code_zero():
+    """P3-07's first counterexample: recto planes x = 20 and 22 with only verso x = 18. The outer recto
+    must never be paired through the intervening face (the old CROSS threshold missed the 1-voxel gap);
+    and 20 / 18 is a 2-voxel pair, below the decoder's floor."""
+    rec, ver, dy, dx = _bands(48, [20, 22], [18], half=0, zy=5)
+    _, _, ok, sup = targets.block_fields(rec, ver, dy, dx)
+    assert not ok.any()
+
+
+def test_orthogonal_faces_are_not_a_pair():
+    """P3-07's second counterexample: recto x = 20, verso y = 10, radial +x. The old code accepted it
+    (target midline gradient norm 0.707); the verso face's normal is not radial."""
+    shape = (5, 32, 48)
+    rec = np.zeros(shape, np.uint8)
+    ver = rec.copy()
+    rec[:, :, 20] = 255
+    ver[:, 10, :] = 255
+    dy, dx = np.zeros((5, 32, 1), np.float32), np.ones(shape, np.float32)
+    _, _, ok, sup = targets.block_fields(rec, ver, dy, dx)
+    assert not ok.any() and sup["normal"] > 0
+
+
+def test_a_curved_sheet_keeps_most_of_its_support():
+    """An annulus: recto radius 50, verso radius 40, the axis in the middle of the box. The pairing
+    checks must not reject a plain curved sheet; the targets are within the medial surfaces' own
+    discretisation of the analytic ones."""
+    n = 160
+    z, y, x = np.meshgrid(np.arange(4), np.arange(n), np.arange(n), indexing="ij")
+    dy, dx = (y - 80.0).astype(np.float32), (x - 80.0).astype(np.float32)
+    r = np.sqrt(dy * dy + dx * dx)
+    rec = np.where(np.abs(r - 50) <= 1, 255, 0).astype(np.uint8)
+    ver = np.where(np.abs(r - 40) <= 1, 255, 0).astype(np.uint8)
+    m, t, ok, sup = targets.block_fields(rec, ver, dy, dx)
+    inner = (np.abs(r - 50) <= 24) & (np.abs(r - 40) <= 24)
+    assert ok.sum() >= 0.85 * inner[1:3].sum()
+    assert np.abs(t[ok] - 10).max() <= 2.1
+    assert np.abs(m[ok] - (r[ok] - 45)).max() <= 1.0
+    assert sup["crossing"] == 0 and sup["reciprocal"] == 0
 
 
 def test_empty_recto_block_is_no_data_everywhere():
@@ -142,17 +204,29 @@ def test_a_voxel_beyond_reach_is_no_data():
     rec, ver, dy, dx = _bands(128, [80], [70])
     m, t, ok, _ = targets.block_fields(rec, ver, dy, dx, reach=8.0)
     x = np.arange(128)
-    assert np.array_equal(ok[2, 2], (np.abs(x - 80) <= 8) & (np.abs(x - 70) <= 8))
+    assert np.array_equal(ok[2, 2], _stencil((np.abs(x - 80) <= 8) & (np.abs(x - 70) <= 8)))
     assert not ok[2, 2, 100] and ok[2, 2, 75]
 
 
-def test_negative_or_too_thick_pairs_are_rejected_not_clamped():
-    rec, ver, dy, dx = _bands(128, [60], [61 + 30])            # verso OUTSIDE recto: t < 0
-    _, _, ok, sup = targets.block_fields(rec, ver, dy, dx, reach=40.0)
-    assert not ok.any() and sup["thickness"] > 0
-    rec, ver, dy, dx = _bands(128, [80], [50])                  # t = 30 > TMAX 24
-    _, _, ok, _ = targets.block_fields(rec, ver, dy, dx, reach=40.0)
-    assert not ok.any()
+def test_thin_negative_or_too_thick_pairs_are_rejected_not_clamped():
+    """P3-06 / T03: below the decoder's 3-voxel floor, negative, or above tmax: code 0, never clamped."""
+    for rectos, versos in (([20], [18]), ([60], [91]), ([80], [50])):   # t = 2, t < 0, t = 30
+        rec, ver, dy, dx = _bands(128, rectos, versos, half=0)
+        _, _, ok, sup = targets.block_fields(rec, ver, dy, dx, reach=40.0)
+        assert not ok.any() and sup["thickness"] > 0, (rectos, versos)
+
+
+def test_coverage_rejects_a_ball_that_leaves_the_observed_stores():
+    """Rule 2: outside the region's stores nothing is observed, so a voxel whose nearest-face ball
+    reaches past them could have a nearer, unseen face."""
+    rec, ver, dy, dx = _bands(64, [40], [30])
+    x = np.arange(64)
+    cover = np.broadcast_to((64 - x).astype(np.float32), rec.shape)     # the stores end at x = 64
+    _, _, ok, sup = targets.block_fields(rec, ver, dy, dx, reach=20.0, cover=cover)
+    pair = (np.abs(x - 40) <= 20) & (np.abs(x - 30) <= 20) & \
+        ((64 - x) > np.maximum(np.abs(x - 40), np.abs(x - 30)) + targets.COVER_MARGIN)
+    assert np.array_equal(ok[2, 2], _stencil(pair))
+    assert sup["coverage"] > 0
 
 
 # ------------------------------------------------------------------------------- the stores, end to end
@@ -167,28 +241,34 @@ def test_signed_distance_sign_units_and_reach_on_a_slab(slab_region):
     th = _read(r.root, "thickness", r.lo)
     assert mid.shape == (128, 128, 128)
     x = np.arange(128)
-    keep = (np.abs(x - 80) <= 12) & (np.abs(x - 70) <= 12)
+    keep = _stencil((np.abs(x - 80) <= 12) & (np.abs(x - 70) <= 12))
     want = np.where(keep, np.rint((x - 75.0) / targets.UNIT) + targets.OFF, 0).astype(np.uint8)
     assert np.array_equal(mid[64, 64, :], want)
-    assert np.array_equal(mid[10, 100, :], want)
+    assert np.array_equal(mid[40, 100, :], want)
     assert mid[64, 64, 75] == 128 and mid[64, 64, 80] > 128 and mid[64, 64, 70] < 128
     assert np.array_equal(th[64, 64, :], np.where(keep, 40, 0).astype(np.uint8))
+    ok = th > 0
+    assert np.array_equal(ok[30:-30, 30:-30], np.broadcast_to(keep, (68, 68, 128)))
+    assert not ok[0].any() and not ok[:, -1].any()             # coverage: the region's edge
     sup = rep["rungs"][2]["support"]
-    ok = th > 0                     # (the region's outermost y / z layer: the band's medial surface is
-    assert np.array_equal(ok[1:-1, 1:-1], np.broadcast_to(keep, (126, 126, 128)))   # cut by the air)
-    assert sup["valid"] == int(ok.sum()) and sup["crossing"] == 0 and sup["thickness"] == 0
+    assert sup["valid"] == int(ok.sum()) and sup["coverage"] > 0
     a = stores.open_store(stores.store_path(r.root, "midline", r.lo))
     assert a.attrs["target_def"] == targets.TARGET_DEF and a.attrs["reach_vox"] == 12.0
+    assert a.attrs["recto_digest"] and a.attrs["verso_digest"]
+    blocks = a.attrs["support_blocks"]
+    assert len(blocks["rows"]) == 8 and blocks["columns"][3:] == list(targets.SUPPORT)
+    assert sum(row[3 + targets.SUPPORT.index("valid")] for row in blocks["rows"]) == sup["valid"]
 
 
 def test_store_thickness_is_exact_past_the_old_cap(slab_region):
-    """T02 through the stores, production halo: recto 100 / verso 96 with reach 40, so voxels at
-    x = 64..69 (and 127) have both faces more than 31.75 away and still carry thickness 4."""
+    """T02 through the stores, production halo: recto 100 / verso 96 with reach 40, so voxels near
+    x = 64 have both faces more than 31.75 away and still carry thickness 4."""
     r = slab_region(name="cap", n=128, recto_x=100, verso_x=96)
     targets.region_fields(r.root, r.lo, r.ax, rungs=(2,), block=64, halo=48, reach=40)
     th = _read(r.root, "thickness", r.lo)[64, 64, :]
     x = np.arange(128)
-    keep = (np.abs(x - 100) <= 40) & (np.abs(x - 96) <= 40)
+    u = np.maximum(np.abs(x - 100), np.abs(x - 96))
+    keep = _stencil((u <= 40) & (np.minimum(x + 1, 128 - x) > u + targets.COVER_MARGIN))
     assert np.array_equal(th, np.where(keep, 16, 0).astype(np.uint8))
     assert keep[64] and 100 - 64 > targets.CAP and 96 - 64 > targets.CAP
 
@@ -203,23 +283,49 @@ def test_empty_recto_store_is_code_zero_not_a_zero_distance(slab_region):
     assert rep["rungs"][2]["support"]["no_recto"] == 128 ** 3
 
 
-def test_verso_missing_is_no_data_then_recomputed_when_verso_arrives(slab_region):
-    """T04: without a verso store both fields are code 0 (no recto-only midline); the store records
-    `verso: False`, so a later call after the verso pass recomputes instead of reusing it."""
+def _write_band(root, name, lo, centres, shape=(128, 128, 128), half=1, round_=0):
+    x = np.arange(shape[2])[None, None, :] + lo[2]
+    b = np.zeros((1, 1, shape[2]), bool)
+    for c in centres:
+        b |= np.abs(x - c) <= half
+    v = np.broadcast_to(np.where(b, np.uint8(255), np.uint8(0)), shape)
+    stores.write(stores.store_path(root, name, lo, round_), np.ascontiguousarray(v), lo, rung=2,
+                 channels=(name,), q=8)
+
+
+def test_verso_missing_is_no_data_then_regenerated_when_verso_arrives_or_changes(slab_region):
+    """T04 and P3-08: without a verso store both fields are code 0 (no recto-only midline). The fields
+    record their sources' digests, so the scheduler's predicate (`fields_current`) turns False when the
+    verso appears or is rewritten, and `region_fields` regenerates them."""
     r = slab_region(name="noverso", n=128, recto_x=80, verso=False)
     rep = targets.region_fields(r.root, r.lo, r.ax, rungs=(2,), **KW)
     assert rep["verso"] is False
     assert int(_read(r.root, "midline", r.lo).max()) == 0
     assert int(_read(r.root, "thickness", r.lo).max()) == 0
-    x = np.arange(128)[None, None, :]
-    v = np.broadcast_to(np.where(np.abs(x - 70) <= 1, np.uint8(255), np.uint8(0)), (128,) * 3)
-    stores.write(stores.store_path(r.root, "verso", r.lo, 0), np.ascontiguousarray(v), r.lo, rung=2,
-                 channels=("verso",), q=8)
+    assert targets.fields_current(r.root, r.lo, rungs=(2,), reach=12)
+    _write_band(r.root, "verso", r.lo, [70])
     assert not targets.fields_current(r.root, r.lo, rungs=(2,), reach=12)   # the scheduler's view
     rep = targets.region_fields(r.root, r.lo, r.ax, rungs=(2,), **KW)
     assert "skipped" not in rep["rungs"][2]
     assert _read(r.root, "midline", r.lo)[64, 64, 75] == 128
     assert targets.fields_current(r.root, r.lo, rungs=(2,), reach=12)
+    _write_band(r.root, "verso", r.lo, [72], half=2)                        # a new verso generation
+    assert not targets.fields_current(r.root, r.lo, rungs=(2,), reach=12)
+    targets.region_fields(r.root, r.lo, r.ax, rungs=(2,), **KW)
+    assert _read(r.root, "midline", r.lo)[64, 64, 76] == 128
+
+
+def test_a_scheduler_regenerates_a_stale_definition(slab_region, monkeypatch):
+    """P3-08: `run._next_job` asks the same predicate the writer skips on, so a field store written
+    under an older definition is scheduled again instead of being treated as done."""
+    from types import SimpleNamespace
+    from rvsm import run
+    r = slab_region(name="stale", n=128, recto_x=80, verso_x=70)
+    targets.region_fields(r.root, r.lo, r.ax, rungs=(2,))
+    cat = SimpleNamespace(done=lambda *a: True)
+    assert run._next_job(cat, r.lo, 0, True, r.root, rungs=(2,)) is None
+    monkeypatch.setattr(targets, "TARGET_DEF", "paired-v4")
+    assert run._next_job(cat, r.lo, 0, True, r.root, rungs=(2,)) == "fields"
 
 
 def test_near_axis_voxels_get_weight_zero(slab_region):
@@ -246,12 +352,22 @@ def test_coarse_rungs_are_recomputed_and_never_pooled(slab_region):
     assert int(a3.attrs["rung"]) == 3
     assert a3.attrs["voxel_um"] == ladder.rung_um(3)
     assert a3.attrs["shape_true"] == [64, 64, 64]
-    assert a3.attrs["tmax_vox"] == 12.0
+    assert (a3.attrs["reach_vox"], a3.attrs["tmin_vox"], a3.attrs["tmax_vox"]) == (6.0, 3.0, 12.0)
     assert a3.shape == (128, 128, 128)                        # padded up to the 128 store granularity
     m3 = np.asarray(a3[:], np.uint8)
     assert int(m3[64:, :, :].max()) == 0                      # the padding is no-data
     th3 = np.asarray(stores.open_store(stores.store_path(r.root, "thickness_r3", r.lo))[:], np.uint8)
     assert int(th3[32, 32, 36]) == int(round(8.0 / targets.UNIT))   # 16 rung-2 voxels = 8 rung-3 voxels
+
+
+def test_coarse_rungs_lose_thin_sheets_by_design(slab_region):
+    """P3-06: a 10-voxel rung-2 sheet is 2.5 voxels at rung 4, below the decoder's 3-voxel floor, so it
+    has no field target there -- it is not clamped up to 3."""
+    r = slab_region(name="thin4", n=128, recto_x=80, verso_x=70)
+    rep = targets.region_fields(r.root, r.lo, r.ax, rungs=(2, 4), **KW)
+    assert int(_read(r.root, "thickness", r.lo, 4).max()) == 0
+    assert rep["rungs"][4]["support"]["valid"] == 0
+    assert int(_read(r.root, "thickness", r.lo, 2).max()) == 40
 
 
 def test_done_is_resume_and_force_or_new_parameters_recompute(slab_region):
@@ -275,6 +391,34 @@ def test_reach_must_stay_below_the_halo(slab_region):
     r = slab_region(name="reach", n=128)
     with pytest.raises(AssertionError):
         targets.region_fields(r.root, r.lo, r.ax, rungs=(2,), block=64, halo=16, reach=16)
+
+
+def test_a_region_seam_never_invents_a_pair_the_whole_volume_rejects(tmp_path, volcomp_lib):
+    """P3-08: the same continuous volume, as one 256-wide region and as two 128-wide ones. Sheet A
+    (recto 116, verso 110) is in the left region, a competing wrap (verso 131, recto 137) in the right
+    one. From x = 121 the whole volume sees verso 131 nearer than 110 (t < 0: no pair), but the left
+    region alone cannot see it; coverage must reject the voxel rather than pair 116 with 110. Wherever
+    the tiling has a value, it is the whole volume's value."""
+    rectos, versos = [116, 137], [110, 131]
+    zs = np.arange(0, 129, 16, dtype=np.float64)
+    ax = np.stack([zs, np.full_like(zs, 64.0), np.full_like(zs, -1000.0)])
+    whole, tiled = str(tmp_path / "whole"), str(tmp_path / "tiled")
+    for name, cs in (("recto", rectos), ("verso", versos)):
+        _write_band(whole, name, (0, 0, 0), cs, shape=(128, 128, 256))
+        for lo in ((0, 0, 0), (0, 0, 128)):
+            _write_band(tiled, name, lo, cs)
+    targets.region_fields(whole, (0, 0, 0), ax, rungs=(2,), **KW)
+    for lo in ((0, 0, 0), (0, 0, 128)):
+        targets.region_fields(tiled, lo, ax, rungs=(2,), **KW)
+    for kind in ("midline", "thickness"):
+        w = _read(whole, kind, (0, 0, 0))
+        t = np.concatenate([_read(tiled, kind, (0, 0, 0)), _read(tiled, kind, (0, 0, 128))], axis=2)
+        has = t > 0
+        assert has.any()
+        assert np.array_equal(t[has], w[has]), kind
+    assert _read(whole, "thickness", (0, 0, 0))[64, 64, 121] == 0
+    assert _read(tiled, "thickness", (0, 0, 0))[64, 64, 121] == 0
+    assert _read(tiled, "thickness", (0, 0, 0))[64, 64, 113] == 24       # sheet A's own pair, t = 6
 
 
 def _tree(root):
@@ -305,7 +449,7 @@ def test_jobs_are_byte_identical(slab_region):
     targets.region_fields(c.root, c.lo, c.ax, rungs=(2, 3), jobs=4, **KW)
     _same_stores(a, b)
     _same_stores(a, c)
-    assert int(_read(a.root, "thickness", a.lo)[1:-1, 1:-1].max()) == 40   # parity over real support
+    assert int(_read(a.root, "thickness", a.lo).max()) == 40      # the parity is over real support
 
 
 def test_a_rung_above_four_is_refused(slab_region):

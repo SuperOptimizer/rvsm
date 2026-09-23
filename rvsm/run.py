@@ -929,19 +929,18 @@ def _next_job(cat, lo, round_, verso_on, out, rungs=(2, 3, 4)):
 
     Round 0: the teacher pass, then (once the gate has fired) the flipped-sign verso, then the distance
     fields. Round r >= 1: one multi-head student pass, then the fields at the pooled rungs."""
-    from rvsm import stores, targets as TG
+    from rvsm import targets as TG
     if round_ == 0:
         if not cat.done("recto", lo):
             return "teacher"
         if verso_on and not cat.done("verso", lo):
             return "verso"
-        if cat.done("verso", lo) and not stores.is_done(
-                stores.store_path(out, TG.channel("midline", max(rungs)), lo, round_)):
+        if cat.done("verso", lo) and not TG.fields_current(out, lo, round_, rungs):   # the writer's own test
             return "fields"
         return None
     if not cat.done("recto", lo):
         return "self"
-    if not stores.is_done(stores.store_path(out, TG.channel("midline", max(rungs)), lo, round_)):
+    if not TG.fields_current(out, lo, round_, rungs):
         return "fields"
     return None
 
