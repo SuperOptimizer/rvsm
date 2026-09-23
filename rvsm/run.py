@@ -93,6 +93,8 @@ WAIT_S = 5.0                # the trainer's sleep when nothing in the lookahead 
 IDLE_S = 2.0                # the producer's sleep when there is nothing to produce
 ROUND_GAIN = 0.02           # "< 2 % remaining gain" is the plateau half of the round gate
 GATE_REGIONS = 2            # held-out regions scored per gate attempt (see the module docstring)
+GATE_SCREEN = 0.1           # the verso gate's held-out pass is skipped while the eval's fine-rung dice
+                            # is more than this below `verso_gate_dice` (see `verso_gate`)
 LOOKAHEAD_MAX = 64
 REEST_S = 600.0             # the lookahead L is re-estimated from the logs this often
 
@@ -996,15 +998,34 @@ def _boot(vals, n=200, seed=0, lo=2.5, hi=97.5):
     return float(v.mean()), float(np.percentile(b, lo)), float(np.percentile(b, hi))
 
 
-def verso_gate(cfg, out, step, rows_fn=None):
+def eval_dice(out, step):
+    """The headline (fine-rung, voxel-weighted) `dice` of the evaluation at `step` from
+    `logs/eval.jsonl`, or None when there is none."""
+    for r in reversed(tail_jsonl(os.path.join(str(out), "logs", "eval.jsonl"), 20)):
+        if int(r.get("step", -1)) == int(step) and isinstance(r.get("dice"), (int, float)):
+            return float(r["dice"])
+    return None
+
+
+def verso_gate(cfg, out, step, rows_fn=None, screen=None):
     """Has round 0's recto earned the flipped-sign verso passes?
 
     Pass when the pooled dice over the held-out regions is at least `verso_gate_dice` AND the betti0
     error is no worse than the reference-against-itself baseline by more than the bootstrap CI's width
     -- or unconditionally at `verso_after_steps`, which is the fallback the plan gives the gate so a
-    run can never stall on it."""
+    run can never stall on it.
+
+    `screen` is the evaluation's own fine-rung dice at this step (`eval_dice`): the validation grid is
+    tiles of the SAME held-out regions scored against the SAME round-0 stores, so while it is more than
+    `GATE_SCREEN` below `verso_gate_dice` the held-out pass cannot pass and is not paid for. That pass
+    is two student region passes plus two streamed `compare_stores` in the trainer, ~13 min on tnr-0
+    (paris4 step 2000: dice 0.10 against a 0.6 gate)."""
     if int(step) >= int(cfg.verso_after_steps):
         return True, {"why": "verso_after_steps", "step": int(step)}
+    need = float(getattr(cfg, "verso_gate_dice", 0.6))
+    if screen is not None and np.isfinite(screen) and float(screen) < need - GATE_SCREEN:
+        return False, {"why": "eval dice below the gate", "eval_dice": float(screen),
+                       "screen": need - GATE_SCREEN}
     rows = list((rows_fn() if rows_fn is not None else None) or [])
     if not rows:
         return False, {"why": "no held-out reference yet"}
@@ -1404,7 +1425,9 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
             return box["rows"]
 
         if state["round"] == 0 and not st.get("verso_on"):
-            ok, why = verso_gate(cfg, out, step, rows_fn)
+            t_g = time.time()
+            ok, why = verso_gate(cfg, out, step, rows_fn, screen=eval_dice(out, step))
+            why = {**why, "gate_s": round(time.time() - t_g, 1)}
             jlog(out, "sched", {"kind": "verso_gate", "step": step, "pass": bool(ok), **why})
             if ok:
                 write_state(out, verso_on=True, verso_gate_step=step)

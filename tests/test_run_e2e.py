@@ -293,6 +293,12 @@ def test_the_verso_gate_needs_the_dice_and_the_betti_baseline(small_cfg):
     assert RUN.verso_gate(cfg, "", 10, lambda: topo)[0] is False, \
         "a topological blow-up must veto the gate"
     assert RUN.verso_gate(cfg, "", 10, lambda: [])[0] is False
+    # the eval's fine-rung dice screens the held-out pass: far below the gate it is never paid for
+    called = []
+    ok, why = RUN.verso_gate(cfg, "", 10, lambda: called.append(1) or good, screen=0.1)
+    assert not ok and why["why"] == "eval dice below the gate" and not called
+    assert RUN.verso_gate(cfg, "", 10, lambda: called.append(1) or good, screen=0.55)[0] is True
+    assert called == [1]                       # near the gate: the held-out pass decides
     called = []
     ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [])   # the fallback
     assert ok and why["why"] == "verso_after_steps"
@@ -441,6 +447,14 @@ def test_the_ram_guard_pauses_the_producer_and_lets_it_go(tmp_path):
     assert not RUN.producer_paused(out) and rec["action"] == "resume"
     kinds = [r.get("action") for r in RUN.tail_jsonl(os.path.join(out, "logs", "sched.jsonl"))]
     assert kinds == ["pause_producer", "resume_producer"]
+
+
+def test_eval_dice_reads_the_evaluation_at_that_step(tmp_path):
+    out = str(tmp_path / "e")
+    for st, d in ((2000, 0.1), (4000, 0.2)):
+        RUN.jlog(out, "eval", {"step": st, "dice": d}, echo=False)
+    assert RUN.eval_dice(out, 4000) == 0.2 and RUN.eval_dice(out, 2000) == 0.1
+    assert RUN.eval_dice(out, 6000) is None
 
 
 def test_tree_rss_counts_this_process_and_its_children():
