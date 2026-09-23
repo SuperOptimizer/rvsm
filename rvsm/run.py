@@ -484,21 +484,6 @@ def torch_full_like_u8(t, v):
     return torch.full_like(t, int(v), dtype=torch.uint8)
 
 
-def file_sha256(path, _cache={}):
-    """sha256 of a checkpoint file, cached per (path, mtime, size): a store's attrs name the exact
-    weights that wrote it."""
-    import hashlib
-    st = os.stat(path)
-    key = (os.path.abspath(path), st.st_mtime_ns, st.st_size)
-    if key not in _cache:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for blk in iter(lambda: f.read(1 << 24), b""):
-                h.update(blk)
-        _cache[key] = h.hexdigest()
-    return _cache[key]
-
-
 class StudentSlot:
     """The student the producer runs, reloaded when its file changes and not otherwise.
 
@@ -527,9 +512,13 @@ class StudentSlot:
         m = os.path.getmtime(p)
         if self.st is None or p != self.loaded or m != self.mtime:
             try:
-                st = infer.student_fn(p, device=self.device, compile=self.compile)
+                import hashlib
+                with open(p, "rb") as f:          # read ONCE: the digest is of the bytes loaded
+                    buf = f.read()
+                st = infer.student_fn(p, device=self.device, compile=self.compile, data=buf)
                 self.st, self.mtime, self.loaded = st, m, p
-                self.sha = file_sha256(p)
+                self.sha = hashlib.sha256(buf).hexdigest()
+                del buf
             except Exception as e:  # noqa: BLE001  -- a checkpoint caught mid-rename comes back next loop
                 print(f"[produce] student reload: {e!r}", flush=True)
                 return self.st if self.loaded == p else None

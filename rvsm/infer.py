@@ -607,11 +607,14 @@ def save_student(path, state, cfg, temps=None, step=0, **extra):
     return str(path)
 
 
-def load_student_ckpt(path, map_location="cpu"):
-    """(raw dict, Config, Layout, state dict, {rung: T}, step) of a student checkpoint."""
+def load_student_ckpt(path, map_location="cpu", data=None):
+    """(raw dict, Config, Layout, state dict, {rung: T}, step) of a student checkpoint. `data`: the
+    checkpoint's BYTES, already read (a caller that hashes them loads exactly what it hashed)."""
+    import io
     from rvsm import calib as CAL
     from rvsm.config import Config, _coerce, _TYPES
-    st = torch.load(str(path), map_location=map_location, weights_only=False)
+    st = torch.load(io.BytesIO(data) if data is not None else str(path), map_location=map_location,
+                    weights_only=False)
     raw = next((st[k] for k in CKPT_CFG_KEYS if isinstance(st.get(k), dict)), None)
     if isinstance(raw, dict) and isinstance(raw.get("config"), dict):
         raw = raw["config"]   # a TRAINER checkpoint stores `cfg.to_json()` = {config, layout, fingerprint}
@@ -643,11 +646,12 @@ class Student:
 
     FIELDS = ("midline", "thickness", "conf")
 
-    def __init__(self, ckpt, device=None, compile=True, mode="max-autotune-no-cudagraphs", temps=True):
+    def __init__(self, ckpt, device=None, compile=True, mode="max-autotune-no-cudagraphs", temps=True,
+                 data=None):
         from rvsm import model as M
         self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.ckpt = str(ckpt)
-        st, cfg, layout, sd, tmps, step = load_student_ckpt(ckpt, map_location=self.dev)
+        st, cfg, layout, sd, tmps, step = load_student_ckpt(ckpt, map_location=self.dev, data=data)
         self.cfg, self.layout, self.step = cfg, layout, step
         self.temps = tmps if temps else {}
         self.use_temps = bool(temps)
@@ -714,10 +718,11 @@ class Student:
         return self.plane_fn()(x)
 
 
-def student_fn(ckpt_path, device=None, compile=True, mode="max-autotune-no-cudagraphs", temps=True):
+def student_fn(ckpt_path, device=None, compile=True, mode="max-autotune-no-cudagraphs", temps=True,
+               data=None):
     """A `Student` for a checkpoint: the net built from its own cfg/layout, the EMA weights loaded, the
     per-rung temperature applied to the PROBABILITY heads only, ready to serve plane stacks."""
-    return Student(ckpt_path, device=device, compile=compile, mode=mode, temps=temps)
+    return Student(ckpt_path, device=device, compile=compile, mode=mode, temps=temps, data=data)
 
 
 def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, device=None,

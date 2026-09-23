@@ -615,10 +615,17 @@ def test_round_r_student_passes_use_the_frozen_round_teacher(tmp_path, monkeypat
     (out / "ckpt" / "student.pt").write_bytes(b"live")
     tp = out / "ckpt" / "teacher_round_1.pt"
     loads = []
-    monkeypatch.setattr(infer, "student_fn", lambda p, device=None, compile=True: loads.append(p) or p)
+    got_bytes = []
+
+    def fake(p, device=None, compile=True, data=None):
+        loads.append(p)
+        got_bytes.append(data)
+        return p
+    monkeypatch.setattr(infer, "student_fn", fake)
     slot = RUN.StudentSlot(str(out), compile=False)
     assert slot.get(0) == str(out / "ckpt" / "student.pt")
     assert slot.sha == hashlib.sha256(b"live").hexdigest()
+    assert got_bytes[-1] == b"live", "the weights are loaded from the very bytes that were hashed"
     assert slot.get(1, str(tp)) is None, "round 1 must not fall back to the live student"
     tp.write_bytes(b"frozen")
     assert slot.get(1, str(tp)) == str(tp) and slot.sha == hashlib.sha256(b"frozen").hexdigest()
