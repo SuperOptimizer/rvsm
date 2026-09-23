@@ -791,8 +791,12 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     def fields(lo, round_, t0, cursor):
         try:
             TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs, pool=fpool)
+            g = TG.source_verso(out, lo, round_)[0]
+            if g > stores.bundle_gen(out, lo, round_) and TG.fields_current(out, lo, round_, frungs):
+                # the new verso AND all of its fields are finished: only now do readers move to them
+                stores.commit_bundle(out, lo, round_, g, t=time.time())
             jlog(out, "produce", {"kind": "fields", "region": list(lo), "round": round_,
-                                  "s": round(time.time() - t0, 2), "cursor": cursor})
+                                  "s": round(time.time() - t0, 2), "cursor": cursor, "gen": g})
         finally:
             with lock:
                 busy.discard(lo)
@@ -2084,18 +2088,37 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     # reference is the fixed reference every round is compared against (plan §3).
     ckpt = os.path.join(out, "ckpt", "student.pt")
     t_g = time.time()
-    val = sample.val_grid(cfg, ctx["heldout"], root=out, ct=ctx["ct"], ax=ctx["ax"], round_=0,
-                          meta=ctx["meta5"], spill=os.path.join(out, "eval", "grid"),
-                          threads=max(min(int(os.cpu_count() or 1) // 2, 4), 1))
+    def build_grid():
+        return sample.val_grid(cfg, ctx["heldout"], root=out, ct=ctx["ct"], ax=ctx["ax"], round_=0,
+                               meta=ctx["meta5"], spill=os.path.join(out, "eval", "grid"),
+                               threads=max(min(int(os.cpu_count() or 1) // 2, 4), 1))
+
+    val = build_grid()
     jlog(out, "sched", {"kind": "val_grid", "items": len(val), "s": round(time.time() - t_g, 1)})
+
+    def refresh_grid():
+        """At an evaluation boundary: when the held-out labels a reader sees have changed (the verso
+        appeared, or a regenerated bundle was committed), the grid key changes and the verso/field grid
+        generation is (re)built; the recto reference grid directory is never touched. The trainer's
+        DiskGrid is updated IN PLACE, so the next evaluation reads the new items."""
+        t_r = time.time()
+        new = build_grid()
+        if getattr(new, "paths", None) is not None and list(new.paths) != list(val.paths):
+            val.paths[:] = list(new.paths)
+            jlog(out, "sched", {"kind": "val_grid_refresh", "items": len(val),
+                                "dir": os.path.dirname(val.paths[0]) if val.paths else "",
+                                "s": round(time.time() - t_r, 1)})
     st0 = read_state(out)
     state = {"round": int(st0.get("round", 0)), "stop": False, "ref": st0.get("round_ref")}
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
     resume = os.path.exists(ckpt)
 
     def hook(info):
-        """Every `eval_every` steps: publish the state, honour STOP and PHASE, run the two gates."""
+        """Every `eval_every` steps: publish the state, honour STOP and PHASE, run the two gates, and
+        refresh the validation grid when the held-out labels changed."""
         step = int(info["step"])
+        if isinstance(val, sample.DiskGrid):
+            refresh_grid()
         write_state(out, step=step, round=state["round"], cursor=read_cursor(out, state["round"]),
                     region_s=region_seconds(out, state["round"]), walk=walk_snapshot(out, state["round"]),
                     verso_on=bool(read_state(out).get("verso_on", False)))

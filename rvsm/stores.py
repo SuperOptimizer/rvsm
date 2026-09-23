@@ -67,9 +67,47 @@ def store_gen(root, channel, lo, round_=0):
     return best
 
 
+BUNDLED = ("verso", "midline", "thickness")   # the channels a verso regeneration replaces TOGETHER
+
+
+def is_bundled(channel):
+    c = str(channel)
+    return any(c == b or c.startswith(b + "_r") for b in BUNDLED)
+
+
+def _bundle_file(root, lo, round_):
+    return os.path.join(str(root), "stores", f"round_{int(round_)}", "bundle", region_name(lo)[:-5] + ".json")
+
+
+def bundle_gen(root, lo, round_=0):
+    """The COMMITTED generation of a region's label bundle (verso + its fields): what every reader uses.
+    0 until a regenerated bundle is complete and committed (`commit_bundle`)."""
+    try:
+        import json
+        with open(_bundle_file(root, lo, round_)) as f:
+            return int(json.load(f).get("gen", 0))
+    except (OSError, ValueError):
+        return 0
+
+
+def commit_bundle(root, lo, round_, gen, **info):
+    """Make generation `gen` of the region's label bundle the one readers use -- written ONLY once the
+    verso and every field store of that generation are finished, so a reader never mixes a new verso
+    with old fields (pass-4 P4-04). Atomic (tmp + rename)."""
+    import json
+    p = _bundle_file(root, lo, round_)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p + ".tmp", "w") as f:
+        json.dump({"gen": int(gen), **info}, f)
+    os.replace(p + ".tmp", p)
+    return p
+
+
 def current_path(root, channel, lo, round_=0):
-    """The path a READER uses: the newest finished generation (generation 0's path when none is)."""
-    return gen_path(store_path(root, channel, lo, round_), max(store_gen(root, channel, lo, round_), 0))
+    """The path a READER uses. A bundled channel (verso, midline*, thickness*) reads the region's
+    COMMITTED bundle generation, all of them the same one; any other channel has one generation."""
+    base = store_path(root, channel, lo, round_)
+    return gen_path(base, bundle_gen(root, lo, round_)) if is_bundled(channel) else base
 
 
 def read_attrs(path):

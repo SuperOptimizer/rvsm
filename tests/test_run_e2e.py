@@ -1280,12 +1280,22 @@ def test_the_verso_is_regenerated_once_as_a_new_generation(tmp_path, small_cfg):
     _fake_store(g1, step=22000, gen=1)                                    # the producer's new store
     assert stores.is_done(stores.store_path(out, "verso", lo, 0)), "generation 0 is left as it was"
     assert stores.store_gen(out, "verso", lo, 0) == 1
-    assert RG.Catalog(out, 0).path("verso", lo) == g1                   # every reader moves to it
-    assert TG.field_path(out, "midline", 4, lo, 0).endswith(".g1.zarr")   # and its fields follow
+    # P4-04: readers stay on the COHERENT generation-0 bundle (verso + fields) while the new fields
+    # are pending; the writer builds the fields from the new verso
+    assert RG.Catalog(out, 0).path("verso", lo) == stores.store_path(out, "verso", lo, 0)
+    assert TG.field_path(out, "midline", 4, lo, 0).endswith(".g1.zarr")
     assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4), regen=regen) == "fields"
     for f in fields:
         _fake_store(stores.gen_path(f, 1))                               # the fields at generation 1
     assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4), regen=regen) is None
+    assert RG.Catalog(out, 0).path("midline", lo).endswith(".zarr") and \
+        not RG.Catalog(out, 0).path("midline", lo).endswith(".g1.zarr")  # not committed yet
+    stores.commit_bundle(out, lo, 0, 1)                                  # the producer commits it
+    c2 = RG.Catalog(out, 0)
+    assert c2.path("verso", lo) == g1                                    # every reader moves ...
+    assert all(c2.path(TG.channel(kind, k), lo).endswith(".g1.zarr")    # ... to the whole bundle
+               for kind in TG.KINDS for k in (2, 3, 4))
+    assert c2.path("recto", lo) == stores.store_path(out, "recto", lo, 0)
     assert stores.read_attrs(g1)["step"] == 22000
 
 

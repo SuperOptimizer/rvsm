@@ -359,7 +359,8 @@ class Patches(torch.utils.data.IterableDataset):
         current region's pools are kept (a new region drops them), so a worker holds at most one region's
         rung-3 pools, one visit's context super-cubes (`_ctx_cube`) and `regions.POOL_BYTES` of rung 4-6
         pools at any time."""
-        key = (str(chan), tuple(int(v) for v in r))
+        # the store's PATH is part of the key: a committed regeneration is a different store
+        key = (str(chan), tuple(int(v) for v in r), self.cat.path(chan, r))
         if getattr(self, "_p3key", None) != key[1]:
             self._p3key, self._p3 = key[1], {}
         if key not in self._p3:
@@ -654,7 +655,21 @@ def grid_heads(ds, heldout):
     return tuple(heads)
 
 
-def grid_key(cfg, corners, round_, heads):
+def grid_sources(ds, heldout):
+    """The identity of every label store the held-out grid reads, AS A READER SEES IT (committed
+    generations): a regenerated verso / its fields, or any rewritten store, changes the grid key
+    (pass-4 P4-04: changed labels returned the cached targets)."""
+    from rvsm import targets as TG
+    chans = sorted({str(c) for c in ds.channels} | {"rw"} |
+                   {TG.channel(kind, k) for kind in TG.KINDS for k in (2, 3, 4)})
+    out = []
+    for h in heldout:
+        lo = tuple(int(v) for v in h["lo"])
+        out.append([list(lo)] + [TG.source_digest(ds.cat.path(c, lo)) for c in chans])
+    return out
+
+
+def grid_key(cfg, corners, round_, heads, sources=None):
     """The identity of a validation grid: the corners, the store round, which heads have targets, the
     schema and target-definition versions and the config fields an item is built from -- NOT the whole
     config fingerprint, which moves whenever an unrelated field joins its exclusions and rebuilt the
@@ -667,7 +682,8 @@ def grid_key(cfg, corners, round_, heads):
         "heads": list(heads), "schema": GRID_SCHEMA, "target_def": TG.TARGET_DEF,
         "keys": list(RUNG_ITEM_KEYS), "patch": int(cfg.patch), "ctx": [int(v) for v in cfg.ctx],
         "channels": [str(c) for c in cfg.channels], "planes": str(cfg.planes),
-        "rungs": [int(v) for v in cfg.rungs]}, sort_keys=True).encode()).hexdigest()[:16]
+        "rungs": [int(v) for v in cfg.rungs], "sources": sources or []},
+        sort_keys=True).encode()).hexdigest()[:16]
 
 
 def grid_dir(spill, heads):
@@ -719,7 +735,7 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
     import json
     import os
     heads = grid_heads(ds, heldout)
-    key = grid_key(cfg, corners, round_, heads)
+    key = grid_key(cfg, corners, round_, heads, grid_sources(ds, heldout))
     spill = grid_dir(spill, heads)
     os.makedirs(spill, exist_ok=True)
     man = os.path.join(spill, "grid.json")

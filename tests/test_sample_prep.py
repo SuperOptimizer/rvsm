@@ -711,3 +711,31 @@ def test_verso_targets_make_a_new_grid_generation_and_leave_the_recto_grid(synth
     import unittest.mock as um
     with um.patch.object(sample, "GRID_SCHEMA", "grid-v999"):
         assert k != sample.grid_key(c, corners, 0, ("recto",))              # the schema
+
+
+def test_a_committed_regeneration_changes_the_grid_and_readers_see_one_bundle(synth_run, tmp_path):
+    """P4-04: the grid key includes the identity of every held-out label store a reader sees, so a
+    committed verso regeneration (a new verso + its fields) rebuilds the verso/field grid; before the
+    commit nothing changes."""
+    import shutil
+    from rvsm import regions as RG, targets as TG
+    held = [r for r in synth_run.regions if r["k"] == 2][:1]
+    kw = dict(root=synth_run.root, ct=synth_run.cfg.ct, ax=synth_run.ax, rungs=(2,))
+    d = tmp_path / "grid"
+    sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+    dd = type(d)(sample.grid_dir(str(d), ("recto", "verso")))
+    k0 = json.load(open(dd / "grid.json"))["key"]
+    lo = tuple(int(v) for v in held[0]["lo"])
+    base = stores.store_path(synth_run.root, "verso", lo, 0)
+    shutil.copytree(stores.store_path(synth_run.root, "recto", lo, 0), stores.gen_path(base, 1))
+    sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+    assert json.load(open(dd / "grid.json"))["key"] == k0, "an uncommitted generation changes nothing"
+    try:
+        stores.commit_bundle(synth_run.root, lo, 0, 1)
+        assert RG.Catalog(synth_run.root, 0).path("verso", lo) == stores.gen_path(base, 1)
+        sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+        assert json.load(open(dd / "grid.json"))["key"] != k0         # the new labels: a new grid
+    finally:
+        os.remove(os.path.join(synth_run.root, "stores", "round_0", "bundle",
+                               stores.region_name(lo)[:-5] + ".json"))
+        shutil.rmtree(stores.gen_path(base, 1))

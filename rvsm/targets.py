@@ -563,18 +563,25 @@ def source_digest(path):
     return h.hexdigest()[:16]
 
 
+def source_verso(root, lo, round_=0):
+    """(generation, path) of the verso the WRITER builds fields from: the newest FINISHED generation
+    (a regeneration's new verso), which readers see only once its fields are committed with it."""
+    g = max(stores.store_gen(root, "verso", lo, round_), 0)
+    return g, stores.gen_path(stores.store_path(root, "verso", lo, round_), g)
+
+
 def _want(root, lo, round_, rung, reach, tmin, tmax, thr):
     rk, tn, tx = rung_params(rung, reach, tmin, tmax)
     return {"target_def": TARGET_DEF, "reach_vox": rk, "tmin_vox": tn, "tmax_vox": tx, "thr": float(thr),
-            "recto_digest": source_digest(stores.current_path(root, "recto", lo, round_)),
-            "verso_digest": source_digest(stores.current_path(root, "verso", lo, round_))}
+            "recto_digest": source_digest(stores.store_path(root, "recto", lo, round_)),
+            "verso_digest": source_digest(source_verso(root, lo, round_)[1])}
 
 
 def field_path(root, kind, k, lo, round_=0):
     """Where a field store of the region lives: at the GENERATION of its verso source, so a verso
     regenerated once (round 0, `run.verso_needs_regen`) gets its fields in a new directory beside the
     old ones, never over them."""
-    g = max(stores.store_gen(root, "verso", lo, round_), 0)
+    g = source_verso(root, lo, round_)[0]
     return stores.gen_path(stores.store_path(root, channel(kind, k), lo, round_), g)
 
 
@@ -624,8 +631,8 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     512 and 256 and nothing is padded."""
     assert 0 < float(reach) < int(halo), f"reach {reach} must be positive and below the halo {halo}"
     assert 0 <= float(tmin) <= float(tmax), (tmin, tmax)
-    rp = stores.current_path(root, "recto", lo, round_)
-    vp = stores.current_path(root, "verso", lo, round_)     # the newest generation of each source
+    rp = stores.store_path(root, "recto", lo, round_)
+    vgen, vp = source_verso(root, lo, round_)         # the writer's source: the newest finished verso
     rec = stores.open_store(rp)                       # raises unless the recto pass has finished
     if not stores.is_done(vp):
         vp = ""
