@@ -171,3 +171,140 @@ def test_a_failed_shard_aborts_the_unit_and_books_nothing(ct_origin, tmp_path):
     assert good in cache.regions["r2"] and absent not in cache.regions["r2"]
     assert absent not in cache.size
     cache.close()
+
+
+# --------------------------------------------------------------------------- residency (D04 / D10)
+
+def _rolling(base):
+    """What a filesystem walk says the rolling part of a mirror is: every shard file (not metadata,
+    not an absent marker), with its size."""
+    out = {}
+    for dp, _dn, fn in os.walk(base):
+        for n in fn:
+            if not (n.endswith(".json") or n.endswith(".absent")):
+                out[os.path.join(dp, n)] = os.path.getsize(os.path.join(dp, n))
+    return out
+
+
+A, B = (0, 64, 0), (64, 128, 64)
+KW = {"ctx": (1, 2, 3), "patch": 32, "region": 64}
+
+
+def test_a_restart_inventories_old_shards_and_evicts_them_first(ct_origin, tmp_path, windowed):
+    """D10: after a restart the books were empty, so every shard an earlier process had fetched was
+    never charged and never an eviction candidate (paris4: 122 GB on disk against a 64 GB budget).
+    The constructor now charges what is on disk with its mtime as the last reference: the budget is
+    honoured at once, and the oldest untouched shards go first."""
+    root = str(tmp_path / "c")
+    c1 = stream.ShardCache(ct_origin.url, root, budget_gb=1)
+    c1.pin_small_levels(max_vox=4_000_000)
+    ka, kb = c1.fetch_region(A, **KW), c1.fetch_region(B, **KW)
+    pa = {p for p in c1.regions[ka] if os.path.exists(p)}
+    pb = {p for p in c1.regions[kb] if os.path.exists(p)}
+    pins = {p for p in c1.pin if os.path.exists(p)}
+    assert pa and pb and not (pa & pb) and pins
+    c1.close()
+    old = os.path.getmtime(next(iter(pb))) - 3600
+    for p in pa:                                 # A was last touched an hour before B
+        os.utime(p, (old, old))
+    open(next(iter(pb)) + ".part", "wb").write(b"half")   # a killed process's half shard
+
+    c2 = stream.ShardCache(ct_origin.url, root, budget_gb=1)
+    assert not os.path.exists(next(iter(pb)) + ".part"), "a .part is garbage and is removed"
+    c2.pin_small_levels(max_vox=4_000_000)
+    disk = _rolling(c2.base)
+    rolling = {p: s for p, s in disk.items() if p not in c2.pin}
+    assert set(rolling) == pa | pb
+    st = c2.stats()
+    assert c2.cache_bytes == sum(rolling.values()) and st["inventoried"] == len(disk)
+    assert abs(st["pinned_gb"] * (1 << 30) - sum(disk[p] for p in pins)) < 1
+    # a budget that holds B but not A: nothing is held after a restart, the old A goes, B stays
+    bb = sum(rolling[p] for p in pb)
+    c2.budget = int(bb / 0.9) + 1
+    assert c2.cache_bytes > c2.budget
+    assert c2.evict() == len(pa)
+    assert not any(os.path.exists(p) for p in pa) and all(os.path.exists(p) for p in pb)
+    assert all(os.path.exists(p) for p in pins) and c2.cache_bytes <= c2.budget
+    c2.close()
+
+
+def test_seed_linked_shards_are_not_charged_and_never_evicted(ct_origin, tmp_path, windowed):
+    """A shard hard-linked from the seed costs no disk: it is booked as `linked`, not against the
+    budget, and eviction never removes it -- a revisit of a seeded level can never find it gone."""
+    import shutil
+    seed = tmp_path / "seed"
+    shutil.copytree(ct_origin.path, seed)
+    root = str(tmp_path / "c")
+    c = stream.ShardCache(ct_origin.url, root, budget_gb=1, seed=str(seed))
+    k = c.fetch_region(A, **KW)
+    files = [p for p in c.regions[k] if os.path.exists(p)]
+    assert files and all(os.stat(p).st_nlink > 1 for p in files)
+    assert c.cache_bytes == 0 and set(files) <= c.linked
+    c.release(k)
+    c.budget = 0
+    c.cache_bytes = 1                           # force an eviction pass
+    c.evict()
+    assert all(os.path.exists(p) for p in files)
+    c.close()
+    c2 = stream.ShardCache(ct_origin.url, root, budget_gb=1, seed=str(seed))   # and after a restart
+    assert set(files) <= c2.linked and c2.cache_bytes == 0
+    c2.close()
+
+
+def test_a_leased_region_survives_eviction_under_a_tiny_budget(ct_origin, tmp_path, windowed):
+    """D04: the producer releases a region once the cursor has passed it, but the cursor is published
+    when a visit STARTS -- the region the worker is reading is already behind it. Its lease keeps its
+    shards through any eviction until the worker lets go."""
+    c = stream.ShardCache(ct_origin.url, str(tmp_path / "c"), budget_gb=1)
+    c.pin_small_levels(max_vox=4_000_000)
+    ka = c.fetch_region(A, **KW)
+    pa = {p for p in c.regions[ka] if os.path.exists(p)}
+    c.release(ka)                               # the producer is done with A ...
+    c.lease([ka])                               # ... a worker is still reading it
+    c.budget = 1
+    kb = c.fetch_region(B, **KW)                # evicts everything it may
+    pb = {p for p in c.regions[kb] if os.path.exists(p)}
+    assert pa and all(os.path.exists(p) for p in pa), "a leased region's shards were evicted"
+    assert not c.missing(ka)
+    c.lease([])                                 # the worker moved on
+    c.evict()
+    assert not any(os.path.exists(p) for p in pa) and all(os.path.exists(p) for p in pb)
+    assert c.missing(ka)
+    c.close()
+
+
+def test_a_revisit_whose_home_was_evicted_is_fetched_again(ct_origin, tmp_path, windowed,
+                                                          monkeypatch):
+    """A rung 3-6 visit's home region was produced (and released) when the walk passed it; by the
+    visit the budget has evicted its shards. The worker's lease names it, the producer sees a leased
+    region it does not hold and fetches it again (`produce_loop.follow_leases` -> `need`), and the
+    worker's residency check passes only then. `_release_passed` never releases a leased region."""
+    from rvsm import run as RUN
+    out = str(tmp_path / "run")
+    c = stream.ShardCache(ct_origin.url, out, budget_gb=1)
+    c.pin_small_levels(max_vox=4_000_000)
+    pyr = c.levels()
+    ka = c.fetch_region(A, **KW)
+    c.release(ka)
+    c.budget = 1
+    kb = c.fetch_region(B, **KW)
+    home = stream.region_paths(pyr, A, KW["ctx"], KW["region"])
+    assert not stream.resident(home), "the fixture should have evicted A"
+    # the worker waiting on its revisit publishes the lease
+    RUN.write_state(out, round=0)
+    RUN._write_json(os.path.join(RUN.cursor_dir(out), "w0.json"),
+                    {"pos": 5, "stride": 1, "worker": 0, "round": 0, "lease": [list(A), list(B)]})
+    leased = RUN.cursor_leases(out)
+    assert leased == sorted([A, B])
+    keys = {B: kb}                              # the producer holds B, not A
+    c.lease(c.region_key(lo) for lo in leased)
+    todo = [lo for lo in leased if lo not in keys]
+    assert todo == [A]
+    n0 = c.stats()["fetched"]
+    keys[A] = c.fetch_region(np.array(A, np.int64), **KW)
+    assert c.stats()["fetched"] > n0 and stream.resident(home)
+    # both are behind the cursor and finished: only the unleased one may be released
+    monkeypatch.setattr(RUN, "_next_job", lambda *a, **k: None)
+    RUN._release_passed(c, keys, {A: 0, B: 1}, 5, None, 0, True, out, rungs=(2,), leased=[A])
+    assert A in keys and B not in keys
+    c.close()

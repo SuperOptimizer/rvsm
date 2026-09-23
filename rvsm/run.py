@@ -656,6 +656,18 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
 
     bank, slot = None, StudentSlot(out, device=device, compile=cfg.compile)
     keys = {}
+    # a restart: the inventory charged every shard an earlier process left, and nothing is held yet --
+    # the regions the trainer's workers are reading are re-held (and re-fetched if they lost shards)
+    # BEFORE the first eviction, which then honours the budget at once
+    held0 = cursor_leases(out)
+    for lo in held0:
+        keys[lo] = cache.fetch_region(np.array(lo, np.int64), ctx=cfg.ctx, patch=cfg.patch,
+                                      region=cfg.region, evict=False)
+    cache.lease(cache.region_key(lo) for lo in held0)
+    n_ev = cache.evict()
+    jlog(out, "produce", {"kind": "cache_start", "leased": len(held0), "evicted": n_ev,
+                          **{k: (round(v, 2) if isinstance(v, float) else v)
+                             for k, v in cache.stats().items()}}, echo=False)
     L = k_active + int(cfg.lookahead_extra)
     t_reest = 0.0
 
@@ -694,6 +706,27 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     def prefetch(lo, job):
         if (lo, job) not in pre:
             pre[(lo, job)] = reader.submit(need, lo, job)
+
+    leasing = {}                                # lo -> future of a leased region's (re-)fetch
+
+    def follow_leases(round_):
+        """The trainer's leases (review D04): their shards are protected from eviction from now on, and
+        a leased region this producer does not hold -- a rung 3-6 revisit of a home the walk released
+        long ago, a region the budget evicted, a restart -- is fetched again on the reader thread. The
+        worker that leased it waits until its shards are all on disk (`WalkPatches._resident`)."""
+        leased = cursor_leases(out, round_)
+        with clock:
+            cache.lease(cache.region_key(lo) for lo in leased)
+        for lo, f in list(leasing.items()):
+            if f.done():
+                leasing.pop(lo)
+                if f.exception() is not None:
+                    jlog(out, "produce", {"kind": "lease_fetch_failed", "region": list(lo),
+                                          "err": repr(f.exception())})
+        for lo in leased:
+            if lo not in keys and lo not in leasing:
+                leasing[lo] = reader.submit(need, lo, "lease")
+        return leased
 
     def settle():
         """Raise a background failure here, on the producer's own thread, and forget finished work."""
@@ -750,6 +783,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             head = max(read_cursor_head(out, round_), cursor)
             if time.time() - t_reest > REEST_S:
                 L, t_reest = lookahead(cfg, out, k_active), time.time()
+            leased = follow_leases(round_)
             _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "last_ts": time.time(),
                              "L": L, "cursor": cursor, "head": head})
 
@@ -853,12 +887,14 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     raise
                 did = True
                 with clock:
-                    _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs)
+                    _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs,
+                                    leased=leased)
             for k in [k for k in pre if k not in gpu_units]:
                 pre.pop(k)                          # a read for a unit this pass no longer wants
             if not did:
                 with clock:
-                    _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs)
+                    _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs,
+                                    leased=leased)
                 time.sleep(IDLE_S)
                 if read_phase(out, "") == "produce" and not busy:
                     write_phase(out, "train")     # the window is drained: give the card back
@@ -945,13 +981,15 @@ def _next_job(cat, lo, round_, verso_on, out, rungs=(2, 3, 4)):
     return None
 
 
-def _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, rungs=(2, 3, 4)):
+def _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, rungs=(2, 3, 4), leased=()):
     """Give back the CT of every region whose stores are finished and whose walk position the trainer's
     cursor has passed. A region still ahead of the cursor keeps its shards: the trainer is about to
-    read them."""
+    read them -- and so does a region a worker has LEASED (the cursor is published when a visit starts,
+    so it is already past the visit being read; and a rung 3-6 visit's home can sit far behind it)."""
+    leased = set(leased)
     for lo in list(keys):
         n = pos.get(lo)
-        if n is None or n >= int(cursor):
+        if n is None or n >= int(cursor) or lo in leased:
             continue
         if _next_job(cat, lo, round_, verso_on, out, rungs=rungs) is None:
             cache.release(keys.pop(lo))
@@ -1205,6 +1243,19 @@ def cursor_records(out, round_=None):
             continue
         out_.append(r)
     return out_
+
+
+def cursor_leases(out, round_=None):
+    """The union of the workers' leases: the rung-2 region corners (tuples) whose CT they are reading or
+    are about to read (`WalkPatches._publish`). A stale round's leases are not the trainer's."""
+    got = set()
+    for r in cursor_records(out, round_):
+        for lo in r.get("lease") or ():
+            try:
+                got.add(tuple(int(v) for v in lo))
+            except (TypeError, ValueError):
+                continue
+    return sorted(got)
 
 
 def read_cursor(out, round_=None):
@@ -1632,10 +1683,12 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     resume_now = {"on": bool(resume)}
 
     def patches_factory():
+        from rvsm import ladder
         ds = walk_patches()(cfg, out, root=out, ct=ctx["ct"], ax=ctx["ax"], round_=state["round"],
                             heldout=ctx["heldout"], meta=ctx["meta5"],
                             region_records=walk_records(ctx["records"], ctx["heldout"]),
                             lookahead_n=lookahead(cfg, out, k_active),
+                            stream_mirror=ladder.is_url(ladder.pyramid_base(str(cfg.ct))),
                             start=(resume_walk(out, state["round"]) if resume_now["on"] else None))
         # every later loader resumes too: a new round's walk=None and empty cursor dir give None there
         resume_now["on"] = True

@@ -816,3 +816,35 @@ def test_close_gives_up_on_a_fetch_that_never_returns():
     assert src.close(timeout=0.5) is False
     assert time.time() - t0 < 5.0
     gate.set()
+
+
+def test_the_walk_leases_its_homes_and_waits_for_an_evicted_one(tmp_path, monkeypatch):
+    """D04, the trainer's side: every publish leases the visit being read and the pending ones, and on
+    a streamed mirror a visit whose home lost its shards does not start -- the worker leases it while
+    it waits, and starts it once the producer has fetched it again."""
+    from rvsm import stream
+    out = tmp_path / "lease"
+    os.makedirs(out / "logs")
+    RUN.write_state(str(out), round=0)
+    shard = lambda home: str(tmp_path / ("shard_%d" % home[0]))          # noqa: E731
+    monkeypatch.setattr(stream, "region_paths", lambda pyr, home, ctx, region: [shard(home)])
+    ds = _stub_walk(out, n=4)                          # order 3, 2, 1, 0; homes (128 * id, 0, 0)
+    ds.stream_mirror, ds.ctx = True, ()
+    for i in (0, 1, 2):
+        open(shard((128 * i, 0, 0)), "w").close()       # visit 3's home is not on disk
+    got, it = [], iter(ds)
+    got += [next(it) for _ in range(3)]
+    assert got == [2, 1, 0], "the non-resident visit 3 must not start"
+    rec = RUN._read_json(os.path.join(RUN.cursor_dir(str(out)), "w0.json"))
+    assert [384, 0, 0] in rec["lease"] and rec["round"] == 0
+    th = threading.Thread(target=lambda: got.append(next(it)), daemon=True)
+    th.start()
+    t0 = time.time()
+    while time.time() - t0 < 5 and RUN.cursor_leases(str(out)) != [(384, 0, 0)]:
+        time.sleep(0.01)
+    assert RUN.cursor_leases(str(out)) == [(384, 0, 0)], "the waiting worker leases what it waits on"
+    assert th.is_alive() and got == [2, 1, 0]
+    open(shard((384, 0, 0)), "w").close()               # the producer fetched it again
+    th.join(5.0)
+    assert got == [2, 1, 0, 3]
+    assert (384, 0, 0) in RUN.cursor_leases(str(out))   # held while its windows are drawn

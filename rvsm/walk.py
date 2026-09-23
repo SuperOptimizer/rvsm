@@ -19,14 +19,23 @@ class WalkPatches(sample.Patches):
     """`start` is a saved walk (`run.walk_snapshot`: `{"stride": W, "workers": {w: {"pos", "done",
     "pass"}}}`): a worker whose stride matches resumes its own share of the walk at `pos`, skipping
     the positions in `done` it had already visited past it, instead of replaying from 0 -- a restart
-    must never repeat training data. A snapshot for a different worker count is ignored."""
+    must never repeat training data. A snapshot for a different worker count is ignored.
 
-    def __init__(self, cfg, out, *, lookahead_n=8, wait_s=WAIT_S, start=None, **kw):
+    LEASES (review D04). Every publish carries `lease`: the home regions (rung-2 corners) of the visit
+    being read and of the visits pending in the lookahead. The producer never evicts a leased region's
+    shards and fetches again one it no longer holds. `stream_mirror=True` (the CT is the run's rolling
+    mirror of a URL) makes a visit wait until its home's shards are all on disk before it starts: a
+    rung 3-6 revisit whose home the budget evicted long ago then re-fetches first instead of reading air."""
+
+    RPATHS_MAX = 256        # homes whose shard path lists a worker keeps (a few hundred paths each)
+
+    def __init__(self, cfg, out, *, lookahead_n=8, wait_s=WAIT_S, start=None, stream_mirror=False, **kw):
         super().__init__(cfg, **kw)
         self.out = str(out)
         self.L = int(lookahead_n)
         self.wait_s = float(wait_s)
         self.start = start or None
+        self.stream_mirror = bool(stream_mirror)
 
     def _stale(self):
         """Has the run moved past this walk's round? The trainer bumps `round` in state.json at a round
@@ -35,17 +44,38 @@ class WalkPatches(sample.Patches):
         r = (read_state(self.out) or {}).get("round")
         return r is not None and int(r) != int(self.round)
 
-    def _publish(self, w, W, pos, region_s, done=(), npass=0):
-        """Publish this worker's walk position, stamped with its round. A walk whose round is over does
-        not write at all (the readers in `run` reject a record of another round as well: this check and
-        the write are not atomic)."""
+    def _publish(self, w, W, pos, region_s, done=(), npass=0, lease=()):
+        """Publish this worker's walk position, stamped with its round, and its lease (the home regions
+        it is reading or about to read). A walk whose round is over does not write at all (the readers
+        in `run` reject a record of another round as well: this check and the write are not atomic)."""
         if self._stale():
             return False
         _write_json(os.path.join(cursor_dir(self.out), f"w{int(w)}.json"),
                     {"pos": int(pos), "stride": int(W), "worker": int(w), "round": int(self.round),
                      "region_s": float(region_s), "t": time.time(),
-                     "done": sorted(int(q) for q in done), "pass": int(npass)})
+                     "done": sorted(int(q) for q in done), "pass": int(npass),
+                     "lease": [list(lo) for lo in dict.fromkeys(tuple(v) for v in lease)]})
         return True
+
+    def _lease(self, visits):
+        """The home regions of these visits (walk indices), in order, once each."""
+        return list(dict.fromkeys(self._region_lo(self.visits[i]) for i in visits))
+
+    def _resident(self, rec):
+        """Are the shards of this visit's home region all on disk? Always, unless the CT is a streamed
+        mirror: there the producer may have evicted them, and a visit that started anyway would read
+        missing shards as air."""
+        if not getattr(self, "stream_mirror", False):
+            return True
+        from rvsm import stream
+        home = self._region_lo(rec)
+        rp = self.__dict__.setdefault("_rpaths", {})
+        paths = rp.get(home)
+        if paths is None:
+            if len(rp) >= self.RPATHS_MAX:
+                rp.clear()
+            paths = rp[home] = stream.region_paths(self.pyr, home, self.ctx, int(self.cfg.region))
+        return stream.resident(paths)
 
     def _region_lo(self, rec):
         k = int(rec["k"])
@@ -90,10 +120,15 @@ class WalkPatches(sample.Patches):
             if not pend:                       # the walk is exhausted: start it again
                 pos, npass, visited = 0, npass + 1, set()
                 continue
-            pick = next((j for j, (_, i) in enumerate(pend) if self._visitable(self.visits[i])), None)
+            pick = next((j for j, (_, i) in enumerate(pend)
+                         if self._visitable(self.visits[i]) and self._resident(self.visits[i])), None)
             if pick is None:
                 if stop_requested(self.out) or self._stale():
                     return
+                # waiting: lease what is pending, so a home the producer let go is fetched again
+                f = floor()
+                self._publish(w, W, f, region_s, {v for v in visited if v >= f}, npass,
+                              lease=self._lease(i for _, i in pend))
                 jlog(self.out, "train", {"kind": "wait", "worker": int(w),
                                          "train_wait_s": self.wait_s, "pending": len(pend)},
                      echo=False)
@@ -116,7 +151,10 @@ class WalkPatches(sample.Patches):
             t_last = now
             f = floor()
             visited = {v for v in visited if v >= f}
-            self._publish(w, W, f, region_s, visited, npass)
+            # the lease: this visit's home until its last window is drawn (the cursor just moved past
+            # it), and the homes pending in the lookahead
+            self._publish(w, W, f, region_s, visited, npass,
+                          lease=self._lease([i] + [j for _, j in pend]))
             left, fails, air = self.windows, 0, self.air_budget()
             while left > 0 and fails < 8 * max(self.windows, 1):
                 if self._stale():

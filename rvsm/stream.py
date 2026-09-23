@@ -32,6 +32,26 @@ them, so `pin_small_levels` pulls whole levels at or below `ladder.CACHE_VOX` vo
 evicts them; the fine levels are the rolling part. Eviction is LRU by LAST REFERENCE and never touches a
 shard a region still holds: `release(key)` is what makes that region's shards evictable, and the budget
 is only enforced down to 90 % so a run does not spend its life at the boundary.
+
+Across restarts (review D10). The constructor rebuilds the inventory from the files on disk -- size, and
+the mtime as the last reference (every reference touches it) -- so a shard an earlier process fetched is
+charged and is an eviction candidate like any other; before this, untouched old shards were invisible
+and the disk grew past the budget with every restart (paris4: 122 GB against 64). The accounting is in
+three parts, reported separately by `stats()`:
+
+    rolling   fetched shards: charged against the budget, evicted LRU
+    pinned    the small coarse levels: never evicted, not charged
+    linked    shards HARD-LINKED from the local seed mirror: never evicted, not charged
+
+A linked shard costs no disk (its inode is the seed's), so evicting it would free nothing and only turn
+a later read of it into another link -- or, worse, into a miss for a visit already under way. Keeping
+every linked shard is what makes a revisit of a seeded level always safe; a shard the seed could not
+link (another filesystem: `_from_seed` copies it) has one link and is rolling.
+
+Leases (review D04). `release` only says the PRODUCER is done with a region; the trainer's workers may
+still be reading it (a visit that has just started, or a rung 3-6 revisit of a home the walk passed long
+ago). `lease(keys)` is the trainer's side of residency: a leased region's shards are never evicted, even
+released ones, and `missing(key)` says whether one has lost shards (the producer then fetches it again).
 """
 from __future__ import annotations
 
@@ -109,6 +129,31 @@ def ctx_need(pyr, k, lo, p, ctx):
         lo_d = c0 // (1 << int(d)) - ladder.shape3(p) // 2
         out.append(rung_need(pyr, k + int(d), lo_d, p))
     return out
+
+
+def region_paths(pyr, lo2, ctx=None, region=1024, rung=2):
+    """The local mirror paths of every shard a region's reads touch (what `ShardCache.fetch_region`
+    fetches): the rung-`rung` shards of the region itself plus the `ctx_need` shards of the context
+    rungs of a window centred in it. Pure: the trainer's workers use it to check residency."""
+    ctx = tuple(range(1, ladder.NCTX + 1)) if ctx is None else tuple(ctx)
+    lo2 = np.asarray(lo2, np.int64)
+    R = ladder.shape3(region)
+    need = [rung_need(pyr, int(rung), lo2, R)] + ctx_need(pyr, int(rung), lo2, R, ctx)
+    paths = []
+    for arr, keys, _whole in need:
+        d = ladder.array_dir(arr)
+        paths += [f"{d}/{chunk_key(arr, ix)}" for ix in keys]
+    return list(dict.fromkeys(paths))
+
+
+def present(path):
+    """Is a mirror object here: the shard itself, or its absent (= air) marker?"""
+    return os.path.exists(path) or os.path.exists(path + ".absent")
+
+
+def resident(paths):
+    """Are all of `paths` on disk (a shard or its absent marker)?"""
+    return all(present(p) for p in paths)
 
 
 # ------------------------------------------------------------------ fetching
@@ -268,6 +313,8 @@ class ShardCache:
         self.budget = int(float(budget_gb) * (1 << 30))
         self.size, self.ref, self.pin, self.hold, self.regions = {}, {}, set(), {}, {}
         self.cache_bytes, self.clock, self.evicted = 0, 0, 0
+        self.linked, self.leased, self._paths_of = set(), set(), {}
+        self.inventoried = 0
         self._loop = self._sess = self._f = None
         self._meta = False
         os.makedirs(os.path.dirname(self.base), exist_ok=True)
@@ -280,6 +327,45 @@ class ShardCache:
             elif not os.path.exists(self.base):
                 os.symlink(tgt, self.base)
             self._meta = True
+        else:
+            self.inventory()
+
+    def inventory(self):
+        """Rebuild the residency books from the mirror's files: every shard on disk is charged at its
+        size, with its mtime as its last reference (oldest first in the LRU, and older than anything
+        this process touches), except a hard-linked seed shard, which is `linked`. A `.part` left by a
+        killed process is garbage and is removed. Returns the number of shards found."""
+        found = []
+        for dp, _dn, fn in os.walk(self.base) if os.path.isdir(self.base) else ():
+            for n in fn:
+                p = os.path.join(dp, n)
+                if n.endswith(".part"):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                    continue
+                if n.endswith(".absent") or n.endswith(".json"):
+                    continue
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                found.append((st.st_mtime, p, st))
+        found.sort(key=lambda q: q[0])
+        for i, (_t, p, st) in enumerate(found):
+            if self._is_linked(st):
+                self.linked.add(p)
+                self.size[p] = int(st.st_size)
+                continue
+            self.cache_bytes += int(st.st_size) - self.size.get(p, 0)
+            self.size[p] = int(st.st_size)
+            self.ref[p] = i - len(found)       # negative: older than every reference of this process
+        self.inventoried = len(found)
+        return len(found)
+
+    def _is_linked(self, st):
+        return self.seed is not None and st.st_nlink > 1
 
     # ---- the asyncio side, kept private ---------------------------------
 
@@ -356,13 +442,35 @@ class ShardCache:
 
     def charge(self, path, sz=None):
         """Book a buffered shard against the budget, and stamp it with the current clock (LRU by LAST
-        reference: a shard a later region touches again moves back to the end of the queue)."""
+        reference: a shard a later region touches again moves back to the end of the queue). The file's
+        mtime is touched too, so the next process's `inventory` sees the same order. A hard-linked seed
+        shard is `linked` instead: not charged, never evicted (see the module docstring)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            st = None
         if sz is None:
-            sz = os.path.getsize(path) if os.path.exists(path) else 0
-        self.cache_bytes += sz - self.size.get(path, 0)
+            sz = int(st.st_size) if st is not None else 0
+        if st is not None and self._is_linked(st):
+            if path in self.ref:
+                self.cache_bytes -= self.size.get(path, 0)
+                self.ref.pop(path, None)
+            self.linked.add(path)
+            self.size[path] = sz
+            return sz
+        self.linked.discard(path)
+        if path in self.ref or path not in self.size:
+            self.cache_bytes += sz - self.size.get(path, 0)
+        else:
+            self.cache_bytes += sz
         self.size[path] = sz
         self.clock += 1
         self.ref[path] = self.clock
+        if st is not None:
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
         return sz
 
     def pin_small_levels(self, max_vox=ladder.CACHE_VOX):
@@ -376,6 +484,11 @@ class ShardCache:
                 continue
             todo += self._paths(pyr[k], all_keys(pyr[k]))
             out.append(k)
+        for p in todo:                  # an inventoried pinned shard is no longer rolling
+            if p in self.ref:
+                self.cache_bytes -= self.size.get(p, 0)
+                self.ref.pop(p, None)
+            self.linked.discard(p)
         self._fetch(todo, pin=True)
         return out
 
@@ -417,26 +530,24 @@ class ShardCache:
     def region_key(self, lo2):
         return "%d_%d_%d" % tuple(int(v) for v in lo2)
 
-    def fetch_region(self, lo2, ctx=tuple(range(1, ladder.NCTX + 1)), patch=256, region=1024, rung=2):
+    def fetch_region(self, lo2, ctx=tuple(range(1, ladder.NCTX + 1)), patch=256, region=1024, rung=2,
+                     evict=True):
         """Pull everything a 1024^3 region at rung-2 corner `lo2` needs: the rung-2 shards the region's
         own reads touch, plus the `ctx_need` shards of the nine context rungs of a window CENTRED in it
         (the context cubes of any window inside the region live in the same coarse shards, because one
         coarse shard covers the whole region's footprint many times over). Returns the region key that
-        `release` takes. A local volume fetches nothing."""
+        `release` takes. A local volume fetches nothing. `evict=False` leaves the budget to a later
+        `evict()` (a producer re-holding several leased regions at startup must hold them all first)."""
         pyr = self.levels()
         key = self.region_key(lo2)
-        lo2 = np.asarray(lo2, np.int64)
-        R = ladder.shape3(region)
-        need = [rung_need(pyr, int(rung), lo2, R)]
-        need += ctx_need(pyr, int(rung), lo2, R, ctx)
-        paths = []
-        for arr, keys, _whole in need:
-            paths += self._paths(arr, keys)
+        paths = region_paths(pyr, lo2, ctx, region, rung)
+        self._paths_of[key] = paths
         t0 = time.time()
         f = self._f
         b0, n0, s0 = (f.bytes, f.fetched, f.seeded) if f is not None else (0, 0, 0)
         self._fetch(paths, key=key)
-        self.evict()
+        if evict:
+            self.evict()
         if self.remote:
             f, dt = self._f, max(time.time() - t0, 1e-6)
             mb = ((f.bytes - b0) if f is not None else 0) / (1 << 20)
@@ -458,17 +569,39 @@ class ShardCache:
     def held(self, path):
         return bool(self.hold.get(path))
 
+    def lease(self, keys):
+        """The regions the trainer's workers are reading or about to read (their region keys). A leased
+        region's shards are never evicted, whether or not the producer still holds it. Replaces the
+        previous set."""
+        self.leased = {str(k) for k in keys}
+
+    def missing(self, key):
+        """Has the region `key` lost any of its shards (evicted since it was fetched, or never fetched
+        by this process)? A local volume never misses anything."""
+        if not self.remote:
+            return False
+        paths = self._paths_of.get(str(key))
+        return paths is None or not resident(paths)
+
+    def _leased_paths(self):
+        out = set()
+        for k in self.leased:
+            out.update(self._paths_of.get(k, ()))
+        return out
+
     def evict(self):
-        """Delete released shards, oldest reference first, down to 90 % of the budget. A pinned level and
-        a shard a live region still holds are never candidates, so a budget smaller than the working set
-        simply does not shrink -- which is the honest failure, not a cache that deletes what is in use."""
+        """Delete released shards, oldest reference first, down to 90 % of the budget. A pinned level,
+        a linked seed shard, a shard a live region still holds and a shard of a region the trainer has
+        leased are never candidates, so a budget smaller than the working set simply does not shrink --
+        which is the honest failure, not a cache that deletes what is in use."""
         if not self.remote or self.cache_bytes <= self.budget:
             return 0
         target, n = 0.9 * self.budget, 0
+        keep = self._leased_paths()
         for p, _i in sorted(self.ref.items(), key=lambda q: q[1]):
             if self.cache_bytes <= target:
                 break
-            if p in self.pin or self.held(p):
+            if p in self.pin or p in self.linked or self.held(p) or p in keep:
                 continue
             try:
                 os.remove(p)
@@ -483,7 +616,13 @@ class ShardCache:
 
     def stats(self):
         f = self._f
-        return {"gb": self.cache_bytes / (1 << 30), "shards": len(self.size), "pinned": len(self.pin),
+        g = 1 << 30
+        return {"gb": self.cache_bytes / g, "shards": len(self.size), "pinned": len(self.pin),
+                "rolling_gb": self.cache_bytes / g,
+                "pinned_gb": sum(self.size.get(p, 0) for p in self.pin) / g,
+                "linked_gb": sum(self.size.get(p, 0) for p in self.linked) / g,
+                "linked": len(self.linked), "leased": len(self.leased),
+                "inventoried": self.inventoried,
                 "regions": len(self.regions), "evicted": self.evicted,
                 "fetched": getattr(f, "fetched", 0), "seeded": getattr(f, "seeded", 0), "have": getattr(f, "have", 0),
                 "absent": getattr(f, "absent", 0), "failed": getattr(f, "failed", 0)}
