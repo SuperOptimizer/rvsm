@@ -1172,3 +1172,50 @@ def test_the_supervisor_kills_a_dead_producers_group_before_respawning(tmp_path)
         for p in (worker, forkserver, other):
             if _running(p):
                 os.kill(p, 9)
+
+
+# --------------------------------------------------------------------------- P3-10: a stuck unit
+
+def test_a_live_heartbeat_with_stale_progress_is_a_stall(tmp_path):
+    """P3-10: the ticker keeps `last_ts` fresh even when the unit never progresses. A fresh heartbeat
+    with `progress_ts` older than UNIT_STALL_S is reported as a STALL (once, with the unit's identity),
+    a deliberate pause is exempt, and at twice the limit the producer is restarted like a silent one.
+    The review's probe: fresh ticker, 24 h frozen unit -> the supervisor now acts."""
+    clock = [1_000_000.0]
+    out, procs, spawned, w = _watch(tmp_path, _FakeProc(), clock)
+    hb = os.path.join(out, "workers", "produce.json")
+    sched = os.path.join(out, "logs", "sched.jsonl")
+    unit = {"phase": "round0", "job": "teacher", "region": [0, 1024, 0]}
+    RUN._write_json(hb, {**unit, "last_ts": clock[0], "progress_ts": clock[0] - 60})
+    assert w.check() is None
+    RUN._write_json(hb, {**unit, "last_ts": clock[0], "progress_ts": clock[0] - RUN.UNIT_STALL_S - 60})
+    assert w.check() == "stall" and w.check() == "stall" and not spawned
+    stalls = [r for r in RUN.tail_jsonl(sched) if r.get("kind") == "STALL"]
+    assert len(stalls) == 1 and stalls[0]["unit"]["job"] == "teacher" and \
+        stalls[0]["unit"]["region"] == [0, 1024, 0]
+    # a deliberate pause is not a stall
+    RUN._write_json(hb, {"phase": "paused_ram", "last_ts": clock[0], "progress_ts": clock[0] - 86400})
+    assert w.check() is None
+    open(os.path.join(out, RUN.PAUSE_FILE), "w").close()
+    RUN._write_json(hb, {**unit, "last_ts": clock[0], "progress_ts": clock[0] - 86400})
+    assert w.check() is None
+    os.remove(os.path.join(out, RUN.PAUSE_FILE))
+    # 24 h: alert and restart
+    first = procs["produce"]
+    assert w.check() == "restart" and len(spawned) == 1
+    assert "terminate" in first.calls
+    rs = [r for r in RUN.tail_jsonl(sched) if r.get("kind") == "restart"]
+    assert rs and rs[-1]["reason"] == "stalled"
+    assert len([r for r in RUN.tail_jsonl(sched) if r.get("kind") == "STALL"]) == 2
+
+    # the probe verbatim: an alive producer that cannot be stopped (no terminate) is not "healthy"
+    class Alive:
+        def is_alive(self):
+            return True
+    now = 100000.0
+    out2 = str(tmp_path / "probe")
+    RUN._write_json(os.path.join(out2, "workers", "produce.json"),
+                    {"last_ts": now, "progress_ts": now - 86400, "phase": "round0", "job": "teacher"})
+    watch = RUN.ProducerWatch(out2, {"produce": Alive()}, lambda: None, clock=lambda: now,
+                              log=lambda m: None)
+    assert watch.check() is not None

@@ -89,6 +89,8 @@ HEARTBEAT_S = 30.0          # how often the supervisor stamps workers.json / log
 SILENT_MAX_S = 1800.0       # a producer that has not stamped its heartbeat for this long is restarted
 LEASE_POLL_S = 0.25         # how often the producer's lease keeper looks for new leases
 LEASE_RETRY_S = 10.0        # a leased region whose (re-)fetch left it incomplete is retried this often
+UNIT_STALL_S = 2700.0       # a live producer whose loop has not progressed this long is a STALL (alert);
+                            # twice this long and it is restarted like a silent one
 HB_TICK_S = 60.0            # the producer's own stamping thread: alive while a long unit runs
 RESTART_MIN_S = 10.0        # a dead producer is restarted AT ONCE; a second death waits this long, doubling
 RESTART_MAX_S = 600.0       # ... up to this
@@ -1705,9 +1707,12 @@ class ProducerWatch:
     doubling to `RESTART_MAX_S`; a producer that lives `RESTART_RESET_S` resets that, and
     `RESTART_FATAL` restarts in a row are shouted in the log."""
 
-    def __init__(self, out, procs, respawn, log=print, clock=time.time, join_s=30.0):
+    def __init__(self, out, procs, respawn, log=print, clock=time.time, join_s=30.0,
+                 unit_stall_s=None):
         self.out, self.procs, self.respawn, self.log = str(out), procs, respawn, log
         self.clock, self.join_s = clock, float(join_s)
+        self.unit_stall_s = float(UNIT_STALL_S if unit_stall_s is None else unit_stall_s)
+        self._alerted = None            # the progress stamp of the stall already reported
         self.fails, self.next_at, self.born = 0, 0.0, clock()
         self.restarts = 0
 
@@ -1729,23 +1734,52 @@ class ProducerWatch:
                  echo=False)
         return sent
 
+    def _paused(self, hb):
+        """A deliberate pause is not a stall: the host-RAM guard's, or a one-card timeshare turn."""
+        if producer_paused(self.out) or str(hb.get("phase", "")) == "paused_ram":
+            return True
+        return os.path.exists(os.path.join(self.out, PHASE_FILE)) and read_phase(self.out) != "produce"
+
+    def _stall(self, hb, now):
+        """None, "stall" (reported: no progress for `unit_stall_s`, the heartbeat itself fresh -- the
+        ticker only proves the process is alive, review P3-10) or "stalled" (twice that: restart it)."""
+        prog = hb.get("progress_ts")
+        if prog is None or self._paused(hb):
+            return None
+        page = now - float(prog)
+        if page <= self.unit_stall_s:
+            return None
+        if self._alerted != prog:
+            self._alerted = prog
+            unit = {k: hb.get(k) for k in ("phase", "job", "region", "round", "cursor")
+                    if hb.get(k) is not None}
+            jlog(self.out, "sched", {"kind": "STALL", "progress_age_s": round(page), "unit": unit,
+                                     "pid": hb.get("pid"), "limit_s": self.unit_stall_s}, echo=False)
+            self.log(f"!!!! [supervisor] STALL: the producer is alive but its unit {unit} has made no "
+                     f"progress for {page / 60:.0f} min (restart at {2 * self.unit_stall_s / 60:.0f}) !!!!")
+        return "stalled" if page > 2 * self.unit_stall_s else "stall"
+
     def check(self):
-        """One look. Returns what happened: None (healthy / nothing to do), "restart", "backoff",
-        "stuck" (will not exit) or "silent_thread"."""
+        """One look. Returns what happened: None (healthy / nothing to do), "stall" (reported),
+        "restart", "backoff", "stuck" (will not exit) or "silent_thread"."""
         pr = self.procs.get("produce")
         if pr is None or stop_requested(self.out):
             return None
         now = self.clock()
         if pr.is_alive():
-            age = now - float(self._hb().get("last_ts") or now)
-            if age <= SILENT_MAX_S:
-                if self.fails and now - self.born > RESTART_RESET_S:
+            hb = self._hb()
+            age = now - float(hb.get("last_ts") or now)
+            stall = self._stall(hb, now) if age <= SILENT_MAX_S else None
+            if age <= SILENT_MAX_S and stall != "stalled":
+                if stall is None and self.fails and now - self.born > RESTART_RESET_S:
                     self.fails = 0
-                return None
+                return stall
+            why = "producer silent" if stall is None else "producer stalled"
             if not hasattr(pr, "terminate"):
-                jlog(self.out, "sched", {"kind": "producer_silent_thread", "age_s": round(age)})
+                jlog(self.out, "sched", {"kind": "producer_silent_thread", "age_s": round(age),
+                                         "why": why})
                 return "silent_thread"
-            jlog(self.out, "sched", {"kind": "restart", "reason": "producer silent", "age_s": round(age),
+            jlog(self.out, "sched", {"kind": "restart", "reason": why, "age_s": round(age),
                                      "pid": getattr(pr, "pid", None)})
             tree = proc_tree(pr.pid) if getattr(pr, "pid", None) else []
             for stop in ("terminate", "kill"):
@@ -1763,7 +1797,7 @@ class ProducerWatch:
                 self.log(f"!!!! [supervisor] producer pid {getattr(pr, 'pid', None)} is silent and will "
                          f"not exit: NOT starting another one !!!!")
                 return "stuck"
-            reason = "silent"
+            reason = "silent" if stall is None else "stalled"
         else:
             reason = f"exit {getattr(pr, 'exitcode', None)}"
             # it died on its own: its forkserver and fields pool may not have (P3-09)
