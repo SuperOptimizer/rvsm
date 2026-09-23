@@ -469,3 +469,15 @@ def test_rvsm_train_runs_on_real_region_stores(synth_run, tmp_path):
     ev = [json.loads(q) for q in (out / "logs" / "eval.jsonl").read_text().splitlines()]
     assert ev and math.isfinite(ev[-1]["dice"])
     assert list((out / "eval").glob("val_*.png"))
+
+
+def test_the_self_p_schedule_has_two_breakpoints():
+    """0.1 at 0 -> 0.7 at 20k -> 0.9 at 30k, held; the mask source keeps the rest."""
+    from rvsm.config import Config
+    c = Config()
+    want = {0: 0.1, 10000: 0.4, 20000: 0.7, 25000: 0.8, 30000: 0.9, 40000: 0.9}
+    for st, v in want.items():
+        assert TR.self_p_at(c, st, 60000) == pytest.approx(v), st
+    old = replace(c, self_p_mid_step=0)                  # the old whole-run schedule
+    assert old.fingerprint() == c.fingerprint() == replace(c, self_p_end=0.5).fingerprint()
+    assert TR.self_p_at(old, 30000, 60000) == pytest.approx(0.4)

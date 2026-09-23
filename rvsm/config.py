@@ -151,7 +151,8 @@ RUNG_ITEM_KEYS = ("ct", "tgt", "w", "lo", "cyx", "sym", "rung", "norm", "cm", "c
 
 # Fields a resume is allowed to differ in: a longer run, a different eval cadence, different hardware.
 FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_seed", "ckpt_act", "compile",
-                       "vram_train_gb", "vram_produce_gb", "pin_memory", "gpu_prefetch", "verso_min_dice")
+                       "vram_train_gb", "vram_produce_gb", "pin_memory", "gpu_prefetch", "verso_min_dice",
+                       "self_p_mid_step", "self_p_end", "self_p_end_step")
 
 
 @dataclass
@@ -210,7 +211,10 @@ class Config:
     # ------------------------------------------------------------------ fixed recipe: cascade + planes
     cascade: str = "mix"               # off | mask | self | mix: source of the cascade channel
     self_p_lo: float = 0.1             # cascade self-prediction probability at step 0
-    self_p_hi: float = 0.7             # ... annealed to this by the end of the run
+    self_p_hi: float = 0.7             # ... annealed linearly to this at `self_p_mid_step`
+    self_p_mid_step: int = 20000       # (0: the old schedule, self_p_lo -> self_p_hi over the whole run)
+    self_p_end: float = 0.9            # ... then linearly to this at `self_p_end_step`, held after
+    self_p_end_step: int = 30000
     cascade_drop: float = 0.1          # probability of blanking the cascade channel
     cascade_noise: bool = True         # jitter the cascade channel
     planes: str = "radius+meta"        # the conditioning planes (radius plane + 5 scan-metadata planes)

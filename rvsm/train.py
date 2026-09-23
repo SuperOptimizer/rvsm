@@ -226,6 +226,25 @@ def _rungs_of(b):
     return [int(v) for v in b["rung"].reshape(-1).tolist()]
 
 
+def self_p_at(cfg, step, nsteps=None):
+    """The cascade `mix` self-source probability at `step`: `self_p_lo` at 0, linear to `self_p_hi` at
+    `self_p_mid_step`, linear to `self_p_end` at `self_p_end_step`, held after. The mask source takes
+    the rest. `self_p_mid_step <= 0` is the old schedule, lo -> hi linearly over the whole run
+    (`nsteps`). The faster anneal (0.7 at 20k instead of 60k) came after paris4's self-cascade dice
+    fell 0.15 -> 0.05 over steps 4k-10k while the mask-cascade dice sat at 0.83: at self_p ~0.2 the
+    student leaned on the mask source and never learned to use its own coarse prediction."""
+    s, lo, hi = float(step), float(cfg.self_p_lo), float(cfg.self_p_hi)
+    m = int(getattr(cfg, "self_p_mid_step", 0) or 0)
+    if m <= 0:
+        return lo + (hi - lo) * min(s / max(int(nsteps or cfg.steps), 1), 1.0)
+    if s <= m:
+        return lo + (hi - lo) * s / m
+    e, end = int(cfg.self_p_end_step), float(cfg.self_p_end)
+    if e <= m or s >= e:
+        return end if e > m else hi
+    return hi + (end - hi) * (s - m) / (e - m)
+
+
 FINE_RUNGS = (2, 3, 4)   # the rungs the headline `dice` / `bce` / `mae` are pooled over
 NBINS = 200              # probability bins of the threshold-free (best-threshold) dice
 
@@ -737,8 +756,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             rung_n[r] = rung_n.get(r, 0) + 1
         if cas.on:
             cas.sync(ema)   # the self-mode coarse pass always runs on the current EMA weights
-            a0, a1 = float(cfg.self_p_lo), float(cfg.self_p_hi)
-            cas.self_p = a0 + (a1 - a0) * min(step / max(nsteps, 1), 1.0)
+            cas.self_p = self_p_at(cfg, step, nsteps)
         cas.clock = ph.on
         ct, tg, wt = prep.prepare(b, dev, cascade=cas, layout=layout)
         ph.mark("prepare+cascade")
@@ -836,6 +854,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                   "lr": sched.get_last_lr()[0], "vox_s": round(nvox / dt),
                   "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0,
                   "rung": {str(k): rung_n[k] for k in sorted(rung_n)},
+                  "self_p": round(float(cas.self_p), 4) if cas.on else None,
                   "train_wait_s": round(wait_s, 3), **ph.take()})
             rung_n, wait_s, nvox, t0 = {}, 0.0, 0, time.time()
         if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:
