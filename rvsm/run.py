@@ -381,12 +381,17 @@ def region_route(cfg, visits, order, heldout=()):
             seen.add(lo)
             out.append(lo)
     pos = {}
+    # a rung 3-6 visit whose home is not a rung-2 region of the walk is dead (`Patches._dead`): the
+    # trainer never draws it, so its home -- nearly all air -- is not worth a teacher pass
+    fine2 = {tuple(int(v) for v in r["lo"]) for r in visits if int(r["k"]) == 2}
     for n, i in enumerate(order):
         rec = visits[i]
         k = int(rec["k"])
         lo2 = np.array(rec["lo"], np.int64) << max(k - 2, 0)
         lo = tuple(int(v) // int(cfg.region) * int(cfg.region) for v in lo2)
         if lo in seen:
+            continue
+        if 3 <= k <= 6 and fine2 and lo not in fine2:
             continue
         seen.add(lo)
         pos[lo] = n

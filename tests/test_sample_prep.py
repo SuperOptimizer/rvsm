@@ -498,3 +498,58 @@ def test_a_visit_whose_home_region_is_held_out_is_dead(synth_run):
     for _ in range(30):
         item = next(it)
         assert int(item["rung"]) != 3 or ds._home_r != home
+
+
+def test_a_visit_whose_home_region_is_not_a_walk_region_is_dead(synth_run):
+    """paris4 steps 780-1140: a rung-3 tile passed the occupancy test on the mean of its eight
+    regions, but its home region was air, so the visit's 128 windows were all `air_keep` windows of
+    weight 0. A rung 3-6 visit whose home is not a rung-2 record of the walk is dead, and
+    `run.region_route` does not produce that home."""
+    from rvsm import run as RUN
+    recs3 = [v for v in synth_run.regions if int(v["k"]) == 3]
+    assert recs3
+    ds0 = _patches(synth_run)
+    ds0._open()
+    home = ds0._home(recs3[0])
+    assert home in ds0._fine2 and not ds0._dead(recs3[0])
+    # the same walk without the home's rung-2 record: the rung-3 visit is dead
+    kept = [r for r in synth_run.regions
+            if not (int(r["k"]) == 2 and tuple(int(v) for v in r["lo"]) == home)]
+    ds = sample.Patches(synth_run.cfg, root=synth_run.root, ct=synth_run.cfg.ct, ax=synth_run.ax,
+                        region_records=kept)
+    ds._open()
+    assert ds._dead(recs3[0])
+    assert not any(ds._dead(v) for v in ds.visits if int(v["k"]) == 2)
+    # and the producer's route leaves that home out, while the full walk keeps it
+    route, _ = RUN.region_route(synth_run.cfg, ds.visits, list(range(len(ds.visits))))
+    assert home not in route
+    route0, _ = RUN.region_route(synth_run.cfg, ds0.visits, list(range(len(ds0.visits))))
+    assert home in route0
+
+
+def test_a_visit_keeps_at_most_its_air_budget_of_air_windows(synth_run, monkeypatch):
+    """A visit to a region that is all air used to fill all its windows with `air_keep` windows of
+    weight 0. The air windows a visit keeps are capped at `air_keep` of its windows: one pass of the
+    walk over an all-air visit yields exactly its budget, then the visit ends on its fail limit."""
+    from dataclasses import replace
+    cfg = replace(synth_run.cfg, air_keep=0.25, windows_per_region=8)
+    ds = sample.Patches(cfg, root=synth_run.root, ct=cfg.ct, ax=synth_run.ax,
+                        region_records=synth_run.regions, seed=0)
+    ds._open()
+    assert ds.air_budget() == 2
+    monkeypatch.setattr(sample.ladder, "read_rung",
+                        lambda pyr, k, lo, shape, dtype=np.uint8: np.zeros(tuple(ladder.shape3(shape)), dtype))
+    rec = dict(ds.visits[0], k=2)
+    ds.visits, ds.order = [rec], np.array([0])
+    monkeypatch.setattr(ds, "_visitable", lambda r: True)
+    calls = []
+    real = ds._draw
+    monkeypatch.setattr(ds, "_draw", lambda rng, r, air_ok=True: calls.append(air_ok) or real(rng, r, air_ok))
+    it = iter(ds)
+    got = [next(it) for _ in range(2)]
+    assert all(not np.asarray(g["w"]).any() for g in got)
+    n_first = len(calls)
+    next(it)                                   # the third item is from the NEXT pass over the walk
+    pass1 = calls[:len(calls)]
+    assert pass1.count(False) >= 8 * 8 - 1, "the spent budget must reject every later air window"
+    assert n_first < len(calls)

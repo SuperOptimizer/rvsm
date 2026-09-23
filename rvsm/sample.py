@@ -217,6 +217,8 @@ class Patches(torch.utils.data.IterableDataset):
         # held-out region stores never supply a training target, even as a stitched neighbour
         self._held = {tuple(int(v) for v in h["lo"]) for h in self.heldout
                       if int(h.get("k", 2)) == 2}
+        # the rung-2 regions worth a visit of their own (occupancy >= occ_min_fine, not held out)
+        self._fine2 = {tuple(int(v) for v in r["lo"]) for r in self._records if int(r["k"]) == 2}
 
     # ---- where a target comes from --------------------------------------
 
@@ -467,8 +469,19 @@ class Patches(torch.utils.data.IterableDataset):
         lo_b = np.maximum(lo_a, lo_b)
         return dict(rec, lo=[int(v) for v in lo_a], size=[int(v) for v in lo_b - lo_a + p])
 
-    def _draw(self, rng, rec):
-        """One window inside one region, or None when the CT-air rule rejects it."""
+    def air_budget(self):
+        """How many CT-air windows one visit may keep: `air_keep` of its windows (at least one).
+
+        `air_keep` keeps that share of the air windows DRAWN, and a visit draws until it has
+        `windows` of them -- so a home region that is nearly all air filled its whole visit with
+        weight-0 air windows (paris4 steps 780-1140: 128 in a row from one rung-3 visit). Capped per
+        visit, air stays about `air_keep` of the items and a mostly-air visit ends early instead."""
+        return max(int(round(float(self.cfg.air_keep) * self.windows)), 1)
+
+    def _draw(self, rng, rec, air_ok=True):
+        """One window inside one region, or None when the CT-air rule rejects it (always, once the
+        visit's air budget is spent: `air_ok=False`). `self._last_air` says whether a kept window
+        was an air one."""
         k = int(rec["k"])
         if 3 <= k <= 6:
             self._home_r = self._home(rec)
@@ -478,8 +491,10 @@ class Patches(torch.utils.data.IterableDataset):
         hi = np.maximum(rlo + rsz - p, rlo)
         lo = rng.integers(np.minimum(rlo, hi), hi + 1)
         ct = ladder.read_rung(self.pyr, k, lo, p, dtype=np.uint8)
-        if (ct == 0).mean() > 0.9 and rng.random() > self.cfg.air_keep:
+        air = bool((ct == 0).mean() > 0.9)
+        if air and (not air_ok or rng.random() > self.cfg.air_keep):
             return None
+        self._last_air = air
         tg, w = self._rung_target(k, lo, ct)
         sym = int(draw_sym(rng, tuple(p))) if self.sym else 0
         cx = [self._ctx_cube(rec, k, d, lo, ct.shape) for d in self.ctx] if self.ctx else ()
@@ -487,12 +502,19 @@ class Patches(torch.utils.data.IterableDataset):
                          **self._plane_extras(k), **self._cascade_extras(k, lo, ct.shape, rec=rec))
 
     def _dead(self, rec):
-        """A rung 3-6 visit whose HOME region is held out: the producer makes no store for it (the
-        held-out store is never a training target), so every window it could draw is weight 0 -- and
-        a rung-5/6 record is visited up to `visits_max` times. The walk skips it for good."""
+        """A rung 3-6 visit whose HOME region is held out, or is not a rung-2 region of the walk (its
+        occupancy is under `occ_min_fine`: a coarse tile passes the occupancy test on the MEAN of all
+        its regions, but its windows are drawn on the home region alone). Every window it could draw
+        is weight 0 -- a held-out store is never a target, and an air home yields 128 `air_keep`
+        windows (paris4: 8 % of the items of the first 2000 steps) -- and a rung-5/6 record is
+        visited up to `visits_max` times. The walk skips it for good; `run.region_route` does not
+        produce its home either."""
         k = int(rec["k"])
-        return (3 <= k <= 6 and not self.label_free
-                and self._home(rec) in getattr(self, "_held", ()))
+        if not 3 <= k <= 6 or self.label_free:
+            return False
+        h = self._home(rec)
+        fine = getattr(self, "_fine2", None)
+        return h in getattr(self, "_held", ()) or bool(fine) and h not in fine
 
     def _visitable(self, rec):
         """Is this visit worth making? A fine region with no finished store would yield only zero
@@ -519,12 +541,13 @@ class Patches(torch.utils.data.IterableDataset):
                 rec = self.visits[i]
                 if self._dead(rec) or not self._visitable(rec):
                     continue
-                left, fails = self.windows, 0
+                left, fails, air = self.windows, 0, self.air_budget()
                 while left > 0 and fails < 8 * max(self.windows, 1):
-                    got = self._draw(rng, rec)
+                    got = self._draw(rng, rec, air_ok=air > 0)
                     if got is None:
                         fails += 1
                         continue
+                    air -= int(self._last_air)
                     left, fails, served = left - 1, 0, served + 1
                     yield got
             if not served:   # nothing is produced yet: do not spin the CPU on an empty walk

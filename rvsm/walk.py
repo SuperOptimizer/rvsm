@@ -68,12 +68,13 @@ class WalkPatches(sample.Patches):
             if not had_verso and i not in seen_no_verso:
                 seen_no_verso[i] = True
                 revisit.append(i)
-            left, fails = self.windows, 0
+            left, fails, air = self.windows, 0, self.air_budget()
             while left > 0 and fails < 8 * max(self.windows, 1):
-                got = self._draw(rng, rec)
+                got = self._draw(rng, rec, air_ok=air > 0)
                 if got is None:
                     fails += 1
                     continue
+                air -= int(self._last_air)
                 left, fails = left - 1, 0
                 yield got
             now = time.time()
