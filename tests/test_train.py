@@ -757,3 +757,66 @@ def test_the_recto_gate_metric_does_not_move_when_verso_targets_appear(full_cfg)
     assert ra["eval_schema"] == TR.EVAL_SCHEMA
     assert ra["dice_recto_r2"] == pytest.approx(rb["dice_recto_r2"]) and ra["dice_recto_r2"] > 0.99
     assert rb["dice_r2"] < ra["dice_r2"]
+
+
+# --------------------------------------------------------------------- host memory over a long loop
+
+PAD_MB = 48          # ballast per item: a leak of one batch per step would be 48 MB a step
+
+
+class _BallastItems(torch.utils.data.IterableDataset):
+    """Endless compact samples, each carrying `PAD_MB` of ballast, from real loader WORKERS: the
+    batches reach the trainer through the loader's shared-memory handoff, as in a run."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def __iter__(self):
+        i = 0
+        while True:
+            i += 1
+            it = _item(self.cfg, k=self.cfg.rungs[i % len(self.cfg.rungs)], seed=i % 7)
+            it["pad"] = torch.full((PAD_MB << 20,), i % 251, dtype=torch.uint8)
+            yield it
+
+
+def _rss_mb():
+    with open("/proc/self/status") as f:
+        for ln in f:
+            if ln.startswith("VmRSS:"):
+                return int(ln.split()[1]) / 1024.0
+    return 0.0
+
+
+def test_the_trainer_holds_no_batch_per_step(tiny_cfg):
+    """The paris4 relaunch died with the trainer's RSS growing by about one compact batch per step.
+    Two hundred steps from a real two-worker loader, through `DevicePrefetch` (on the GPU when there is
+    one: the helper thread, the side-stream copy), with a 48 MB ballast in every item: after warm-up
+    the trainer's RSS must grow by less than one batch."""
+    import threading
+    import time
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = replace(tiny_cfg, steps=200, eval_every=10 ** 6, workers=2, patch=16, ect_block=4,
+                  aff_offsets=(2, 4))
+    rss, stop = [], threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            rss.append(_rss_mb())
+            stop.wait(0.2)
+
+    def factory():
+        return sample.loader(_BallastItems(cfg), workers=2, batch=1, pin_memory=False)
+    th = threading.Thread(target=watch, daemon=True)
+    th.start()
+    t0 = time.time()
+    try:
+        TR.train(cfg, patches_factory=factory, val_items=[_item(cfg, k=2, seed=9)], device=dev)
+    finally:
+        stop.set()
+        th.join(2)
+    assert len(rss) >= 10, f"too few samples in {time.time() - t0:.0f}s"
+    n = len(rss)
+    warm = max(rss[n // 4: n // 2])
+    late = max(rss[3 * n // 4:])
+    assert late - warm < PAD_MB, f"trainer RSS grew {late - warm:.0f} MB after warm-up: {rss[::5]}"

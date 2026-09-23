@@ -600,23 +600,55 @@ def _prepared(grid, dev, layout, cascade=None):
 QUIESCE_S = 60.0     # the longest `DevicePrefetch.close` waits for a fetch in flight before it stops waiting
 
 
+def _run_into(fut, fn):
+    if not fut.set_running_or_notify_cancel():
+        return
+    try:
+        fut.set_result(fn())
+    except BaseException as e:  # noqa: BLE001  -- re-raised by fut.result() on the caller's side
+        fut.set_exception(e)
+
+
 def _spawn(fn):
-    """`fn()` on a fresh DAEMON thread, as a Future. Not a ThreadPoolExecutor: its threads are joined
-    at interpreter exit and by its context manager, so one `next(loader)` that never returns (an old
-    round's walk waiting on a store nobody will produce) blocked the trainer's shutdown with it."""
+    """`fn()` on a fresh DAEMON thread, as a Future (a one-off: `DevicePrefetch` keeps ONE thread)."""
     import concurrent.futures as cf
     import threading
     fut = cf.Future()
-
-    def run():
-        if not fut.set_running_or_notify_cancel():
-            return
-        try:
-            fut.set_result(fn())
-        except BaseException as e:  # noqa: BLE001  -- re-raised by fut.result() on the caller's side
-            fut.set_exception(e)
-    threading.Thread(target=run, name="rvsm-h2d", daemon=True).start()
+    threading.Thread(target=_run_into, args=(fut, fn), name="rvsm-h2d-once", daemon=True).start()
     return fut
+
+
+class _Fetcher:
+    """ONE long-lived DAEMON thread that runs submitted calls in order and returns Futures.
+
+    One thread for the whole run, like the ThreadPoolExecutor(1) this replaces -- a thread per batch
+    means per-thread CUDA / allocator state created and torn down every step -- but a daemon one: a
+    `next(loader)` that never returns (an old round's walk waiting on a store nobody will produce) must
+    not block the trainer's shutdown, and an executor's worker is joined at interpreter exit."""
+
+    def __init__(self, name="rvsm-h2d"):
+        import queue
+        import threading
+        self.q = queue.SimpleQueue()
+        self.t = threading.Thread(target=self._loop, name=name, daemon=True)
+        self.t.start()
+
+    def _loop(self):
+        while True:
+            job = self.q.get()
+            if job is None:
+                return
+            _run_into(*job)
+            del job                 # nothing of a finished call outlives it on this thread
+
+    def submit(self, fn):
+        import concurrent.futures as cf
+        fut = cf.Future()
+        self.q.put((fut, fn))
+        return fut
+
+    def stop(self):
+        self.q.put(None)
 
 
 def _shutdown_loader(src, it):
@@ -649,7 +681,8 @@ class DevicePrefetch:
     The thread is what makes this overlap at all: from pageable memory a `non_blocking` copy is still
     synchronous for the calling thread (~110 ms for one 256^3 sample's ~300 MB of uint8 over
     Thunder's 2.7 GB/s link), and pinned memory is not an option there (the trainer hung inside CUDA
-    calls whenever the loader pinned). `side=False` copies on the default stream instead.
+    calls whenever the loader pinned). `side=False` copies on the default stream instead (still on
+    the helper thread, whose wait the RAM guard's `stop()` can abandon).
 
     `close()` is the SHUTDOWN PROTOCOL (review T19): it stops handing out batches, waits (at most
     `timeout` seconds) for the fetch in flight, and shuts the loader's workers down. The round
@@ -658,7 +691,7 @@ class DevicePrefetch:
 
     def __init__(self, src, dev, side=True, stop=None):
         self.src, self.dev, self.side, self.stop = src, dev, bool(side), stop
-        self._it = self._fut = None
+        self._it = self._fut = self._worker = None
         self._closed = False
         self.clean = None           # after close(): True when nothing was still running
 
@@ -688,14 +721,17 @@ class DevicePrefetch:
                 yield item
             return
         stream = torch.cuda.Stream(self.dev) if self.side else None
-        self._fut = _spawn(lambda: self._fetch(stream))
+        self._worker = _Fetcher()
+        fetch = self._fetch
+        self._fut = self._worker.submit(lambda: fetch(stream))
         while not self._closed:
             got = self._wait()
             if got is None or self._closed:
                 self._fut = None
                 return
-            self._fut = _spawn(lambda: self._fetch(stream))
+            self._fut = self._worker.submit(lambda: fetch(stream))
             cur, ev = got
+            got = None
             if ev is not None:
                 torch.cuda.current_stream(self.dev).wait_event(ev)
                 for v in cur.values():
@@ -731,6 +767,9 @@ class DevicePrefetch:
                 clean = False
             except Exception:  # noqa: BLE001  -- a failing last fetch is not the transition's problem
                 pass
+        w = getattr(self, "_worker", None)
+        if w is not None:
+            w.stop()                # after the fetch in flight; a stuck one keeps its daemon thread
         _shutdown_loader(self.src, self._it)
         self.clean = clean
         return clean
