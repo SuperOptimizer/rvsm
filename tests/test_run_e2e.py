@@ -63,7 +63,7 @@ def run_cfg(region_cfg, fake_teacher, tmp_path, has_volcomp):
     return replace(region_cfg,
                    out=str(tmp_path / "e2e"), teacher_ckpts={"fake": fake_teacher.ckpt},
                    mode="cpu", gpus=(), rounds=2, steps=20, eval_every=5,
-                   verso_after_steps=5, round_steps=10, heldout=1, workers=0,
+                   verso_after_steps=5, verso_min_dice=0.0, round_steps=10, heldout=1, workers=0,
                    min_regions_before_train=2, lookahead_extra=2, reserve_gb=0.001,
                    infer_window=64, infer_halo=8, cascade_depth=1, calibrate=True,
                    aff_offsets=(4, 8, 16))
@@ -164,7 +164,7 @@ def test_rvsm_stop_ends_the_run_within_one_unit(region_cfg, fake_teacher, tmp_pa
         pytest.skip("a region store is a volcomp array; no libvolcomp on this host")
     cfg = replace(region_cfg, out=str(tmp_path / "stopme"),
                   teacher_ckpts={"fake": fake_teacher.ckpt}, mode="cpu", gpus=(), rounds=1,
-                  steps=10000, eval_every=1, verso_after_steps=0, round_steps=10 ** 9,
+                  steps=10000, eval_every=1, verso_after_steps=0, verso_min_dice=0.0, round_steps=10 ** 9,
                   heldout=1, workers=0, min_regions_before_train=1, reserve_gb=0.001,
                   infer_window=64, infer_halo=8, cascade_depth=1)
     box = {}
@@ -335,8 +335,12 @@ def test_the_verso_gate_needs_the_dice_and_the_betti_baseline(small_cfg):
     assert RUN.verso_gate(cfg, "", 10, lambda: called.append(1) or good, screen=0.55)[0] is True
     assert called == [1]                       # near the gate: the held-out pass decides
     called = []
-    ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [])   # the fallback
+    ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [], screen=0.35)  # the fallback
     assert ok and why["why"] == "verso_after_steps"
+    # ... which still needs the eval's fine-rung dice at verso_min_dice: a garbage recto never flips
+    ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [], screen=0.07)
+    assert not ok and "verso_min_dice" in why["why"] and why["verso_min_dice"] == 0.3
+    assert not RUN.verso_gate(cfg, "", 1000, lambda: [], screen=None)[0]
     assert not called, "the fallback must not pay for a student pass it does not need"
 
 

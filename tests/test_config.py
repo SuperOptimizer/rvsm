@@ -22,7 +22,8 @@ def test_rung_item_keys_are_frozen():
 def test_fingerprint_ignores_only_the_resume_fields():
     a = Config(ct="x")
     assert a.fingerprint() == Config(ct="x", steps=99, eval_every=7, workers=1, gpus=(1, 2),
-                                     rounds=9, ct_seed="/m", ckpt_act=0, compile=False).fingerprint()
+                                     rounds=9, ct_seed="/m", ckpt_act=0, compile=False,
+                                     verso_min_dice=0.9).fingerprint()
     assert a.fingerprint() != Config(ct="x", patch=128).fingerprint()
     assert a.fingerprint() != Config(ct="y").fingerprint()
 

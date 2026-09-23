@@ -1022,16 +1022,24 @@ def verso_gate(cfg, out, step, rows_fn=None, screen=None):
 
     Pass when the pooled dice over the held-out regions is at least `verso_gate_dice` AND the betti0
     error is no worse than the reference-against-itself baseline by more than the bootstrap CI's width
-    -- or unconditionally at `verso_after_steps`, which is the fallback the plan gives the gate so a
-    run can never stall on it.
+    -- or at `verso_after_steps`, the fallback the plan gives the gate so a run cannot stall on a
+    held-out comparison, PROVIDED the evaluation's fine-rung dice (`screen`) has reached
+    `verso_min_dice`: a verso pass from a student that cannot yet find the recto writes garbage verso
+    labels (paris4: dice 0.15 -> 0.07 over steps 4000-8000, the fallback due at 10000). Without an
+    evaluation at that step the fallback waits too.
 
     `screen` is the evaluation's own fine-rung dice at this step (`eval_dice`): the validation grid is
     tiles of the SAME held-out regions scored against the SAME round-0 stores, so while it is more than
     `GATE_SCREEN` below `verso_gate_dice` the held-out pass cannot pass and is not paid for. That pass
     is two student region passes plus two streamed `compare_stores` in the trainer, ~13 min on tnr-0
     (paris4 step 2000: dice 0.10 against a 0.6 gate)."""
+    floor = float(getattr(cfg, "verso_min_dice", 0.0))
     if int(step) >= int(cfg.verso_after_steps):
-        return True, {"why": "verso_after_steps", "step": int(step)}
+        if screen is None or not np.isfinite(screen) or float(screen) < floor:
+            return False, {"why": "verso_after_steps reached, but the eval's fine-rung dice is below "
+                                  "verso_min_dice: waiting", "eval_dice": screen, "verso_min_dice": floor,
+                           "step": int(step)}
+        return True, {"why": "verso_after_steps", "step": int(step), "eval_dice": float(screen)}
     need = float(getattr(cfg, "verso_gate_dice", 0.6))
     if screen is not None and np.isfinite(screen) and float(screen) < need - GATE_SCREEN:
         return False, {"why": "eval dice below the gate", "eval_dice": float(screen),

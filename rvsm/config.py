@@ -151,7 +151,7 @@ RUNG_ITEM_KEYS = ("ct", "tgt", "w", "lo", "cyx", "sym", "rung", "norm", "cm", "c
 
 # Fields a resume is allowed to differ in: a longer run, a different eval cadence, different hardware.
 FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_seed", "ckpt_act", "compile",
-                       "vram_train_gb", "vram_produce_gb", "pin_memory", "gpu_prefetch")
+                       "vram_train_gb", "vram_produce_gb", "pin_memory", "gpu_prefetch", "verso_min_dice")
 
 
 @dataclass
@@ -235,6 +235,7 @@ class Config:
     # ------------------------------------------------------------------ fixed recipe: rounds + inference
     verso_source: str = "flip"         # verso stores come from the student run with the radial sign flipped
     verso_after_steps: int = 10000     # round-0 verso starts here if the gate has not already fired
+    verso_min_dice: float = 0.3        # ... and even then only once the eval's fine-rung dice reaches this
     verso_gate_dice: float = 0.6       # ... or earlier, once the held-out recto reaches this dice
     eval_every: int = 2000             # held-out evaluation cadence, in steps
     calibrate: bool = True             # refit the temperatures after every eval
