@@ -1123,6 +1123,37 @@ def read_cursor(out):
     return min(vals) if vals else 0
 
 
+def walk_snapshot(out, round_=None):
+    """The sampler workers' walk positions, from their cursor files: `{"stride", "round", "workers":
+    {w: {"pos", "done", "pass"}}}`, or None when there are none. Written into state.json at every
+    checkpoint so a resume continues the walk where the checkpoint left it (`WalkPatches(start=)`)."""
+    d = cursor_dir(out)
+    ws, stride = {}, None
+    for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        r = _read_json(os.path.join(d, n))
+        if not r or not isinstance(r.get("pos"), int):
+            continue
+        stride = int(r.get("stride", 1))
+        ws[str(int(r.get("worker", 0)))] = {"pos": int(r["pos"]), "done": list(r.get("done") or []),
+                                            "pass": int(r.get("pass", 0))}
+    if not ws:
+        return None
+    return {"stride": stride, "round": None if round_ is None else int(round_), "workers": ws}
+
+
+def resume_walk(out, round_):
+    """The walk a resumed trainer starts from: the snapshot the last checkpoint wrote into state.json,
+    else (a run older than the snapshot) the workers' own cursor files -- never position 0 when the
+    run has been somewhere. None for a new round (its walk starts over) or a fresh run."""
+    st = read_state(out)
+    w = st.get("walk")
+    if w and (w.get("round") is None or int(w["round"]) == int(round_)):
+        return w
+    if int(st.get("round", 0)) == int(round_):
+        return walk_snapshot(out, round_)
+    return None
+
+
 def read_cursor_head(out):
     """The walk position of the FASTEST sampler worker's next visit: worker w of W at its own position
     p is at `p * W + w` of the shared walk. The producer's window must reach past this one too."""
@@ -1430,7 +1461,7 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
         """Every `eval_every` steps: publish the state, honour STOP and PHASE, run the two gates."""
         step = int(info["step"])
         write_state(out, step=step, round=state["round"], cursor=read_cursor(out),
-                    region_s=region_seconds(out),
+                    region_s=region_seconds(out), walk=walk_snapshot(out, state["round"]),
                     verso_on=bool(read_state(out).get("verso_on", False)))
         if stop_requested(out):
             jlog(out, "sched", {"kind": "stop", "step": step})
@@ -1474,16 +1505,21 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                 # producer's window past the positions the new sampler asks for first (a deadlock
                 # the end-to-end test hit whenever those regions fell outside the old window)
                 shutil.rmtree(cursor_dir(out), ignore_errors=True)
-                write_state(out, round=nxt, teacher=tp, round_step=step, cursor=0)
+                write_state(out, round=nxt, teacher=tp, round_step=step, cursor=0, walk=None)
                 jlog(out, "sched", {"kind": "round", "round": nxt, "teacher": tp, "step": step})
                 return True
         return False
+
+    resume_now = {"on": bool(resume)}
 
     def patches_factory():
         ds = walk_patches()(cfg, out, root=out, ct=ctx["ct"], ax=ctx["ax"], round_=state["round"],
                             heldout=ctx["heldout"], meta=ctx["meta5"],
                             region_records=walk_records(ctx["records"], ctx["heldout"]),
-                            lookahead_n=lookahead(cfg, out, k_active))
+                            lookahead_n=lookahead(cfg, out, k_active),
+                            start=(resume_walk(out, state["round"]) if resume_now["on"] else None))
+        # every later loader resumes too: a new round's walk=None and empty cursor dir give None there
+        resume_now["on"] = True
         return sample.loader(ds, workers=cfg.workers, batch=cfg.batch, pin_memory=cfg.pin_memory)
 
     ck = ckpt

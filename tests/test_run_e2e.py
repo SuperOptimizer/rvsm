@@ -508,3 +508,76 @@ def test_tree_rss_counts_this_process_and_its_children():
         assert n2 > n1 and both > me + (48 << 20)
     finally:
         p.kill()
+
+
+def _stub_walk(out, n=40, start=None, L=3, dead=(), wait_until=None):
+    """A WalkPatches over `n` synthetic visits whose windows are just the visit ids (one per visit)."""
+    from rvsm.walk import WalkPatches
+    ds = WalkPatches.__new__(WalkPatches)
+    ds.out, ds.L, ds.wait_s, ds.start = str(out), L, 0.0, start
+    ds.windows, ds.seed, ds.round, ds.root = 1, 0, 0, str(out)
+    ds.pyr = object()
+    ds.visits = [{"k": 2, "lo": [i * 128, 0, 0], "size": [128] * 3, "id": i} for i in range(n)]
+    ds.order = list(range(n))[::-1]
+    ds.cfg = type("C", (), {"region": 128})()
+
+    class Cat:
+        def __init__(self, *a):
+            pass
+
+        def done(self, ch, lo):
+            return True                      # no verso revisits in this test
+    ds.cat = Cat()
+    ds._dead = lambda rec: rec["id"] in dead
+    ds._visitable = lambda rec: wait_until is None or rec["id"] not in wait_until
+    ds.air_budget = lambda: 1
+    ds._last_air = 0
+    ds._draw = lambda rng, rec, air_ok=True: rec["id"]
+    return ds
+
+
+def test_a_resumed_walk_continues_where_the_checkpoint_left_it(tmp_path):
+    """The standing rule: a restart never repeats training data. The walk position the workers
+    publish is snapshotted into state.json at every checkpoint; a resumed sampler starts there (and
+    skips the visits it had already made past it) instead of at 0, and the producer's window follows."""
+    import itertools
+    out = tmp_path / "wk"
+    os.makedirs(out / "logs")
+    first = list(itertools.islice(iter(_stub_walk(out, dead={37})), 12))
+    assert first == [39, 38, 36, 35, 34, 33, 32, 31, 30, 29, 28, 27]     # order reversed, 37 dead
+    snap = RUN.walk_snapshot(str(out), 0)
+    assert snap["stride"] == 1 and snap["workers"]["0"]["pos"] == 13
+    RUN.write_state(str(out), round=0, walk=snap)
+    assert RUN.resume_walk(str(out), 0) == snap
+    # the resumed walk starts at the saved position: nothing from the first run comes again
+    again = list(itertools.islice(iter(_stub_walk(out, dead={37}, start=RUN.resume_walk(str(out), 0))), 27))
+    assert again[0] == 26 and not set(again) & set(first)
+    assert sorted(first + again) == [i for i in range(40) if i != 37]    # the same visits, once each
+    # the producer's window follows the restored walk: a resumed worker publishes its saved position
+    # before its first window, and the window over the walk starts there, not at 0
+    it = iter(_stub_walk(out, dead={37}, start=snap))
+    assert next(it) == 26                                    # the visit at the saved 13 starts
+    assert RUN.read_cursor(str(out)) == 14 and RUN.read_cursor_head(str(out)) == 14
+    route = [(i,) for i in range(40)]
+    win = RUN._window(route, {(i,): i for i in range(40)}, RUN.read_cursor(str(out)), 3, [],
+                      head=RUN.read_cursor_head(str(out)))
+    assert win == [(i,) for i in range(14, 18)]
+    # a new round walks from 0; a different worker count ignores the snapshot
+    assert RUN.resume_walk(str(out), 1) is None
+    assert list(itertools.islice(iter(_stub_walk(out, start={**snap, "stride": 6})), 1)) == [39]
+
+
+def test_a_resumed_walk_skips_what_it_visited_past_a_waiting_region(tmp_path):
+    """A visit that waited for its store leaves the saved `pos` behind it; the ones visited past it
+    are in `done` and are not visited again after the restart."""
+    import itertools
+    out = tmp_path / "wk2"
+    os.makedirs(out / "logs")
+    it = iter(_stub_walk(out, L=4, wait_until={39}))
+    got = [next(it) for _ in range(2)]                  # 39 waits for its store: 38, 37 go first
+    assert got == [38, 37]
+    snap = RUN.walk_snapshot(str(out), 0)
+    assert snap["workers"]["0"]["pos"] == 0 and 38 not in snap["workers"]["0"]["done"]
+    assert snap["workers"]["0"]["done"] == [1, 2]
+    after = list(itertools.islice(iter(_stub_walk(out, L=4, start=snap)), 6))
+    assert after[0] == 39 and 38 not in after and 37 not in after
