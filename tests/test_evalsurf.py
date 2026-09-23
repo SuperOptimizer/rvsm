@@ -160,3 +160,66 @@ def test_evaluate_with_only_a_reference_store():
     assert out["box"] == [0, 0, 0, 32, 32, 32]
     assert out["vs_store"]["dice"] == pytest.approx(1.0)
     assert "metrics" not in out                        # no tifxyz -> no mesh suite, and no pretending
+
+
+class _Lazy:
+    """A store stand-in that records every read, so a test can see how much of it was ever whole."""
+
+    def __init__(self, v):
+        self.v, self.shape, self.ndim, self.reads = v, v.shape, v.ndim, []
+
+    def __getitem__(self, sl):
+        blk = self.v[sl]
+        self.reads.append(blk.size)
+        return blk
+
+
+def _sheets(n=96, seed=0):
+    """Two wavy sheets, the second with a hole: something with components, loops and a broken skeleton."""
+    zz, yy, xx = np.mgrid[:n, :n, :n]
+    a = (np.abs(yy - (n * 0.3 + 4 * np.sin(xx / 9.0))) < 2.5) | (np.abs(yy - (n * 0.7 + 3 * np.cos(zz / 7.0))) < 2.5)
+    b = a.copy()
+    b[n // 3:n // 2, :, n // 3:n // 2] = False
+    rng = np.random.default_rng(seed)
+    b |= rng.random(a.shape) > 0.9995                  # specks: extra components
+    return _u8(a), _u8(b)
+
+
+def test_compare_stores_in_blocks_keeps_the_whole_volume_counts():
+    """Dice, overlap, precision and skeleton recall do not depend on the block size (the halo makes the
+    band and the skeleton exact on every core); one block IS the whole-volume comparison."""
+    a, b = _sheets()
+    whole = E.compare_stores(a, b, margin=4, block=10 ** 6)
+    assert whole["betti_blocks"] == 1
+    for blk in (32, 40):
+        m = E.compare_stores(a, b, margin=4, block=blk)
+        assert m["betti_blocks"] > 1
+        for k in ("dice", "overlap", "precision", "skel_recall", "n_ref", "n_pred", "skel_vox",
+                  "betti_interior_vox"):
+            assert m[k] == pytest.approx(whole[k]), k
+        assert m["betti0_err"] >= 1                    # the specks are still charged, block by block
+        assert m["erl_vox"] <= whole["erl_vox"] + 1e-9  # a block face can only cut a run
+    same = E.compare_stores(a, a, margin=4, block=32)
+    assert same["dice"] == 1.0 and same["betti0_err"] == 0 and same["betti1_err"] == 0
+
+
+def test_compare_stores_streams_the_reference_and_stays_small():
+    """The gate's comparison reads the reference store block by block (never whole) and its peak
+    allocation is a few blocks, not a few copies of the volume -- the whole-region float64 EDTs, int32
+    labels and float32 skeleton stacks are what OOMed the 64 GB production host."""
+    import tracemalloc
+    n, blk = 128, 32
+    a, b = _sheets(n)
+    ref = _Lazy(a)
+    tracemalloc.start()
+    E.compare_stores(ref, b, margin=4, block=blk)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert max(ref.reads) <= (blk + 2 * 8) ** 3, "a read bigger than one haloed block"
+    assert sum(ref.reads) < 3 * a.size                  # each voxel read about once (plus halos)
+    # bounded by the haloed BLOCK (~45 bytes a voxel of it: the EDT's feature transform and distances,
+    # the labels), not by the volume: the whole-volume version held >= 20 bytes a voxel of the VOLUME
+    # (float64 EDT + int32 feature transform), 40 MB here
+    halo = 8
+    assert peak < 64 * (blk + 2 * halo) ** 3, f"peak {peak / 2 ** 20:.1f} MB"
+    assert peak < 4 * a.size, f"peak {peak / 2 ** 20:.1f} MB for a {a.size / 2 ** 20:.1f} Mvox volume"

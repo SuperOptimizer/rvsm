@@ -933,9 +933,18 @@ def heldout_rows(cfg, out, ckpt, held, ax, meta5=None, round_=0, device=None, n=
                  ct=None):
     """`compare_stores` of the student's own recto against the round-0 reference, per held-out region.
 
-    Each row also carries the reference against ITSELF (`base_*`), which is the only honest baseline
-    for a topological error: a betti0 error of 3 means nothing until you know what the reference scores
-    against a perfect copy of itself."""
+    Each row also carries the reference against ITSELF (`base_*`), the baseline a topological error is
+    read against. With `compare_stores`' default `betti_dilate = 0` the reference compared with itself
+    is the same bool volume twice, so that baseline is exactly zero error at the reference's own Betti
+    numbers: it is written down from the reference's side of the one comparison instead of paying for a
+    second one.
+
+    HOST MEMORY. This runs in the trainer, beside six loader workers and the producer, on a 64 GB host
+    (paris4 step 2000 OOMed it here). So: the student pass stays on the card (`as_tensor`, cascade
+    included) and only its uint8 recto crosses to the host (1 GB for 1024^3); the reference store is
+    never read whole -- `compare_stores` streams it in haloed blocks; and each region's arrays are
+    dropped before the next one starts. Peak: ~1 GB plus one block's working set (~1 GB)."""
+    import torch
     from rvsm import evalsurf as EV, infer, stores
     rows = []
     stu = None
@@ -944,16 +953,24 @@ def heldout_rows(cfg, out, ckpt, held, ax, meta5=None, round_=0, device=None, n=
         p = stores.store_path(out, "recto", lo, 0)
         if not stores.is_done(p):
             continue
-        ref = np.asarray(stores.open_store(p)[:], np.uint8)
+        ref = stores.open_store(p)               # lazy: read block by block by `compare_stores`
+        shape = tuple(int(v) for v in ref.shape[-3:])
         if stu is None:
             stu = infer.student_fn(ckpt, device=device, compile=False)
-        planes = infer.student_region(stu, ct or cfg.ct, ax, lo, ref.shape, sign=1.0,
-                                      heads=[str(stu.layout.channels[0])], meta=meta5)
-        pred = stores.u8(planes[str(stu.layout.channels[0])])
-        r = EV.compare_stores(ref, pred)
-        b = EV.compare_stores(ref, ref)
-        rows.append({"region": list(lo), **r, **{f"base_{k}": v for k, v in b.items()
-                                                 if k.startswith("betti") or k == "euler"}})
+        head = str(stu.layout.channels[0])
+        planes = infer.student_region(stu, ct or cfg.ct, ax, lo, shape, sign=1.0, heads=[head],
+                                      meta=meta5, as_tensor=True)
+        pred = infer.u8_t(planes[head]).cpu().numpy()
+        del planes
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        r = EV.compare_stores(ref, pred, device=(device if str(device or "cpu") != "cpu" else None))
+        del pred, ref
+        base = {k: r[k] for k in r if k.startswith("betti") or k == "euler"}
+        base.update({"betti0": r["betti0_ref"], "betti1": r["betti1_ref"], "betti2": r["betti2_ref"],
+                     "euler": r["euler_ref"], "betti0_err": 0, "betti1_err": 0,
+                     "betti0_err_norm": 0.0, "betti1_err_norm": 0.0})
+        rows.append({"region": list(lo), **r, **{f"base_{k}": v for k, v in base.items()}})
     return rows
 
 

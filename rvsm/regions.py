@@ -301,26 +301,51 @@ class Catalog:
 # --------------------------------------------------------------------------- pooling a region
 
 _POOL = {}     # {(path, k): ndarray} -- the pooled views of a region store, built once per loader
+POOL_BYTES = 256 << 20   # ... and at most this many bytes of them per process (LRU)
+POOL_SLAB = 64           # z-planes of OUTPUT per slab when a whole store is pooled
 
 
-def pooled(root, channel, lo, k, round_=0, cache=_POOL, limit=64):
+def pool_store(a, d, slab=POOL_SLAB):
+    """The whole region store `a` mean-pooled 2^d (`ladder.pool2` d times), read in z-slabs.
+
+    Byte-identical to reading the store whole and pooling it (a slab is a multiple of 2^d planes, so
+    only the last one can meet `pool2`'s end padding, exactly as the whole volume would), but the
+    transient is one slab -- 64 << d planes, 128 MB for a rung-3 pool of a 1024^3 store -- instead of the
+    1 GB store plus its pooling copies. Six loader workers each holding that 3-4 GB transient at once
+    was a ~20 GB host-RAM spike on the 64 GB production host."""
+    from rvsm import ladder
+    d = int(d)
+    S = tuple(int(v) for v in a.shape[-3:])
+    step = int(slab) << d
+    parts = []
+    for z in range(0, S[0], step):
+        v = np.asarray(a[z:min(z + step, S[0])], np.uint8)
+        for _ in range(d):
+            v = ladder.pool2(v)
+        parts.append(v)
+    return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
+def pooled(root, channel, lo, k, round_=0, cache=_POOL, limit=64, max_bytes=None):
     """The rung-2 region store of `channel` at `lo`, mean-pooled 2^(k-2) to rung k (3 <= k <= 6).
 
     A per-region mini-pyramid WRITTEN into the store group would make a store more than one array and
     give a finished store a way to be half-updated; pooling on the fly keeps the one-array contract and
-    costs a few hundred microseconds per region per rung, once, because the result is cached. Returns
+    costs a few hundred microseconds per region per rung, once, because the result is cached (at most
+    `limit` entries and `max_bytes` -- `POOL_BYTES` -- bytes, least recently used out first). Returns
     None when the store is not finished."""
     k = int(k)
     p = stores.store_path(root, channel, lo, round_)
     key = (p, k)
     if key in cache:
-        return cache[key]
+        v = cache.pop(key)
+        cache[key] = v                   # most recently used last
+        return v
     if not stores.is_done(p):
         return None
-    v = np.asarray(stores.open_store(p)[:], np.uint8)
-    for _ in range(k - 2):
-        v = ladder.pool2(v)
-    if len(cache) >= int(limit):
+    v = pool_store(stores.open_store(p), k - 2)
+    cap = int(POOL_BYTES if max_bytes is None else max_bytes)
+    while cache and (len(cache) >= int(limit) or sum(x.nbytes for x in cache.values()) + v.nbytes > cap):
         cache.pop(next(iter(cache)))
     cache[key] = v
     return v

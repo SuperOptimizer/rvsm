@@ -531,11 +531,22 @@ def _skel_runs(skel, good):
     return np.bincount(lab.ravel())[1:].astype(np.float64), tot
 
 
-def compare_stores(a_u8, b_u8, thr=0.5, margin=8, skel_iters=4, betti_band=6, betti_dilate=0.0):
+COMPARE_BLOCK = 256   # the edge of one `compare_stores` block, in voxels
+
+
+def _blocks(lo, hi, n):
+    """[(start, stop)] tiling [lo, hi) in steps of `n` (the last one short)."""
+    return [(a, min(a + int(n), int(hi))) for a in range(int(lo), int(hi), int(n))]
+
+
+def compare_stores(a_u8, b_u8, thr=0.5, margin=8, skel_iters=4, betti_band=6, betti_dilate=0.0,
+                   block=COMPARE_BLOCK, device=None):
     """Compare two probability volumes of the same box -- a held-out region's reference store and a
     prediction of it -- without any mesh.
 
-    `a_u8` is the REFERENCE. On the interior (`margin` voxels cropped off every face):
+    `a_u8` is the REFERENCE. Either argument may be a numpy array or anything sliceable like one (an
+    open zarr store is read block by block, never whole). On the interior (`margin` voxels cropped off
+    every face):
 
         dice        2|A and B| / (|A| + |B|)
         overlap     |A and B| / |A|, i.e. how much of the reference the prediction covers
@@ -543,33 +554,105 @@ def compare_stores(a_u8, b_u8, thr=0.5, margin=8, skel_iters=4, betti_band=6, be
         betti*_err  `betti_error` of B against A, in a band around A (A is already a thick band, so the
                     default `dilate` is 0: unlike a mesh it needs no thickening)
         erl_vox     an ERL along A's own SKELETON (`losses.skeleton`, the same construction the training
-                    loss uses, on the CPU): the skeleton is cut where B does not cover it, and
-                    sum(L^2)/sum(L) over the surviving 26-connected pieces is the expected length of the
-                    piece containing a skeleton voxel drawn uniformly. `erl_frac` is that as a fraction
-                    of the whole skeleton, so 1.0 means "no break anywhere".
-    """
+                    loss uses): the skeleton is cut where B does not cover it, and sum(L^2)/sum(L) over
+                    the surviving 26-connected pieces is the expected length of the piece containing a
+                    skeleton voxel drawn uniformly. `erl_frac` is that as a fraction of the whole
+                    skeleton, so 1.0 means "no break anywhere".
+
+    STREAMED IN BLOCKS. The interior is tiled into `block`^3 cores; each core is read with a halo wide
+    enough that the band (an EDT within `betti_band`), the dilation and the skeleton (`skel_iters + 1`
+    pooling ops) are exact on the core, so dice / overlap / precision / skel_recall are the
+    whole-volume numbers. Only bool/uint8 blocks of (block + 2 halo)^3 are ever alive, which is what
+    lets the verso gate run beside production on a 64 GB host (the whole-region version held a dozen
+    1 GB+ temporaries -- float64 EDTs, int32 labels, float32 skeleton stacks -- and OOMed tnr-0 at
+    paris4 step 2000). Two numbers become PER-BLOCK sums, because a connected component is counted
+    inside each block: the Betti numbers (and their errors, summed as |error| per block, so a block's
+    extra piece cannot cancel another block's missing one) and the ERL runs, which a block face cuts.
+    A volume no larger than one block is one block, and then every number is the old whole-volume one.
+    `device` runs the skeleton's pooling there (a CUDA card is ~50x the CPU)."""
     import torch
+    from scipy import ndimage as ndi
     from rvsm import losses as L
-    a = np.asarray(a_u8, np.uint8)
-    b = np.asarray(b_u8, np.uint8)
-    assert a.shape == b.shape, (a.shape, b.shape)
-    s = tuple(slice(margin, -margin if margin else None) for _ in range(3))
-    ab, bb = a[s] >= int(round(thr * 255)), b[s] >= int(round(thr * 255))
-    na, nb, ni = int(ab.sum()), int(bb.sum()), int((ab & bb).sum())
+    S = tuple(int(v) for v in a_u8.shape[-3:])
+    assert S == tuple(int(v) for v in b_u8.shape[-3:]), (a_u8.shape, b_u8.shape)
+    t8 = int(round(thr * 255))
+    m = int(margin)
+    lo, hi = [m] * 3, [s - m for s in S]
+    halo = int(max(np.ceil(max(float(betti_band), float(betti_dilate))) + 1, int(skel_iters) + 2))
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    na = nb = ni = 0
+    bsum = {"betti0": 0, "betti1": 0, "betti2": 0, "euler": 0, "betti0_ref": 0, "betti1_ref": 0,
+            "betti2_ref": 0, "euler_ref": 0, "betti0_err": 0, "betti1_err": 0}
+    interior, nblk = 0, 0
+    tot = hit = 0
+    l2 = 0.0
+
+    def rd(v, sl):
+        if v.ndim > 3:
+            return np.asarray(v[(0,) * (v.ndim - 3) + sl], np.uint8)
+        return np.asarray(v[sl], np.uint8)
+
+    for z0, z1 in _blocks(lo[0], hi[0], block):
+        for y0, y1 in _blocks(lo[1], hi[1], block):
+            for x0, x1 in _blocks(lo[2], hi[2], block):
+                c0, c1 = (z0, y0, x0), (z1, y1, x1)
+                h0 = tuple(max(c - halo, l) for c, l in zip(c0, lo))
+                h1 = tuple(min(c + halo, h) for c, h in zip(c1, hi))
+                hs = tuple(slice(a, b) for a, b in zip(h0, h1))
+                cs = tuple(slice(a - h, b - h) for a, b, h in zip(c0, c1, h0))
+                A = rd(a_u8, hs) >= t8
+                B = rd(b_u8, hs) >= t8
+                ab, bb = A[cs], B[cs]
+                interior += int(ab.size)
+                nblk += 1
+                ka, kb = int(ab.sum()), int(bb.sum())
+                na, nb = na + ka, nb + kb
+                if ka and kb:
+                    ni += int((ab & bb).sum())
+                if not A.any():
+                    continue        # no reference within reach: an empty band, no skeleton
+                # ---- topology, in the band around the reference, counted on the core
+                if betti_band > 0 or betti_dilate > 0:
+                    d = ndi.distance_transform_edt(~A)
+                    band = (d <= float(betti_band)) if betti_band > 0 else np.ones_like(A)
+                    r = (d <= float(betti_dilate)) if betti_dilate > 0 else A
+                    del d
+                else:
+                    band, r = np.ones_like(A), A
+                p_, r_ = (B & band)[cs], (r & band)[cs]
+                del band, r
+                p0, p1, p2, pc = betti(p_)
+                r0, r1, r2, rc = betti(r_)
+                del p_, r_
+                for k, v in (("betti0", p0), ("betti1", p1), ("betti2", p2), ("euler", pc),
+                             ("betti0_ref", r0), ("betti1_ref", r1), ("betti2_ref", r2),
+                             ("euler_ref", rc), ("betti0_err", abs(p0 - r0)),
+                             ("betti1_err", abs(p1 - r1))):
+                    bsum[k] += int(v)
+                # ---- the reference's skeleton, cut where the prediction does not cover it
+                with torch.no_grad():
+                    t = torch.from_numpy(A).to(dev, torch.float32)[None, None]
+                    sk = (L.skeleton(t, iters=int(skel_iters), thr=0.5)[0, 0] > 0.5).cpu().numpy()[cs]
+                    del t
+                rl, n = _skel_runs(sk, bb)
+                tot += n
+                hit += int(rl.sum())
+                l2 += float((rl ** 2).sum())
+                del A, B, sk
     out = {"dice": (2.0 * ni / (na + nb)) if (na + nb) else 1.0,
            "overlap": (ni / na) if na else float("nan"),
            "precision": (ni / nb) if nb else float("nan"),
-           "n_ref": na, "n_pred": nb, "margin": int(margin)}
-    out.update({k: v for k, v in betti_error(bb, ab, margin=0, band=betti_band,
-                                             dilate=betti_dilate).items()
-                if k.startswith("betti") or k == "euler"})
-    t = torch.from_numpy(np.ascontiguousarray(a[s], np.float32) / 255.0)[None, None]
-    sk = L.skeleton(t, iters=int(skel_iters), thr=thr)[0, 0].numpy() > 0.5
-    rl, tot = _skel_runs(sk, bb)
+           "n_ref": na, "n_pred": nb, "margin": m}
+    out.update(bsum)
+    out.update({"betti0_err_norm": bsum["betti0_err"] / max(bsum["betti0_ref"], 1),
+                "betti1_err_norm": bsum["betti1_err"] / max(bsum["betti1_ref"], 1),
+                "betti_margin": 0, "betti_band": float(betti_band),
+                "betti_dilate": float(betti_dilate), "betti_interior_vox": int(interior),
+                "betti_blocks": int(nblk), "compare_block": int(block)})
     out["skel_vox"] = tot
-    out["erl_vox"] = float((rl ** 2).sum() / tot) if tot else 0.0
+    out["erl_vox"] = float(l2 / tot) if tot else 0.0
     out["erl_frac"] = float(out["erl_vox"] / tot) if tot else 0.0
-    out["skel_recall"] = float((sk & bb).sum() / tot) if tot else float("nan")
+    out["skel_recall"] = float(hit / tot) if tot else float("nan")
     return out
 
 

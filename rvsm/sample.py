@@ -307,7 +307,9 @@ class Patches(torch.utils.data.IterableDataset):
 
         A rung-3 window reads 512^3 voxels of the rung-2 store to pool them, so every window of a
         visit re-decoded ~8x its own size; the whole region pooled once is 128 MB a channel. Only the
-        current region's pools are kept (a new region drops them)."""
+        current region's pools are kept (a new region drops them), so a worker holds at most one region's
+        rung-3 pools, one visit's context super-cubes (`_ctx_cube`) and `regions.POOL_BYTES` of rung 4-6
+        pools at any time."""
         key = (str(chan), tuple(int(v) for v in r))
         if getattr(self, "_p3key", None) != key[1]:
             self._p3key, self._p3 = key[1], {}
@@ -315,9 +317,8 @@ class Patches(torch.utils.data.IterableDataset):
             a = self.cat.open(chan, r)
             if a is None:
                 return None
-            S = np.array(a.shape[-3:], np.int64)
-            v, _ins = stores.read_store(a, 3, np.asarray(r, np.int64) >> 1, S >> 1)
-            self._p3[key] = v
+            # in z-slabs: reading the 1 GB store whole to pool it was a 3-4 GB transient per worker
+            self._p3[key] = RG.pool_store(a, 1)
         return self._p3[key]
 
     def _near_axis(self, k, lo, shape):

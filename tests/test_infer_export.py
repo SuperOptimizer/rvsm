@@ -577,6 +577,26 @@ def test_cascade_for_at_depth_one_is_the_coarse_pass_upsampled(student_env):
                   - infer.crop_pad(casc, o, (WIN,) * 3)).max() < 1e-6
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the device cascade needs a CUDA card")
+def test_a_cuda_region_keeps_its_cascade_on_the_card(student_env):
+    """On a card the cascade is an fp16 tensor that never visits the host (the host float32 upsample
+    and crop were 12 GB RSS peaks per 1024^3 region), and every window's cascade plane is the CPU
+    path's to fp16 precision."""
+    e = student_env
+    cfg, L, ax = e.cfg, e.layout, e.ax
+    lo, size = (0, 64, 0), (128, 128, 128)
+    head0 = lambda k: _head0_of  # noqa: E731
+    cpu = _student_inputs(cfg, ax, e.meta, lo, size, cascade_depth=2, head0=head0)
+    gpu = infer.StudentInputs(cfg.ct, ax, lo, size, L, meta=e.meta, rung=2, ctx=cfg.ctx, window=WIN,
+                              halo=HALO, cascade_depth=2, head0=head0, device="cuda")
+    assert torch.is_tensor(gpu.cascade) and gpu.cascade.is_cuda and gpu.cascade.dtype == torch.float16
+    assert tuple(gpu.cascade.shape) == size
+    assert np.abs(gpu.cascade.float().cpu().numpy() - cpu.cascade).max() < 2e-3
+    for o in (cpu.offs[0], cpu.offs[-1]):
+        a, b = cpu.prep(o)[0, L.i_cas], gpu.prep(o)[0, L.i_cas].cpu()
+        assert float((a - b).abs().max()) < 2e-3
+
+
 # --------------------------------------------------------------------------- #
 # student_fn: the heads, and what the temperature may touch
 # --------------------------------------------------------------------------- #

@@ -107,6 +107,49 @@ def test_pooled_equals_the_numpy_pool(synth_run):
     assert ins.all() and np.array_equal(cube, ref[:8, :8, :8])
 
 
+def test_pool_store_in_slabs_is_the_whole_pool_bit_for_bit():
+    """A whole-store pool read in z-slabs is the same bytes as the whole store pooled at once, odd
+    shapes (pool2's end padding) included -- and no read is bigger than one slab."""
+    rng = np.random.default_rng(3)
+    for shape in ((40, 24, 20), (37, 19, 23)):
+        v = rng.integers(0, 256, shape, dtype=np.uint8)
+        reads = []
+
+        class A:
+            def __init__(self):
+                self.shape = v.shape
+
+            def __getitem__(self, sl):
+                reads.append(v[sl].shape[0])
+                return v[sl]
+
+        for d in (1, 2, 3):
+            want = v
+            for _ in range(d):
+                want = ladder.pool2(want)
+            reads.clear()
+            got = RG.pool_store(A(), d, slab=2)
+            assert np.array_equal(got, want), (shape, d)
+            assert max(reads) <= 2 << d
+
+
+def test_pooled_cache_is_bounded_in_bytes(synth_run):
+    """The per-process pool cache drops its least recently used entries past `max_bytes`: a loader
+    worker's rung 4-6 pools cannot grow with the number of regions it has visited."""
+    lo, a = synth_run.lo[0], synth_run.cfg
+    cache = {}
+    v = RG.pooled(a.out, "recto", lo, 3, cache=cache, max_bytes=1)
+    assert v is not None and len(cache) == 1          # one entry is always kept, even over the cap
+    RG.pooled(a.out, "recto", lo, 4, cache=cache, max_bytes=1)
+    assert list(cache) == [(stores.store_path(a.out, "recto", lo, 0), 4)]
+    big = {}
+    for k in (3, 4, 5):
+        RG.pooled(a.out, "recto", lo, k, cache=big, max_bytes=1 << 30)
+    assert len(big) == 3
+    RG.pooled(a.out, "recto", lo, 3, cache=big, max_bytes=1 << 30)     # a hit moves it to the back
+    assert list(big)[-1][1] == 3
+
+
 def test_feed_coarse_places_the_block_and_sets_coverage(synth_run):
     a = synth_run.cfg
     lo = np.array(synth_run.lo[0], np.int64)

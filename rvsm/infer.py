@@ -198,7 +198,10 @@ class StudentInputs(Inputs):
         # ---- the cascade channel: the rung-(k+1) prediction over this footprint, upsampled
         if cascade is None and self.cascade_depth > 0 and head0 is not None:
             cascade = cascade_for(self._at_rung, self.rung, self.lo, self.size, self.cascade_depth)
-        self.cascade = None if cascade is None else np.ascontiguousarray(cascade, np.float32)
+        if cascade is None or torch.is_tensor(cascade):
+            self.cascade = cascade
+        else:
+            self.cascade = np.ascontiguousarray(cascade, np.float32)
 
     # ---- the top-down cascade ------------------------------------------------------------------
     def _at_rung(self, k1, o1, s1, depth1):
@@ -209,7 +212,11 @@ class StudentInputs(Inputs):
                             cascade_depth=int(depth1), head0=self.head0, device=self.dev,
                             pyr=self.pyr, rmax_um=self.rmax_um, batch=self.batch)
         p = run_region(self.head0(int(k1)), sub, tuple(int(v) for v in s1), self.window, self.halo,
-                       batch=self.batch, planes=1, offs=sub.offs)
+                       batch=self.batch, planes=1, offs=sub.offs,
+                       out_dtype=(torch.float16 if self.dev.type == "cuda" else torch.float32))
+        del sub
+        if self.dev.type == "cuda":
+            return p[0]                  # fp16 on the card: the cascade never visits the host
         return p[0].float().cpu().numpy()
 
     # ---- one window ----------------------------------------------------------------------------
@@ -236,7 +243,12 @@ class StudentInputs(Inputs):
         for i, d in enumerate(self.ctx):
             img[0, 1 + i] = self.ctx_window(d, o).to(out_dtype)
         P.zscore_cubes_(img, self.norm, out_dtype)              # per cube, exactly as the loader's is
-        x[:, L.i_cas] = torch.from_numpy(crop_pad(self.cascade, o, (w, w, w))).to(self.dev).to(out_dtype)
+        if torch.is_tensor(self.cascade):
+            c = self.cascade[o[0]:o[0] + w, o[1]:o[1] + w, o[2]:o[2] + w]
+            x[:, L.i_cas] = 0
+            x[0, L.i_cas, :c.shape[0], :c.shape[1], :c.shape[2]] = c.to(out_dtype)
+        else:
+            x[:, L.i_cas] = torch.from_numpy(crop_pad(self.cascade, o, (w, w, w))).to(self.dev).to(out_dtype)
         lo_w = torch.tensor([[self.lo[a] + int(o[a]) for a in range(3)]], dtype=torch.int64,
                             device=self.dev)
         cyx_w = self.cyx[None, :, o[0]:o[0] + w]
@@ -337,7 +349,15 @@ def crop_pad(a, off, shape):
 
 
 def up2x_np(a):
-    """2x trilinear upsample of a (Z, Y, X) float32 array -- the same interpolation training uses."""
+    """2x trilinear upsample of a (Z, Y, X) float32 array -- the same interpolation training uses.
+
+    A TENSOR stays a tensor on its device, in its own dtype (the kernel accumulates in fp32 either
+    way): a CUDA region pass keeps its cascade on the card. On the host the rung-2 cascade of a 1024^3
+    region was a 5 GB float32 upsample plus a 4 GB crop of it -- 12 GB RSS peaks in the trainer's gate
+    and in every producer student pass."""
+    if torch.is_tensor(a):
+        return F.interpolate(a[None, None], size=tuple(2 * int(q) for q in a.shape), mode="trilinear",
+                             align_corners=False)[0, 0]
     t = torch.from_numpy(np.ascontiguousarray(a, np.float32))[None, None]
     up = F.interpolate(t, size=tuple(2 * int(q) for q in a.shape), mode="trilinear", align_corners=False)
     return up[0, 0].numpy()
@@ -354,7 +374,10 @@ def cascade_for(at_rung, k, o, s, depth, halo=CASCADE_HALO):
     s1 = [(int(v) + 1) // 2 + 2 * halo for v in s]
     up = up2x_np(at_rung(int(k) + 1, o1, s1, int(depth) - 1))
     a = [int(o[i]) - 2 * o1[i] for i in range(3)]
-    return np.ascontiguousarray(up[a[0]:a[0] + int(s[0]), a[1]:a[1] + int(s[1]), a[2]:a[2] + int(s[2])])
+    crop = up[a[0]:a[0] + int(s[0]), a[1]:a[1] + int(s[1]), a[2]:a[2] + int(s[2])]
+    if torch.is_tensor(crop):
+        return crop.contiguous()
+    return np.ascontiguousarray(crop)
 
 
 # --------------------------------------------------------------------------- #
