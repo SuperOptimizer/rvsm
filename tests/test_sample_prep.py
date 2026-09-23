@@ -45,11 +45,12 @@ def test_prepare_channel_order_matches_the_layout():
     L = Config().layout()
     assert (L.i_cas, L.i_radius, L.i_meta, L.i_scale, L.i_rad, L.cin) == (10, 11, 12, 17, 18, 21)
     b = prep.batch1(_fake_item(nctx=L.nctx, p=8, k=5))
-    x, tgt, w = prep.prepare(b, torch.device("cpu"), layout=L)
+    x, tgt, w = prep.prepare(b, torch.device("cpu"), layout=L,
+                             cascade=prep.Cascade("mask", drop=0.0, noise=False))
     assert x.shape == (1, L.cin, 8, 8, 8) and tgt.shape == (1, 4, 8, 8, 8) and w.shape == tgt.shape
     # the image cubes are z-scored, the rest are not
     assert abs(float(x[0, 0].mean())) < 1e-4 and abs(float(x[0, 0].std()) - 1) < 0.05
-    # cascade at 10: the coarse block upsampled 2x, a probability in 0..1
+    # cascade at 10 (the mask source, asked for by name): the coarse block upsampled 2x, in 0..1
     cas = M.up2x(b["cm"][:, None].float() / 255.0, (8, 8, 8))
     assert torch.allclose(x[:, L.i_cas:L.i_cas + 1], cas, atol=1e-6)
     # radius at 11, the five scan planes at 12..16

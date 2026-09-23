@@ -510,3 +510,21 @@ def test_val_png_draws_the_verso_only_once_verso_is_on(full_cfg, tmp_path):
     blue = lambda a: ((a[..., 2] - a[..., 0]) > 60).mean()   # noqa: E731
     assert blue(pred_off) == 0.0 and (pred_off[..., 0] - pred_off[..., 2] > 60).any()   # recto red
     assert blue(pred_on) > 0.5                                  # the saturated verso, when asked for
+
+
+def test_the_eval_cascade_follows_the_training_mode(full_cfg):
+    """A cascade-"off" run is evaluated with a zero cascade channel (it used to get the oracle mask),
+    `prepare(cascade=None)` means off, and self/mix evaluate the self source."""
+    assert [TR.eval_cascade_mode(m) for m in ("self", "mix", "off", "mask")] == \
+        ["self", "self", "off", "mask"]
+    lay = full_cfg.layout()
+    it = _item(full_cfg, dist_w=0)
+    assert int(it["cm"].max()) > 0                              # there IS a coarse target to leak
+    b = prep.batch1(it)
+    x_off, _, _ = prep.prepare(b, torch.device("cpu"), cascade=prep.Cascade(TR.eval_cascade_mode("off")))
+    x_def, _, _ = prep.prepare(b, torch.device("cpu"))
+    assert lay.i_cas == 10
+    assert float(x_off[:, lay.i_cas].abs().max()) == 0.0
+    assert float(x_def[:, lay.i_cas].abs().max()) == 0.0
+    x_mask, _, _ = prep.prepare(b, torch.device("cpu"), cascade=prep.Cascade("mask", drop=0.0, noise=False))
+    assert float(x_mask[:, lay.i_cas].max()) > 0                # the oracle only when asked for by name

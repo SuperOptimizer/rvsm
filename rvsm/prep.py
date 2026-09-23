@@ -148,8 +148,10 @@ def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade
     Then the worker's cube symmetry is applied to the whole stack (every sample of a batch has the same
     patch shape, and `draw_sym` only draws permutations that keep it). `target` and `weight` come back as
     floats in 0..1. `norad=True` zeroes the radial channels. `cascade`: a `Cascade` saying where the
-    channel's values come from; None means the `mask` source with no noise and no dropout, which is what
-    validation and the tests want. `layout`, when given, is asserted against the result."""
+    channel's values come from; None means OFF (zeros, the "no coarse prediction" value) -- never the
+    `mask` source, which is the pooled TARGET: an oracle that must be asked for by name (the eval's
+    `dice_mask` bracket is the one place it enters evaluation). `layout`, when given, is asserted
+    against the result."""
     to = lambda t: t.to(dev, non_blocking=non_blocking)  # noqa: E731
     ct, tgt, w = to(b["ct"]), to(b["tgt"]), to(b["w"])
     lo, cyx, norm, rung = to(b["lo"]), to(b["cyx"]), to(b["norm"]), to(b["rung"])
@@ -161,7 +163,7 @@ def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade
     img.copy_(ct)
     zscore_cubes_(img, norm, dtype)
     if casc:
-        cascade = cascade if cascade is not None else Cascade("mask", drop=0.0, noise=False)
+        cascade = cascade if cascade is not None else Cascade("off")
         x[:, C:C + 1] = cascade.channel(b, x, norm, dtype, norad=norad, non_blocking=non_blocking)
     if npl:
         fill_planes_(x, C + casc, cyx, lo, dtype=dtype,

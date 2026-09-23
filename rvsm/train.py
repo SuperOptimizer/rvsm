@@ -246,6 +246,14 @@ def self_p_at(cfg, step, nsteps=None):
     return hi + (end - hi) * (s - m) / (e - m)
 
 
+def eval_cascade_mode(mode):
+    """The cascade source the evaluation feeds, following the TRAINING mode: self / mix -> self (what
+    inference feeds), off -> off, mask -> mask (a mask-trained run is evaluated as it was trained).
+    The pooled target otherwise enters the evaluation only through the separate `dice_mask` bracket."""
+    m = str(mode or "off")
+    return {"self": "self", "mix": "self", "off": "off", "mask": "mask"}[m]
+
+
 FINE_RUNGS = (2, 3, 4)   # the rungs the headline `dice` / `bce` / `mae` are pooled over
 NBINS = 200              # probability bins of the threshold-free (best-threshold) dice
 
@@ -701,7 +709,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     evfwd = evnet
     if cfg.compile and dev.type == "cuda":
         evfwd = torch.compile(evnet, mode="max-autotune-no-cudagraphs", dynamic=False)
-    casval = prep.Cascade("self" if cfg.cascade in ("self", "mix") else "mask", self_p=1.0, drop=0.0,
+    casval = prep.Cascade(eval_cascade_mode(cfg.cascade), self_p=1.0, drop=0.0,
                           noise=False, net=evnet, fwd=(evfwd if evfwd is not evnet else None))
     casmask = prep.Cascade("mask", self_p=0.0, drop=0.0, noise=False) \
         if cfg.cascade in ("self", "mix") else None

@@ -715,7 +715,7 @@ reported and left alone -- a temperature fitted against a fraction is not a cali
 
 def _prepared_grid(grid, dev, layout):
     """The validation grid as the `(x, t, w, rung)` batches `calib.collect` reads. The cascade channel
-    comes from its `mask` source with no noise and no dropout, which is the deterministic input."""
+    is zero (`prepare`'s default: no oracle coarse target), the deterministic input."""
     from rvsm import model as M, prep
     for item in grid:
         b = item if item["rung"].ndim else prep.batch1(item)
