@@ -1357,3 +1357,20 @@ def test_the_gate_streak_needs_the_current_row_and_the_previous_distinct_one(tmp
     assert RUN.eval_streak(miss, 4000)[0] is None                        # the pooled metric is not it
     old = log("o", [{"step": 2000, k: 0.31}, {"step": 4000, k: 0.33, **sch}])
     assert RUN.eval_streak(old, 4000)[1] == "eval schema differs from this code's"
+
+
+def test_gc_never_takes_the_held_out_round_0_reference(tmp_path):
+    """The held-out regions' round-0 recto / rw are the reference of every later gate: pinned by the
+    held-out manifest, they survive the collection of round 0 (pass-4 appendix)."""
+    from rvsm import stores as ST
+    out = str(tmp_path / "gc3")
+    held, other = (1024, 0, 0), (0, 0, 0)
+    for lo in (held, other):
+        for ch in ("recto", "rw"):
+            _fake_store(ST.store_path(out, ch, lo, 0))
+        _fake_store(ST.store_path(out, "recto", lo, 2))
+    RUN._write_json(RUN.heldout_path(out), {"regions": [{"lo": list(held), "size": [1024] * 3}]})
+    RUN._clean_old_rounds(out, 2, keep=2)
+    for ch in ("recto", "rw"):
+        assert os.path.exists(ST.store_path(out, ch, held, 0)), ch
+        assert not os.path.exists(ST.store_path(out, ch, other, 0)), ch

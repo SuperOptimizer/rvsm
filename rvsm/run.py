@@ -2258,7 +2258,8 @@ _PHASE_T0 = {}
 
 def _clean_old_rounds(out, round_, keep=2):
     """At most `keep` rounds live on disk: a region's round-r stores go once round r+1 has superseded
-    them for that region (plan §1). Nothing is deleted while it is the newest thing there is."""
+    them for that region (plan §1). Nothing is deleted while it is the newest thing there is, and the
+    held-out regions' round-0 stores (the reference, `eval/heldout.json`) are never deleted."""
     from rvsm import regions as RG
     old = int(round_) - int(keep)
     if old < 0:
@@ -2266,6 +2267,12 @@ def _clean_old_rounds(out, round_, keep=2):
     import glob
     new = RG.Catalog(out, int(round_), ttl=1.0)
     gone = []
+    # the held-out regions' ROUND-0 stores are the fixed reference every gate and evaluation of every
+    # round is scored against: pinned by the held-out manifest (eval/heldout.json), never collected
+    pinned = set()
+    if old == 0:
+        pinned = {tuple(int(v) for v in h["lo"])
+                  for h in (_read_json(heldout_path(out)) or {}).get("regions", [])}
     root = os.path.join(out, "stores", f"round_{old}")
     # EVERY channel directory of the old round -- the per-rung fields (midline_r3, thickness_r4, ...)
     # included, which a fixed list of channel names left behind -- and every generation of a store
@@ -2274,7 +2281,7 @@ def _clean_old_rounds(out, round_, keep=2):
     for ch in chans:
         d = os.path.join(root, ch)
         for lo in RG.Catalog(out, old, ttl=1.0).list_done(ch):
-            if not new.done("recto", lo):
+            if not new.done("recto", lo) or tuple(lo) in pinned:
                 continue
             base = os.path.join(d, "region_%d_%d_%d.zarr" % lo)
             for p in [base] + sorted(glob.glob(base[:-len(".zarr")] + ".g*.zarr")):
