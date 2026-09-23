@@ -648,7 +648,7 @@ def test_stop_now_exits_cleanly_and_checkpoints_only_when_worth_it(tiny_cfg, mon
     is written only when >= STOP_SAVE_MIN steps have passed since the last one."""
     from pathlib import Path
     val = [_item(tiny_cfg, k=2, seed=7)]
-    for smin, want_ckpt in ((100, False), (2, True)):
+    for smin, want_ckpt in ((100, False), (1, True)):
         monkeypatch.setattr(TR, "STOP_SAVE_MIN", smin)
         cfg = replace(tiny_cfg, out=str(Path(tiny_cfg.out).parent / f"stop{smin}"), steps=50,
                       eval_every=10 ** 6)
@@ -660,5 +660,50 @@ def test_stop_now_exits_cleanly_and_checkpoints_only_when_worth_it(tiny_cfg, mon
         ck = TR.train(cfg, patches_factory=_factory(cfg), val_items=val, device="cpu", stop_now=stop)
         rows = [json.loads(q) for q in (Path(cfg.out) / "logs" / "train.jsonl").read_text().splitlines()]
         rec = [r for r in rows if r.get("kind") == "stop_now"]
-        assert len(rec) == 1 and rec[0]["step"] == 3 and rec[0]["reason"] == "RAM"
+        assert len(rec) == 1 and rec[0]["step"] == 2 and rec[0]["reason"] == "RAM"   # checked per batch
         assert Path(ck).exists() is want_ckpt and rec[0]["checkpoint"] is want_ckpt
+
+
+def test_the_ram_stop_comes_before_evaluation_and_hooks(tiny_cfg):
+    """P4-02: the stop request is honoured before the evaluation and the driver hook of that step, not
+    after them, and the discarded work is logged."""
+    from pathlib import Path
+    cfg = replace(tiny_cfg, out=str(Path(tiny_cfg.out).parent / "stopeval"), steps=50, eval_every=2)
+    calls = {"n": 0}
+    hooked = []
+
+    def stop():
+        calls["n"] += 1
+        return "RAM" if calls["n"] >= 3 else None          # 3rd check = the one before step 2's eval
+    TR.train(cfg, patches_factory=_factory(cfg), val_items=[_item(cfg, k=2, seed=7)], device="cpu",
+             stop_now=stop, hook=lambda info: hooked.append(info["step"]))
+    logs = Path(cfg.out) / "logs"
+    ev = (logs / "eval.jsonl").read_text().splitlines() if (logs / "eval.jsonl").exists() else []
+    assert not ev and not hooked, "the evaluation / hook ran after a stop request"
+    rec = [json.loads(q) for q in (logs / "train.jsonl").read_text().splitlines()
+           if '"stop_now"' in q]
+    assert len(rec) == 1 and rec[0]["step"] == 2 and rec[0]["checkpoint"] is False
+    assert rec[0]["discarded_steps"] == 2 and "discarded_microbatches" in rec[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the prefetch thread runs on a CUDA device")
+def test_a_stuck_fetch_is_abandoned_when_stop_is_requested():
+    """The prefetch's wait on the loader polls stop() every second: a loader stuck forever does not
+    keep the trainer from leaving."""
+    import threading
+    import time as _t
+    ev = threading.Event()
+
+    def stuck():
+        yield {"x": torch.zeros(2), "rung": torch.tensor(2)}
+        ev.wait(60)                                         # the second fetch never comes back
+        yield {"x": torch.zeros(2), "rung": torch.tensor(2)}
+    flag = {"on": False}
+    pf = TR.DevicePrefetch(stuck(), torch.device("cuda"), side=False, stop=lambda: flag["on"])
+    it = iter(pf)
+    next(it)
+    t0 = _t.time()
+    threading.Timer(1.0, lambda: flag.update(on=True)).start()
+    assert list(it) == []                                   # the iteration ends ...
+    assert _t.time() - t0 < 5.0                             # ... within a poll or two of the request
+    ev.set()

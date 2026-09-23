@@ -662,8 +662,8 @@ class DevicePrefetch:
     transition calls it before it resets the cursor directory; relying on the generator's GC left a
     pending fetch and the persistent workers free to publish old-round positions into the new round."""
 
-    def __init__(self, src, dev, side=True):
-        self.src, self.dev, self.side = src, dev, bool(side)
+    def __init__(self, src, dev, side=True, stop=None):
+        self.src, self.dev, self.side, self.stop = src, dev, bool(side), stop
         self._it = self._fut = None
         self._closed = False
         self.clean = None           # after close(): True when nothing was still running
@@ -696,7 +696,7 @@ class DevicePrefetch:
         stream = torch.cuda.Stream(self.dev) if self.side else None
         self._fut = _spawn(lambda: self._fetch(stream))
         while not self._closed:
-            got = self._fut.result()
+            got = self._wait()
             if got is None or self._closed:
                 self._fut = None
                 return
@@ -708,6 +708,17 @@ class DevicePrefetch:
                     if torch.is_tensor(v) and v.is_cuda:
                         v.record_stream(torch.cuda.current_stream(self.dev))
             yield cur
+
+    def _wait(self):
+        """The fetch in flight, polled every second so a `stop()` request (the RAM guard) ends the
+        iteration even while a loader is stuck: the pending fetch is then abandoned, not joined."""
+        import concurrent.futures as cf
+        while True:
+            try:
+                return self._fut.result(timeout=1.0)
+            except cf.TimeoutError:
+                if self.stop is not None and self.stop():
+                    return None
 
     def close(self, timeout=QUIESCE_S):
         """Quiesce: no further batch, the fetch in flight finished (or given up on after `timeout`
@@ -731,9 +742,9 @@ class DevicePrefetch:
         return clean
 
 
-def to_device_iter(src, dev, side=True):
-    """`DevicePrefetch(src, dev, side)`: the name the step loop has always used."""
-    return DevicePrefetch(src, dev, side=side)
+def to_device_iter(src, dev, side=True, stop=None):
+    """`DevicePrefetch(src, dev, side, stop)`: the name the step loop has always used."""
+    return DevicePrefetch(src, dev, side=side, stop=stop)
 
 
 class _Phases:
@@ -931,13 +942,22 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     ph = _Phases(dev, os.environ.get("RVSM_PROFILE", "") not in ("", "0"))
     t0, micro, rung_n, wait_s = time.time(), 0, {}, 0.0
     src = patches_factory() if patches_factory is not None else iter(())
-    src = to_device_iter(src, dev, side=bool(getattr(cfg, "gpu_prefetch", True)))
+    def stopping():
+        return stop_now() if stop_now is not None else None
+
+    src = to_device_iter(src, dev, side=bool(getattr(cfg, "gpu_prefetch", True)), stop=stopping)
+    why_stop = None
     loss = bce = dice = None
     reg_log, aux_log = {}, {}
     nvox = 0
     tw = time.time()
     for item in src:
         if step >= nsteps:
+            break
+        # the RAM guard is checked before every microbatch -- so also after the non-finite-gradient
+        # `continue` -- and before every evaluation / hook, never only after them (pass-4 P4-02)
+        why_stop = stopping()
+        if why_stop:
             break
         wait_s += time.time() - tw
         ph.start()
@@ -1077,6 +1097,9 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                   "train_wait_s": round(wait_s, 3), **ph.take()})
             rung_n, wait_s, nvox, t0 = {}, 0.0, 0, time.time()
         if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:
+            why_stop = stopping()
+            if why_stop:
+                break
             do_eval()
             save()
             # `quiesce` is the loader's shutdown protocol: a round transition calls it before it
@@ -1086,20 +1109,23 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                                           "quiesce": src.close}):
                 break
             t0, tw = time.time(), time.time()
-        # `stop_now()` -> a reason: the supervisor's RAM guard asks the trainer to leave NOW (a leak
-        # was about to take the host down). Checkpoint only when it is worth it (>= 200 steps since the
-        # last one: a save is ~1.4 GB of host copies at the worst moment), then exit cleanly.
-        why = stop_now() if stop_now is not None else None
-        if why:
-            last = saved["step"] if saved["step"] is not None else step0
-            do_save = step - int(last) >= STOP_SAVE_MIN
-            _log(str(out / "logs" / "train.jsonl"),
-                 {"kind": "stop_now", "step": step, "reason": str(why), "checkpoint": bool(do_save),
-                  "last_checkpoint": int(last)})
-            src.close()
-            if do_save:
-                save()
-            return str(ck)
+    why_stop = why_stop or stopping()      # the prefetch ends its iteration when stop() is set
+    if why_stop:
+        # `stop_now()` -> a reason: the supervisor's RAM guard asks the trainer to leave NOW (a leak was
+        # about to take the host down). `step` is a complete optimiser boundary (it only moves after
+        # opt.step); a partial accumulation is DISCARDED. Checkpoint only when it is worth it (>= 200
+        # steps since the last one: a save is ~1.4 GB of host copies at the worst moment).
+        opt.zero_grad(set_to_none=True)
+        last = saved["step"] if saved["step"] is not None else step0
+        do_save = step - int(last) >= STOP_SAVE_MIN
+        _log(str(out / "logs" / "train.jsonl"),
+             {"kind": "stop_now", "step": step, "reason": str(why_stop), "checkpoint": bool(do_save),
+              "last_checkpoint": int(last), "discarded_microbatches": int(micro),
+              "discarded_steps": 0 if do_save else int(step - int(last))})
+        src.close(timeout=5.0)
+        if do_save:
+            save()
+        return str(ck)
     src.close()
     save()
     return str(ck)
