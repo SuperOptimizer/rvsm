@@ -589,3 +589,26 @@ def test_a_self_cascade_never_reads_the_coarse_target(small_cfg):
         assert float(c.last_self[0]) in (0.0, 1.0)     # self-scored, or dropped -- never mask
         if float(c.last_self[0]) == 0.0:
             assert float(out.abs().sum()) == 0.0
+
+
+def test_training_coarse_targets_carry_no_weight_over_held_out_regions(monkeypatch):
+    """Rungs 7-11 read the coarse arrays, which fold in EVERY produced region -- the held-out ones too.
+    The training sampler zeroes the coverage over a held-out footprint (rounded outward); the
+    validation view (no held-out list) keeps it (review D03)."""
+    from rvsm import regions as RG
+    monkeypatch.setattr(RG, "read_coarse", lambda root, ch, k, lo, shape, r=0: (
+        np.full(tuple(shape), 200, np.uint8), np.ones(tuple(shape), np.float32)))
+    ds = sample.Patches.__new__(sample.Patches)
+    ds.root, ds.round = "/nowhere", 0
+    ds.cfg = type("C", (), {"region": 1024})()
+    k, lo, shp = 7, (0, 0, 0), (64, 64, 64)                 # rung 7: 32 rung-2 voxels a voxel
+    ds._held = {(1024, 1024, 0)}                              # footprint z 32..64, y 32..64, x 0..32
+    _, cov = ds._source("recto", k, lo, shp)
+    assert float(cov[32:64, 32:64, 0:32].max()) == 0.0
+    assert float(cov.sum()) == 64 ** 3 - 32 ** 3
+    ds._held = set()                                          # the validation view keeps everything
+    _, cov = ds._source("recto", k, lo, shp)
+    assert float(cov.min()) == 1.0
+    odd = np.ones((8, 8, 8), np.float32)                      # outward rounding of a partial voxel
+    sample.zero_footprints(odd, 7, (0, 0, 0), [(24, 24, 24)], 16)   # rung-2 24..40 straddles 0 | 1
+    assert odd[0, 0, 0] == 0 and odd[1, 1, 1] == 0 and odd[2, 2, 2] == 1 and float(odd.sum()) == 512 - 8

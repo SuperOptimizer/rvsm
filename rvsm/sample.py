@@ -243,6 +243,14 @@ class Patches(torch.utils.data.IterableDataset):
         k = int(k)
         if k >= RG.COARSE_RUNGS[0]:
             v, cov = RG.read_coarse(self.root, chan, k, lo, shape, self.round)
+            held = getattr(self, "_held", ())
+            if held:
+                # the TRAINING sampler: a coarse voxel any part of which lies over a held-out region's
+                # footprint carries no weight -- the coarse array folds EVERY produced region in, the
+                # held-out references included, and training on them leaks the evaluation set. The
+                # validation view (no held-out list) keeps them.
+                cov = cov.copy()
+                zero_footprints(cov, k, lo, held, int(self.cfg.region))
             return v, cov
         if k >= 3:
             return self._stitched(chan, k, lo, shape)
@@ -557,6 +565,23 @@ class Patches(torch.utils.data.IterableDataset):
 
 
 # --------------------------------------------------------------------------- validation and loading
+
+def zero_footprints(cov, k, lo, held, region):
+    """Zero `cov` (a rung-k window at `lo`) over the rung-k footprint of every held-out rung-2 region
+    origin in `held` (each `region` voxels on a side at rung 2), rounded OUTWARD: a coarse voxel that
+    touches a footprint at all is zeroed."""
+    d = int(k) - 2
+    lo = np.asarray(lo, np.int64)
+    shp = np.array(cov.shape, np.int64)
+    for h in held:
+        h2 = np.asarray(h, np.int64)
+        a = (h2 >> d) - lo                                   # floor
+        b = (-((-(h2 + int(region))) >> d)) - lo             # ceil
+        a, b = np.maximum(a, 0), np.minimum(b, shp)
+        if (b > a).all():
+            cov[a[0]:b[0], a[1]:b[1], a[2]:b[2]] = 0
+    return cov
+
 
 def _grid_corners(cfg, heldout, p, rungs=None, limit=8):
     """[(k, lo)] of the validation grid, in build order: non-overlapping tiles of each held-out region
