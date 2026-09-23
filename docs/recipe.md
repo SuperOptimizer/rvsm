@@ -26,7 +26,7 @@ Citations: `§n` = `/home/forrest/usrm2/docs/unified_design.md`; `research/<file
 | `gpus` | `(0,)` | one card is the premise | plan Context |
 | `mode` | `"auto"` | picks `resident` or `timeshare` from the cards found; the user asked for defaults tuned for both 80 GB resident and 32 GB timeshare | plan Context, §1 |
 | `rounds` | `3` | round 0 is the teacher bootstrap; a round is discarded if it fails the gate, so the count is an upper bound, not a commitment | plan §1 |
-| `steps` | `20000` | u3 passed the label ceiling on `merge_frac` at 21k; WSD makes extension free, so a shorter default with an explicit extension is the cheaper error | §2.1 of rationale; §26.2 |
+| `steps` | `20000` | the GLOBAL optimiser-step budget over every round (not per round); the round gate promotes only while `round_steps` of it are left, so a promoted round always gets to train. u3 passed the label ceiling on `merge_frac` at 21k; WSD makes extension free, so a shorter default with an explicit extension is the cheaper error | §2.1 of rationale; §26.2 |
 | `workers` | `6` | sampler worker processes. On the 8-core tnr-0 the loader was the bottleneck once the step got fast; with the per-visit context super-cubes, the uint8 targets and the rung-3 pool a draw is ~0.8 s (rung 2-3) per worker, and 6 of them keep a ~0.7 s step fed | `usrm2-runs-state.md`; §17 |
 | `tifxyz` | `""` | human meshes are **optional** and eval-only, by user decision | plan Context |
 | `teacher_ckpts` | `{}` | teacher weights come from **local paths in the config**, by user decision — no registry lookup, no download at train time | plan Context |
@@ -181,7 +181,7 @@ Two rules that are not weights but change what the losses see, and which the rev
 | `lookahead_extra` | `4` | the "+4" of `L = ceil(T_produce/T_train)·K_active + 4`, re-estimated every 10 min from `logs/produce.jsonl`; A100 ~12, 32 GB cards ~8 | plan §1 |
 | `train_min` / `produce_max_min` | `20.0` / `10.0` | timeshare phase lengths. Both processes stay alive across a swap, so the compile cache survives and a recompile on `.cuda()` costs ~1 min — under 5 % of a 20-minute phase | plan §1 |
 | `reserve_gb` | `50.0` | production pauses below this much free disk; a region store is ~9-10 MB, and at most two rounds live on disk at once | `runpod-5090-verso.md`; plan §1 |
-| `round_steps` | `20000` | a round ends here if the plateau fit (`< 2 %` remaining gain) has not ended it first | plan §1 |
+| `round_steps` | `20000` | the MINIMUM a round trains before the round gate may promote it, counted from the round's own start (`state.json` `round_step`), not the absolute step. The gate fails closed (2026-09-23 review): round 0 needs `verso_on` (self-distillation needs round 0's verso stores); then held-out comparison rows with finite precision / betti0 error are required; round 0's stats become the reference (`state.json` `round_ref`, so a restart keeps the veto) and a round >= 1 with no reference, or worse than it beyond the bootstrap CI, is not promoted. The plateau fit reads only this round's evaluations and is logged beside the decision | plan §1; review 2026-09-23 |
 
 ---
 

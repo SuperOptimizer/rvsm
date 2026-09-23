@@ -1057,13 +1057,15 @@ def verso_gate(cfg, out, step, rows_fn=None, screen=None):
                 "betti0_base": base, "betti0_ci": [blo, bhi], "n": len(rows)}
 
 
-def plateau(out, key="dice", min_points=6, gain=ROUND_GAIN):
+def plateau(out, key="dice", min_points=6, gain=ROUND_GAIN, since=None):
     """Is the eval curve flat? `fit_curve` on `logs/eval.jsonl`: the remaining gain to the fitted
-    asymptote, as a fraction of it. Too few points is NOT a plateau."""
+    asymptote, as a fraction of it. Too few points is NOT a plateau. `since`: only the evaluations
+    after that step -- this round's, not the previous rounds' curve."""
     from rvsm import evalsurf as EV
     recs = [(int(r["step"]), float(r[key])) for r in
             tail_jsonl(os.path.join(str(out), "logs", "eval.jsonl"), 500)
-            if isinstance(r.get(key), (int, float)) and np.isfinite(r.get(key))]
+            if isinstance(r.get(key), (int, float)) and np.isfinite(r.get(key))
+            and (since is None or int(r["step"]) > int(since))]
     if len(recs) < int(min_points):
         return False, {"why": "too few eval points", "n": len(recs)}
     s, y = [q[0] for q in recs], [q[1] for q in recs]
@@ -1081,36 +1083,54 @@ def plateau(out, key="dice", min_points=6, gain=ROUND_GAIN):
                                      "remaining": rem, "model": fit.get("model"), "n": len(recs)}
 
 
-def round_gate(cfg, out, step, round_, rows_fn=None, ref=None):
-    """Should round `round_` end and round `round_ + 1` open?
+def round_gate(cfg, out, step, round_, rows_fn=None, ref=None, round_start=0, verso_on=True):
+    """Should round `round_` end and round `round_ + 1` open? Every doubt answers NO (fail closed).
 
-    The plateau (or `round_steps`) opens the question -- and only then is the held-out comparison run,
-    because it costs a student pass per region. It answers it: the merge side (`precision`, how much of
-    what the student calls sheet the reference agrees with) and `betti0_err` must not be worse than the
-    ROUND-0 reference beyond the bootstrap CI. A round that fails is DISCARDED: the round does not
-    advance, the training continues, and WSD makes that extension free (plan §1).
+    In order, each one a refusal with its reason logged:
+      - round 0 without `verso_on`: self-distillation needs round 0's verso stores to exist;
+      - fewer than `round_steps` steps IN THIS ROUND (`step - round_start`, not the absolute step:
+        the absolute one made round 1 due the moment round 0 was over);
+      - less than `round_steps` of the global `steps` budget left: a promoted round must get to train;
+      - no held-out comparison rows, or a non-finite precision / betti0 error;
+      - round >= 1 with no round-0-anchored reference `ref` (it is persisted in state.json, so a
+        restart keeps the veto), or a merge side (`precision`) / `betti0_err` worse than `ref` beyond
+        the bootstrap CI.
+    Round 0 has nothing earlier to be worse than: its measured rows become `ref`. The plateau fit
+    (this round's evaluations only) is reported beside the decision. A round that fails is not
+    discarded wholesale: it simply keeps training, and WSD makes that extension free (plan §1).
 
-    `ref` is what the previous gate measured. Round 0 has no previous round to be worse than, so its
-    only condition is the plateau -- "not worse than the round-0 reference" starts to mean something at
-    round 1. `rows_fn()` returns the held-out rows and is called at most once.
-
-    Returns (fire, why) and the rows it measured in `why["rows"]`, so the caller can keep them as the
-    next round's reference."""
-    flat, why = plateau(out, "dice")
-    if not (flat or int(step) >= int(cfg.round_steps)):
-        return False, {"why": "not a plateau", **why}
+    Returns (fire, why); `why["rows"]` holds the measured stats, the next round's reference."""
+    in_round = int(step) - int(round_start or 0)
+    base = {"round_step": in_round, "round_start": int(round_start or 0)}
+    if int(round_) == 0 and not verso_on:
+        return False, {"why": "verso_on is false: round 0's verso stores must exist first", **base}
+    if in_round < int(cfg.round_steps):
+        return False, {"why": "round_step below round_steps", "round_steps": int(cfg.round_steps),
+                       **base}
+    if int(cfg.steps) - int(step) < int(cfg.round_steps):
+        return False, {"why": "less than round_steps of the global steps budget left for the next "
+                              "round", "steps": int(cfg.steps), **base}
+    flat, pwhy = plateau(out, "dice", since=round_start)
+    base.update({"plateau": bool(flat), "plateau_why": pwhy.get("why")})
     rows = list((rows_fn() if rows_fn is not None else None) or [])
     if not rows:
-        return True, {"why": "plateau, no held-out reference to veto it", **why}
+        return False, {"why": "no held-out comparison rows (fail closed)", **base}
     prec, plo, phi = _boot([r.get("precision", float("nan")) for r in rows])
     b, blo, bhi = _boot([r.get("betti0_err", float("nan")) for r in rows])
     got = {"precision": prec, "betti0_err": b}
-    ok = True
-    if ref:
-        ok = (not np.isfinite(b) or b <= float(ref.get("betti0_err", b)) + max(bhi - blo, 0.0)) and \
-             (not np.isfinite(prec) or prec >= float(ref.get("precision", prec)) - max(phi - plo, 0.0))
-    return bool(ok), {"why": "plateau + quality", "precision": prec, "betti0_err": b,
-                      "ref": ref, "ok": bool(ok), "rows": got, "n": len(rows), **why}
+    if not (np.isfinite(prec) and np.isfinite(b)):
+        return False, {"why": "non-finite held-out metrics (fail closed)", "rows": got, **base}
+    if int(round_) >= 1:
+        if not ref or not all(np.isfinite(float(ref.get(k, float("nan"))))
+                              for k in ("precision", "betti0_err")):
+            return False, {"why": "no round-0 reference to compare with (fail closed)", "rows": got,
+                           **base}
+        ok = b <= float(ref["betti0_err"]) + max(bhi - blo, 0.0) and \
+            prec >= float(ref["precision"]) - max(phi - plo, 0.0)
+        return bool(ok), {"why": "quality vs reference", "precision": prec, "betti0_err": b,
+                          "ref": ref, "ok": bool(ok), "rows": got, "n": len(rows), **base}
+    return True, {"why": "round 0: verso on, round_steps done, held-out rows measured",
+                  "precision": prec, "betti0_err": b, "rows": got, "n": len(rows), **base}
 
 
 # --------------------------------------------------------------------------- #
@@ -1461,7 +1481,8 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                           meta=ctx["meta5"], spill=os.path.join(out, "eval", "grid"),
                           threads=max(min(int(os.cpu_count() or 1) // 2, 4), 1))
     jlog(out, "sched", {"kind": "val_grid", "items": len(val), "s": round(time.time() - t_g, 1)})
-    state = {"round": int(read_state(out).get("round", 0)), "stop": False, "ref": None}
+    st0 = read_state(out)
+    state = {"round": int(st0.get("round", 0)), "stop": False, "ref": st0.get("round_ref")}
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
     resume = os.path.exists(ckpt)
 
@@ -1497,7 +1518,9 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
             if ok:
                 write_state(out, verso_on=True, verso_gate_step=step)
         if state["round"] + 1 < int(cfg.rounds):
-            ok, why = round_gate(cfg, out, step, state["round"], rows_fn, state["ref"])
+            ok, why = round_gate(cfg, out, step, state["round"], rows_fn, state["ref"],
+                                 round_start=int(st.get("round_step", 0) or 0),
+                                 verso_on=bool(read_state(out).get("verso_on", False)))
             if why.get("why") != "not a plateau":
                 jlog(out, "sched", {"kind": "round_gate", "step": step, "round": state["round"],
                                     "pass": bool(ok), **why})
@@ -1507,13 +1530,15 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                 infer.save_student(tp, {k: v.cpu() for k, v in info["ema"].items()}, cfg,
                                    temps=CAL.temps_of(info.get("temps") or {}), step=step,
                                    round=nxt)
-                state["ref"] = why.get("rows") or state["ref"]
+                if state["round"] == 0 or not state["ref"]:
+                    state["ref"] = why.get("rows")          # round 0's stats anchor every later round
                 state["round"] = nxt
                 # the next round walks from the start again: the old round's cursor would put the
                 # producer's window past the positions the new sampler asks for first (a deadlock
                 # the end-to-end test hit whenever those regions fell outside the old window)
                 shutil.rmtree(cursor_dir(out), ignore_errors=True)
-                write_state(out, round=nxt, teacher=tp, round_step=step, cursor=0, walk=None)
+                write_state(out, round=nxt, teacher=tp, round_step=step, cursor=0, walk=None,
+                            round_ref=state["ref"])
                 jlog(out, "sched", {"kind": "round", "round": nxt, "teacher": tp, "step": step})
                 return True
         return False

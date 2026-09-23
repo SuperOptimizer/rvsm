@@ -173,7 +173,8 @@ class Config:
     gpus: tuple = (0,)                 # CUDA device ordinals available to the run
     mode: str = "auto"                 # auto | resident (one big card) | timeshare (alternating phases)
     rounds: int = 3                    # self-distillation rounds, round 0 = the teacher bootstrap
-    steps: int = 20000                 # optimiser steps per round
+    steps: int = 20000                 # optimiser steps in TOTAL, over every round (the global budget;
+                                       # a round is promoted only with round_steps of it left)
     workers: int = 6                   # sampler worker processes
     tifxyz: str = ""                   # optional directory of human tifxyz meshes, for eval only
     teacher_ckpts: dict = field(default_factory=dict)  # {"recto": path, "m7": path} local teacher weights
@@ -255,7 +256,8 @@ class Config:
     train_min: float = 20.0            # timeshare: minutes of training per phase
     produce_max_min: float = 10.0      # timeshare: maximum minutes of production per phase
     reserve_gb: float = 50.0           # production pauses below this much free disk
-    round_steps: int = 20000           # a round ends here if the plateau fit has not ended it
+    round_steps: int = 20000           # the MINIMUM steps a round trains (counted from its own start)
+                                       # before the round gate may promote it
     compile: bool = True               # torch.compile the student (and the teachers, when teacher_bf16)
     teacher_bf16: bool = True          # teachers under bf16 autocast (+ compile): their fp32 forward was
                                        # the whole cost of a teacher region

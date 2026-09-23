@@ -93,6 +93,10 @@ def test_rvsm_run_two_rounds_end_to_end(run_cfg, tmp_path, capsys):
     st = RUN.read_state(out)
     assert st["verso_on"] is True, "the verso gate never fired"
     assert st["round"] == 1, f"the round gate never fired: {st}"
+    # round 0's stats are persisted as the reference every later round is judged against, so a
+    # restart keeps the veto; the round's own start is recorded for the per-round step count
+    assert st.get("round_ref") and all(k in st["round_ref"] for k in ("precision", "betti0_err"))
+    assert st.get("verso_on") and int(st.get("round_step", 0)) >= cfg.round_steps
     assert st["step"] >= 20
 
     # ---- round 0: the teacher stores, and the verso the gate opened
@@ -344,38 +348,50 @@ def test_the_verso_gate_needs_the_dice_and_the_betti_baseline(small_cfg):
     assert not called, "the fallback must not pay for a student pass it does not need"
 
 
-def test_the_round_gate_wants_a_plateau_and_then_the_quality(tmp_path, small_cfg):
+def test_the_round_gate_fails_closed(tmp_path, small_cfg):
+    """Every doubt is a NO: round 0 needs verso on; a round needs round_steps of ITS OWN steps; the
+    global budget must leave a round to train; no rows, non-finite rows, or (round >= 1) no reference
+    never promote; and the rows are only paid for once the cheap conditions pass."""
     out = str(tmp_path / "rounds")
-    cfg = replace(small_cfg, round_steps=10 ** 9)
+    cfg = replace(small_cfg, round_steps=1000, steps=60000)
+    rows = [{"precision": 0.8, "betti0_err": 1.0}, {"precision": 0.82, "betti0_err": 1.2}]
+    seen = []
+
+    def rf():
+        seen.append(1)
+        return rows
+    no, why = RUN.round_gate(cfg, out, 5000, 0, rf, verso_on=False)
+    assert not no and "verso_on" in why["why"]
+    no, why = RUN.round_gate(cfg, out, 5500, 1, rf, rows[0], round_start=5000)   # (a) 500 in round
+    assert not no and why["why"] == "round_step below round_steps" and why["round_step"] == 500
+    no, why = RUN.round_gate(cfg, out, 59500, 0, rf)                              # (d) no budget left
+    assert not no and "budget" in why["why"]
+    assert not seen, "the rows are paid for only once the cheap conditions pass"
+    assert RUN.round_gate(cfg, out, 5000, 0, lambda: [])[1]["why"].startswith("no held-out")
+    bad = [{"precision": float("nan"), "betti0_err": 1.0}]
+    assert RUN.round_gate(cfg, out, 5000, 0, lambda: bad)[1]["why"].startswith("non-finite")
+    fire, why = RUN.round_gate(cfg, out, 5000, 0, rf)                            # round 0: rows = ref
+    assert fire and why["rows"]["precision"] == pytest.approx(0.81)
+    ref = why["rows"]
+    no, why = RUN.round_gate(cfg, out, 6500, 1, rf, None, round_start=5000)      # (c) no reference
+    assert not no and "reference" in why["why"]
+    assert RUN.round_gate(cfg, out, 6500, 1, rf, ref, round_start=5000)[0] is True
+    worse = [{"precision": 0.8, "betti0_err": 90.0}, {"precision": 0.8, "betti0_err": 91.0}]
+    assert RUN.round_gate(cfg, out, 6500, 1, lambda: worse, ref, round_start=5000)[0] is False
+    merged = [{"precision": 0.2, "betti0_err": 1.0}, {"precision": 0.2, "betti0_err": 1.0}]
+    assert RUN.round_gate(cfg, out, 6500, 1, lambda: merged, ref, round_start=5000)[0] is False
+
+
+def test_the_plateau_reads_only_this_rounds_evaluations(tmp_path):
     import math
-    rising = str(tmp_path / "rising")
-    for s in range(1, 9):                                       # still climbing: not a plateau
-        RUN.jlog(rising, "eval", {"step": s * 100, "dice": 0.85 * (1 - math.exp(-s * 100 / 3000.0))},
-                 echo=False)
-    assert RUN.plateau(rising, "dice")[0] is False
-    assert RUN.round_gate(cfg, rising, 800, 0)[0] is False
-    for s in range(1, 20):                                      # ... and a saturating one that is
+    out = str(tmp_path / "pl")
+    for s in range(1, 20):                                      # round 0: a saturated curve
         RUN.jlog(out, "eval", {"step": s * 100, "dice": 0.85 * (1 - math.exp(-s * 100 / 200.0))},
                  echo=False)
-    flat, why = RUN.plateau(out, "dice")
-    assert flat and why["remaining"] < RUN.ROUND_GAIN, why
-    rows = [{"precision": 0.8, "betti0_err": 1.0}, {"precision": 0.82, "betti0_err": 1.2}]
-    # round 0 has no previous round to be worse than: the plateau is the whole condition, and what it
-    # measured becomes the reference the next round is judged against
-    fire, why = RUN.round_gate(cfg, out, 1900, 0, lambda: rows)
-    assert fire is True and why["rows"]["precision"] == pytest.approx(0.81)
-    assert RUN.round_gate(cfg, out, 1900, 1, lambda: rows, why["rows"])[0] is True
-    worse = [{"precision": 0.8, "betti0_err": 90.0}, {"precision": 0.8, "betti0_err": 91.0}]
-    assert RUN.round_gate(cfg, out, 1900, 1, lambda: worse, why["rows"])[0] is False, \
-        "a worse topology than round 0's discards the round"
-    merged = [{"precision": 0.2, "betti0_err": 1.0}, {"precision": 0.2, "betti0_err": 1.0}]
-    assert RUN.round_gate(cfg, out, 1900, 1, lambda: merged, why["rows"])[0] is False, \
-        "more merging than round 0 discards the round"
-    # the rows are only ever asked for once the plateau has opened the question
-    seen = []
-    assert RUN.round_gate(replace(cfg, round_steps=10 ** 9), rising, 800, 0,
-                          lambda: seen.append(1) or rows)[0] is False
-    assert not seen
+    for s in range(1, 4):                                       # round 1: three points so far
+        RUN.jlog(out, "eval", {"step": 2000 + s * 100, "dice": 0.3 * s}, echo=False)
+    flat, why = RUN.plateau(out, "dice", since=2000)            # ... this round's does not
+    assert not flat and why["why"] == "too few eval points" and why["n"] == 3
 
 
 def test_state_and_markers_are_atomic_and_readable_by_anyone(tmp_path):
