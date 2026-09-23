@@ -42,6 +42,7 @@ class WalkPatches(sample.Patches):
         mine = [int(i) for i in self.order[w::W]] or [int(i) for i in self.order]
         pos, pend, revisit, seen_no_verso = 0, [], [], {}
         t_last, region_s = time.time(), 0.0
+        self._publish(w, W, 0, 0.0)     # this walk starts at 0: overwrite whatever an earlier one left
         while True:
             while len(pend) < max(self.L, 1) and pos < len(mine):
                 pend.append(mine[pos])

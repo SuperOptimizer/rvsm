@@ -702,7 +702,10 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             st = read_state(out)
             round_ = int(st.get("round", 0))
             verso_on = bool(st.get("verso_on", False))
-            cursor = int(st.get("cursor", 0))
+            # the LIVE cursor (the sampler workers publish it after every visit), not state.json's
+            # copy: that one is only rewritten at an evaluation, every `eval_every` steps -- dozens of
+            # visits -- and a window that lags that far behind the trainer starves it
+            cursor = max(read_cursor(out), 0)
             if time.time() - t_reest > REEST_S:
                 L, t_reest = lookahead(cfg, out, k_active), time.time()
             _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "last_ts": time.time(),
@@ -1279,7 +1282,11 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                                    round=nxt)
                 state["ref"] = why.get("rows") or state["ref"]
                 state["round"] = nxt
-                write_state(out, round=nxt, teacher=tp, round_step=step)
+                # the next round walks from the start again: the old round's cursor would put the
+                # producer's window past the positions the new sampler asks for first (a deadlock
+                # the end-to-end test hit whenever those regions fell outside the old window)
+                shutil.rmtree(cursor_dir(out), ignore_errors=True)
+                write_state(out, round=nxt, teacher=tp, round_step=step, cursor=0)
                 jlog(out, "sched", {"kind": "round", "round": nxt, "teacher": tp, "step": step})
                 return True
         return False
