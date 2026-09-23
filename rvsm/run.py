@@ -646,7 +646,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
         with hb_lock:
             now = time.time()
             hb_rec.clear()
-            hb_rec.update(rec, pid=os.getpid(), last_ts=now, progress_ts=now)
+            hb_rec.update(rec, pid=os.getpid(), pgid=os.getpgid(0), last_ts=now, progress_ts=now)
             _write_json(hb, dict(hb_rec))
 
     def tick():
@@ -713,7 +713,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     fielder = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fields")
     wslots = threading.BoundedSemaphore(2)     # at most two finished units waiting for the writer
     busy, pend, lock = set(), [], threading.Lock()
-    fpool = TG.field_pool(jobs) if jobs > 1 else None
+    fpool = TG.field_pool(jobs, owner=os.getpid()) if jobs > 1 else None
     pre = {}                                    # (lo, job) -> future of the reader's inputs
 
     clock = threading.Lock()                    # the shard cache is not thread-safe: one caller at a time
@@ -1019,6 +1019,7 @@ def _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, rungs=
 def _produce_entry(cfg_json, out, gpu, frac, backend):
     """The spawned producer's entry point. Sets `CUDA_VISIBLE_DEVICES` BEFORE torch is imported, which
     is why this module imports torch nowhere at the top level."""
+    own_process_group()         # the producer, its forkserver and its fields pool: one killable group
     if gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(int(gpu))
     from rvsm import cli
@@ -1646,6 +1647,32 @@ def proc_tree(pid):
     return out
 
 
+def own_process_group():
+    """Make this process the leader of a new process group (the spawned producer's first act). Its
+    forkserver and every fields-pool worker inherit the group, whoever their parent is, so the supervisor
+    can remove all of them with one `killpg` -- PDEATHSIG alone follows the forkserver, not the
+    producer (review P3-09). Returns the group id."""
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
+    return os.getpgid(0)
+
+
+def kill_group(pgid, sig=None):
+    """SIGKILL the process group `pgid` -- never the caller's own group, never 0/1. True if sent."""
+    import signal
+    sig = signal.SIGKILL if sig is None else sig
+    try:
+        pgid = int(pgid)
+        if pgid <= 1 or pgid == os.getpgid(0):
+            return False
+        os.killpg(pgid, sig)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def kill_tree(tree, sig=None):
     """SIGKILL every (pid, start time) of `proc_tree` that is still that same process."""
     import signal
@@ -1687,6 +1714,21 @@ class ProducerWatch:
     def _hb(self):
         return _read_json(os.path.join(self.out, "workers", "produce.json")) or {}
 
+    def _kill_group(self, pr):
+        """Remove the producer's process group (forkserver, fields pool, anything it started): the
+        group it recorded in its heartbeat when that heartbeat is this process's, else the one it leads
+        (`own_process_group` makes the pgid its pid). A producer THREAD has no group of its own."""
+        pid = getattr(pr, "pid", None)
+        if pid is None:
+            return False
+        hb = self._hb()
+        pgid = hb.get("pgid") if hb.get("pid") == pid and hb.get("pgid") else pid
+        sent = kill_group(pgid)
+        if sent:
+            jlog(self.out, "sched", {"kind": "producer_group_killed", "pgid": int(pgid), "pid": pid},
+                 echo=False)
+        return sent
+
     def check(self):
         """One look. Returns what happened: None (healthy / nothing to do), "restart", "backoff",
         "stuck" (will not exit) or "silent_thread"."""
@@ -1715,6 +1757,7 @@ class ProducerWatch:
                 if not pr.is_alive():
                     break
             kill_tree(tree)
+            self._kill_group(pr)
             if pr.is_alive():
                 jlog(self.out, "sched", {"kind": "producer_stuck", "pid": getattr(pr, "pid", None)})
                 self.log(f"!!!! [supervisor] producer pid {getattr(pr, 'pid', None)} is silent and will "
@@ -1723,6 +1766,8 @@ class ProducerWatch:
             reason = "silent"
         else:
             reason = f"exit {getattr(pr, 'exitcode', None)}"
+            # it died on its own: its forkserver and fields pool may not have (P3-09)
+            self._kill_group(pr)
         if now < self.next_at:
             return "backoff"
         self.fails += 1
@@ -1952,6 +1997,8 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                 pr.terminate()
                 pr.join(30)
                 kill_tree(tree)
+            if getattr(pr, "pid", None):
+                kill_group(pr.pid)              # and whatever of its group outlived it
         jlog(out, "sched", {"kind": "exit", "round": state["round"],
                             "step": int(read_state(out).get("step", 0)), "ckpt": ck})
     return ck

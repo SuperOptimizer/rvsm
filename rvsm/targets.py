@@ -479,24 +479,54 @@ def die_with_parent():
         pass
 
 
-def _nice():
+def _proc_start(pid):
+    """The start time of `pid` (clock ticks since boot), or None when it is gone or a zombie."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            st = f.read()
+        rest = st[st.rindex(")") + 2:].split()
+        return None if rest[0] in ("Z", "X") else int(rest[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def watch_owner(pid, start, every=1.0):
+    """A daemon thread that ends this process as soon as the process `pid` (started at `start`) is gone:
+    the fields-pool worker's producer-death watch (review P3-09). The worker's own parent is the pool's
+    forkserver, which can outlive the producer, so PDEATHSIG alone does not follow the producer."""
+    import threading
+    import time
+
+    def run():
+        while True:
+            if _proc_start(pid) != start:
+                os._exit(0)
+            time.sleep(every)
+    threading.Thread(target=run, name="rvsm-owner-watch", daemon=True).start()
+
+
+def _nice(owner=None, owner_start=None):
     die_with_parent()
+    if owner is not None:
+        watch_owner(owner, owner_start)
     try:
         os.nice(10)       # the fields are background work: the trainer's loader keeps the cores it needs
     except OSError:
         pass
 
 
-def field_pool(jobs):
+def field_pool(jobs, owner=None):
     """A process pool for `region_fields(pool=...)` that lives as long as the producer.
 
     `forkserver`, not `fork`: the producer that owns it has CUDA and several threads, and a forked child
     of a threaded process can inherit a lock some other thread held at the fork. The workers run at
-    nice 10 and die with their parent (`die_with_parent`)."""
+    nice 10 and die with their parent (`die_with_parent`) -- and, given `owner` (the producer's pid),
+    with the OWNER too (`watch_owner`), whatever becomes of the forkserver in between."""
     import concurrent.futures as cf
     import multiprocessing as mp
+    args = (int(owner), _proc_start(owner)) if owner is not None else (None, None)
     return cf.ProcessPoolExecutor(max_workers=int(jobs), mp_context=mp.get_context("forkserver"),
-                                  initializer=_nice)
+                                  initializer=_nice, initargs=args)
 
 
 def _blocks(shape, block):

@@ -1089,3 +1089,86 @@ def test_a_visit_draws_only_after_its_lease_is_acknowledged(tmp_path):
     RUN.write_state(str(out), round=1)
     assert ds._await_ack(0, (256, 0, 0), timeout=10) is False
     assert WK.LEASE_ACK_S == 60.0
+
+
+# --------------------------------------------------------------------------- P3-09: the fields pool dies too
+
+def _pool_producer(conn, group):
+    """A stand-in producer, SPAWNED like the real one: it builds the real `targets.field_pool`
+    (forkserver context), proves a worker initialised and is alive, reports (worker, forkserver) and
+    dies without shutting the pool down."""
+    from rvsm import run as R, targets as TG
+    if group:
+        R.own_process_group()
+    pool = TG.field_pool(1, owner=os.getpid())
+    worker = pool.submit(os.getpid).result(timeout=60)
+    import subprocess
+    # something else the producer started, with no death watch of its own: only its group ties it
+    other = subprocess.Popen(["sleep", "120"]).pid if group else None
+    conn.send((worker, _ppid(worker), os.getpgid(0), other))
+    time.sleep(0.5)
+    os._exit(0)
+
+
+def _ppid(pid):
+    with open(f"/proc/{pid}/stat") as f:
+        st = f.read()
+    return int(st[st.rindex(")") + 2:].split()[1])
+
+
+def _spawn_pool_producer(group):
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    a, b = ctx.Pipe(duplex=False)
+    pr = ctx.Process(target=_pool_producer, args=(b, group))
+    pr.start()
+    assert a.poll(120), "the pool worker must acknowledge a completed initialisation"
+    return (pr,) + tuple(a.recv())
+
+
+def _gone(pids, within=15.0):
+    t0 = time.time()
+    while time.time() - t0 < within and any(_running(p) for p in pids):
+        time.sleep(0.1)
+    return not any(_running(p) for p in pids)
+
+
+def test_the_real_field_pool_dies_with_its_producer():
+    """P3-09 with the production context: the worker's parent is the pool's FORKSERVER, so PDEATHSIG
+    followed the forkserver and both outlived a producer that exited (the review's probe). The owner
+    watch in the worker's initializer ends it when the producer is gone; the forkserver then exits."""
+    pr, worker, forkserver, _, _ = _spawn_pool_producer(group=False)
+    try:
+        assert forkserver != pr.pid and _running(worker) and _running(forkserver)
+        pr.join(30)
+        assert not pr.is_alive()
+        assert _gone([worker, forkserver]), "the fields pool outlived its producer"
+    finally:
+        for p in (worker, forkserver):
+            if _running(p):
+                os.kill(p, 9)
+
+
+def test_the_supervisor_kills_a_dead_producers_group_before_respawning(tmp_path):
+    """P3-09, the supervisor's half: a producer that died on its own is replaced only after its whole
+    process group -- forkserver and fields pool included -- has been killed (the already-dead branch
+    cleaned nothing). The heartbeat records the group; the watch kills it, then respawns."""
+    pr, worker, forkserver, pgid, other = _spawn_pool_producer(group=True)
+    try:
+        assert pgid == pr.pid and all(os.getpgid(p) == pgid for p in (worker, forkserver, other))
+        pr.join(30)
+        time.sleep(0.5)
+        assert not pr.is_alive() and _running(other), "the orphan should outlive the producer"
+        clock = [time.time()]
+        out, procs, spawned, w = _watch(tmp_path, pr, clock)
+        RUN._write_json(os.path.join(out, "workers", "produce.json"),
+                        {"pid": pr.pid, "pgid": pgid, "last_ts": clock[0]})
+        assert w.check() == "restart" and len(spawned) == 1
+        kinds = [r.get("kind") for r in RUN.tail_jsonl(os.path.join(out, "logs", "sched.jsonl"))]
+        assert "producer_group_killed" in kinds
+        assert kinds.index("producer_group_killed") < kinds.index("restart"), kinds
+        assert _gone([worker, forkserver, other], within=5.0)
+    finally:
+        for p in (worker, forkserver, other):
+            if _running(p):
+                os.kill(p, 9)
