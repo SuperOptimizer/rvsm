@@ -175,7 +175,9 @@ class Config:
     teacher_ckpts: dict = field(default_factory=dict)  # {"recto": path, "m7": path} local teacher weights
     cache_gb: float = 64.0             # CT shard cache budget on disk/RAM
     gpu_prefetch: bool = True          # the trainer copies batch i+1 to the device on a side stream
-    pin_memory: bool = True            # the trainer's loader pins its batches (a suspect on virtualised GPUs)
+    pin_memory: bool = False           # the trainer's loader pins its batches. Off: on Thunder's A100 the
+                                       # trainer hung inside CUDA calls in every run that pinned (none that
+                                       # did not), and pinned H2D was slower there anyway (2.2 vs 2.7 GB/s)
     vram_train_gb: float = 46.0        # the resident budget table (GB on an 80 GB card): the trainer ...
     vram_produce_gb: float = 30.0      # ... and the producer; each becomes a per-process memory fraction
     ct_seed: str = ""                  # a local, possibly partial mirror of a URL `ct`: shards it has are

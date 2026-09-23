@@ -400,17 +400,26 @@ def _prepared(grid, dev, layout, cascade=None):
 
 
 def to_device_iter(src, dev, side=True):
-    """Batches from `src` with every tensor already on `dev`: batch i+1 is copied (non_blocking) on a
-    SIDE stream while the caller runs step i on the default stream, and the default stream waits on
-    that copy's event before it touches the batch. On a GPU whose host link is slow (Thunder's A100:
-    2.7 GB/s, ~110 ms for one 256^3 sample's ~300 MB of uint8) the copy then hides under the step.
-    `side=False` copies on the default stream (the fallback if a host misbehaves with extra streams)."""
+    """Batches from `src` with every tensor already on `dev`, fetched and copied AHEAD: a helper thread
+    takes batch i+1 from the loader and copies it (on a side CUDA stream) while the caller runs step i;
+    the default stream waits on the copy's event before it touches the batch.
+
+    The thread is what makes this overlap at all: from pageable memory a `non_blocking` copy is still
+    synchronous for the calling thread (~110 ms for one 256^3 sample's ~300 MB of uint8 over
+    Thunder's 2.7 GB/s link), and pinned memory is not an option there (the trainer hung inside CUDA
+    calls whenever the loader pinned). `side=False` copies on the default stream instead."""
     if dev.type != "cuda":
         yield from src
         return
+    import concurrent.futures as cf
     stream = torch.cuda.Stream(dev) if side else None
+    it = iter(src)
 
-    def ship(item):
+    def fetch():
+        try:
+            item = next(it)
+        except StopIteration:
+            return None
         b = _batch(item)
         if stream is None:
             return {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}, None
@@ -420,23 +429,20 @@ def to_device_iter(src, dev, side=True):
             ev.record(stream)
         return d, ev
 
-    it = iter(src)
-    try:
-        nxt = ship(next(it))
-    except StopIteration:
-        return
-    while nxt is not None:
-        cur, ev = nxt
-        try:
-            nxt = ship(next(it))
-        except StopIteration:
-            nxt = None
-        if ev is not None:
-            torch.cuda.current_stream(dev).wait_event(ev)
-            for v in cur.values():
-                if torch.is_tensor(v) and v.is_cuda:
-                    v.record_stream(torch.cuda.current_stream(dev))
-        yield cur
+    with cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-h2d") as ex:
+        fut = ex.submit(fetch)
+        while True:
+            got = fut.result()
+            if got is None:
+                return
+            fut = ex.submit(fetch)
+            cur, ev = got
+            if ev is not None:
+                torch.cuda.current_stream(dev).wait_event(ev)
+                for v in cur.values():
+                    if torch.is_tensor(v) and v.is_cuda:
+                        v.record_stream(torch.cuda.current_stream(dev))
+            yield cur
 
 
 class _Phases:
