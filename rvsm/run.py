@@ -81,6 +81,10 @@ from rvsm import config as CFG
 
 STOP_FILE = "STOP"
 PHASE_FILE = "PHASE"
+PAUSE_FILE = "PAUSE_RAM"    # while it exists the producer starts no new unit (the host-RAM guard's)
+RAM_PAUSE_FRAC = 0.85       # host memory in use (or the run's process-tree RSS) above this share of
+RAM_RESUME_FRAC = 0.75      # MemTotal pauses the producer; below this share it resumes
+RAM_CHECK_S = 5.0           # the guard looks this often (the paris4 OOM went 90 % -> 99.5 % in 4 s)
 HEARTBEAT_S = 30.0          # how often the supervisor stamps workers.json / logs/sched.jsonl
 SILENT_MAX_S = 1800.0       # a producer that has not stamped its heartbeat for this long is restarted
                             # (it stamps once per unit; one teacher region with its first engine
@@ -732,6 +736,11 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             if os.path.exists(os.path.join(out, PHASE_FILE)) and read_phase(out) != "produce":
                 time.sleep(IDLE_S)
                 continue
+            if producer_paused(out):        # the supervisor's host-RAM guard: no new unit
+                _write_json(hb, {"pid": os.getpid(), "phase": "paused_ram", "last_ts": time.time(),
+                                 "L": L, "cursor": cursor})
+                time.sleep(IDLE_S)
+                continue
             if free_gb(out) < float(cfg.reserve_gb):
                 jlog(out, "produce", {"kind": "backpressure", "free_gb": round(free_gb(out), 1)})
                 time.sleep(IDLE_S * 5)
@@ -1167,10 +1176,99 @@ def setup(cfg, out=None):
             "heldout": held, "visits": visits, "order": order, "route": route}
 
 
+def host_mem():
+    """(MemTotal, MemAvailable) in bytes, from /proc/meminfo; (0, 0) where there is none."""
+    got = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                if k in ("MemTotal", "MemAvailable"):
+                    got[k] = int(v.split()[0]) * 1024
+    except OSError:
+        return 0, 0
+    return got.get("MemTotal", 0), got.get("MemAvailable", 0)
+
+
+def tree_rss(pid=None):
+    """(total RSS in bytes, number of processes) of `pid` (default: this process) and every descendant
+    -- the supervisor/trainer, its loader workers, the producer and the producer's fields pool."""
+    pid = int(pid or os.getpid())
+    kids, rss = {}, {}
+    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return 0, 0
+    for d in names:
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                st = f.read()
+            ppid = int(st[st.rindex(")") + 2:].split()[1])
+            with open(f"/proc/{d}/statm") as f:
+                rss[int(d)] = int(f.read().split()[1]) * page
+        except (OSError, ValueError, IndexError):
+            continue
+        kids.setdefault(ppid, []).append(int(d))
+    tot, n, todo, seen = 0, 0, [pid], set()
+    while todo:
+        q = todo.pop()
+        if q in seen:
+            continue
+        seen.add(q)
+        tot, n = tot + rss.get(q, 0), n + 1
+        todo += kids.get(q, [])
+    return tot, n
+
+
+def producer_paused(out):
+    return os.path.exists(os.path.join(str(out), PAUSE_FILE))
+
+
+def ram_guard(out, pid=None, mem=None, rss=None, log=print):
+    """One look at the host's memory: pause the producer above `RAM_PAUSE_FRAC` of MemTotal, resume it
+    below `RAM_RESUME_FRAC`. Pressure is the larger of the host's memory in use (MemTotal -
+    MemAvailable) and this run's process-tree RSS. Returns the numbers, for the heartbeat's record.
+
+    The kernel OOM on a 64 GB host with no swap takes the whole box down (paris4, step 2000); a paused
+    producer finishes its unit in flight and starts no other, which is the one lever the supervisor
+    has that costs nothing but time."""
+    total, avail = mem if mem is not None else host_mem()
+    r, n = rss if rss is not None else tree_rss(pid)
+    if not total:
+        return {}
+    used = total - avail
+    frac = max(used, r) / total
+    rec = {"rss_gb": round(r / 2 ** 30, 2), "procs": n, "host_used_gb": round(used / 2 ** 30, 2),
+           "host_total_gb": round(total / 2 ** 30, 2), "mem_frac": round(frac, 3)}
+    p = os.path.join(str(out), PAUSE_FILE)
+    if frac >= RAM_PAUSE_FRAC and not os.path.exists(p):
+        with open(p, "w") as f:
+            f.write(json.dumps({"t": time.time(), **rec}))
+        jlog(out, "sched", {"kind": "ram_guard", "action": "pause_producer", **rec}, echo=False)
+        log(f"!!!! [ram_guard] HOST RAM {frac:.0%} of {rec['host_total_gb']} GB (run tree RSS "
+            f"{rec['rss_gb']} GB in {n} procs, host used {rec['host_used_gb']} GB): PRODUCER PAUSED "
+            f"until < {RAM_RESUME_FRAC:.0%} !!!!")
+        rec["action"] = "pause"
+    elif frac < RAM_RESUME_FRAC and os.path.exists(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        jlog(out, "sched", {"kind": "ram_guard", "action": "resume_producer", **rec}, echo=False)
+        log(f"[ram_guard] host RAM back to {frac:.0%}: producer resumed")
+        rec["action"] = "resume"
+    return rec
+
+
 def heartbeat(out, place, stop_ev, procs, respawn):
-    """The supervisor's own thread: stamp `workers.json` and `logs/sched.jsonl`, and restart a producer
-    that has gone silent for longer than `SILENT_MAX_S` (plan §1)."""
+    """The supervisor's own thread: stamp `workers.json` and `logs/sched.jsonl` (with the run's
+    process-tree RSS and the host's memory), restart a producer that has gone silent for longer than
+    `SILENT_MAX_S` (plan §1), and run the host-RAM guard every `RAM_CHECK_S` (`ram_guard`)."""
     while not stop_ev.is_set():
+        mem = ram_guard(out, log=lambda m: print(m, flush=True))
         w = {"mode": place["mode"], "phases": bool(place["phases"]), "t": time.time(),
              "train": {"pid": os.getpid(), "phase": "train", "last_ts": time.time(),
                        **{k: read_state(out).get(k) for k in ("step", "round", "cursor", "verso_on")}}}
@@ -1180,7 +1278,9 @@ def heartbeat(out, place, stop_ev, procs, respawn):
         jlog(out, "sched", {"kind": "heartbeat", **{k: w["train"].get(k) for k in
                                                     ("step", "round", "cursor")},
                             "produce_phase": p.get("phase"),
-                            "produce_age_s": round(time.time() - float(p.get("last_ts") or 0), 1)},
+                            "produce_age_s": round(time.time() - float(p.get("last_ts") or 0), 1),
+                            **{k: v for k, v in mem.items() if k != "action"},
+                            "producer_paused": producer_paused(out)},
              echo=False)
         age = time.time() - float(p.get("last_ts") or time.time())
         pr = procs.get("produce")
@@ -1192,7 +1292,11 @@ def heartbeat(out, place, stop_ev, procs, respawn):
             except Exception:  # noqa: BLE001
                 pass
             procs["produce"] = respawn()
-        stop_ev.wait(HEARTBEAT_S)
+        t_next = time.time() + HEARTBEAT_S
+        while not stop_ev.is_set() and time.time() < t_next:
+            stop_ev.wait(min(RAM_CHECK_S, max(t_next - time.time(), 0.0)))
+            if not stop_ev.is_set() and time.time() < t_next:
+                ram_guard(out, log=lambda m: print(m, flush=True))
 
 
 def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
@@ -1217,8 +1321,9 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
         write_phase(out, "train")
     elif os.path.exists(os.path.join(out, PHASE_FILE)):
         os.remove(os.path.join(out, PHASE_FILE))
-    if os.path.exists(os.path.join(out, STOP_FILE)):
-        os.remove(os.path.join(out, STOP_FILE))
+    for f in (STOP_FILE, PAUSE_FILE):
+        if os.path.exists(os.path.join(out, f)):
+            os.remove(os.path.join(out, f))
 
     dev = device or (f"cuda:{place['train_gpu']}" if place["train_gpu"] is not None else "cpu")
     if place["train_gpu"] is not None:

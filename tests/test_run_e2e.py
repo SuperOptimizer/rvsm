@@ -420,3 +420,42 @@ def test_the_trainer_walks_the_producers_walk(small_cfg, tmp_path):
     assert [int(i) for i in ds.order] == [int(i) for i in ctx["order"]]
     assert [(v["k"], v["lo"], v.get("v")) for v in ds.visits] == \
         [(v["k"], v["lo"], v.get("v")) for v in ctx["visits"]]
+
+
+def test_the_ram_guard_pauses_the_producer_and_lets_it_go(tmp_path):
+    """Above RAM_PAUSE_FRAC of MemTotal (host in use, or the run's own tree RSS) the supervisor drops
+    the PAUSE marker the producer honours, and says so loudly; below RAM_RESUME_FRAC it lifts it."""
+    out = str(tmp_path / "g")
+    os.makedirs(os.path.join(out, "logs"))
+    G = 2 ** 30
+    said = []
+    rec = RUN.ram_guard(out, mem=(64 * G, 40 * G), rss=(10 * G, 9), log=said.append)
+    assert not RUN.producer_paused(out) and "action" not in rec and rec["rss_gb"] == 10.0
+    rec = RUN.ram_guard(out, mem=(64 * G, 5 * G), rss=(20 * G, 9), log=said.append)   # host 92 %
+    assert RUN.producer_paused(out) and rec["action"] == "pause" and "PRODUCER PAUSED" in said[-1]
+    rec = RUN.ram_guard(out, mem=(64 * G, 12 * G), rss=(20 * G, 9), log=said.append)  # 81 %: hold
+    assert RUN.producer_paused(out) and "action" not in rec
+    rec = RUN.ram_guard(out, mem=(64 * G, 30 * G), rss=(56 * G, 9), log=said.append)  # tree 87 %
+    assert RUN.producer_paused(out)
+    rec = RUN.ram_guard(out, mem=(64 * G, 40 * G), rss=(20 * G, 9), log=said.append)
+    assert not RUN.producer_paused(out) and rec["action"] == "resume"
+    kinds = [r.get("action") for r in RUN.tail_jsonl(os.path.join(out, "logs", "sched.jsonl"))]
+    assert kinds == ["pause_producer", "resume_producer"]
+
+
+def test_tree_rss_counts_this_process_and_its_children():
+    import subprocess
+    import sys
+    me, n1 = RUN.tree_rss()
+    assert me > 0 and n1 >= 1
+    p = subprocess.Popen([sys.executable, "-c", "import time; x = bytearray(64 << 20); time.sleep(30)"])
+    try:
+        import time
+        for _ in range(100):
+            both, n2 = RUN.tree_rss()
+            if n2 > n1 and both > me + (48 << 20):
+                break
+            time.sleep(0.1)
+        assert n2 > n1 and both > me + (48 << 20)
+    finally:
+        p.kill()
