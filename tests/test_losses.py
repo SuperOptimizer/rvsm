@@ -212,12 +212,14 @@ def test_the_weighted_dice_of_a_perfect_prediction_is_zero_under_fractional_weig
 
 def test_ect_blocks_are_drawn_per_sample_and_skip_weightless_ones():
     """ect_loss takes `dirs` directions and `nblocks` blocks per sample drawn from a seeded generator
-    (the same seed, the same draw), and never a block whose target weight is all zero (review T07)."""
+    (the same seed, the same draw), and only FULLY observed blocks (review T07, pass-3 P3-12)."""
     torch.manual_seed(0)
     t = (torch.rand(2, 1, 40, 40, 40) > 0.5).float()
     p = torch.rand(2, 1, 40, 40, 40)
     w = torch.zeros_like(t)
     w[0, :, 4:20, 4:20, 4:20] = 1                              # sample 0: only the first block is live
+    w[0, :, 20:36, 4:20, 4:20] = 1
+    w[0, :, 20, 10, 10] = 0                                    # ... this one has one unknown voxel
     a = L.ect_loss(p, t, dirs=3, res=8, margin=4, block=16, nblocks=1, w=w,
                    gen=torch.Generator().manual_seed(5))
     b = L.ect_loss(p, t, dirs=3, res=8, margin=4, block=16, nblocks=1, w=w,
@@ -226,7 +228,7 @@ def test_ect_blocks_are_drawn_per_sample_and_skip_weightless_ones():
     only0 = L.ect_loss(p[:1], t[:1], dirs=3, res=8, margin=4, block=16, nblocks=4, w=w[:1],
                        gen=torch.Generator().manual_seed(1))
     first = L.ect_loss(p[:1], t[:1], dirs=3, res=8, margin=4, block=16, nblocks=1)
-    assert float(only0) == pytest.approx(float(first))         # the one live block, whatever the draw
+    assert float(only0) == pytest.approx(float(first))         # the one FULLY observed block, always
     none = L.ect_loss(p, t, dirs=3, res=8, margin=4, block=16, nblocks=2, w=torch.zeros_like(w))
     assert float(none) == 0.0                                   # nothing live: nothing scores
     seen = set()
@@ -235,3 +237,15 @@ def test_ect_blocks_are_drawn_per_sample_and_skip_weightless_ones():
         seen.add(round(float(L.ect_loss(p[1:], t[1:], dirs=1, res=8, margin=4, block=16, nblocks=1,
                                         gen=g)), 8))
     assert len(seen) > 1
+
+
+def test_the_ect_draw_differs_between_microbatches_of_a_step():
+    from rvsm import train as TR
+    torch.manual_seed(0)
+    t = (torch.rand(1, 1, 72, 72, 72) > 0.5).float()
+    p = torch.rand(1, 1, 72, 72, 72)
+    vals = {round(float(L.ect_loss(p, t, dirs=1, res=8, margin=4, block=16, nblocks=1,
+                                   gen=torch.Generator().manual_seed(TR.ect_seed(100, m)))), 8)
+            for m in range(4)}
+    assert len({TR.ect_seed(100, m) for m in range(4)} | {TR.ect_seed(101, 0)}) == 5
+    assert len(vals) > 1

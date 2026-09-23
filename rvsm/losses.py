@@ -564,8 +564,8 @@ def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5, w=N
     `dirs` is the number of ECT directions (`fib_dirs`). Per SAMPLE, `nblocks` blocks are drawn at
     random from the interior grid with `gen` (a seeded torch.Generator: a resume replays the same draw;
     without one the blocks are the first of the grid, the old fixed choice). With `w` (the target
-    weight, (B, 1+, Z, Y, X)) a block whose weight is all zero is not a candidate -- it says nothing --
-    and a sample with no valid block does not score. The value is 0 when nothing scores.
+    weight, (B, 1+, Z, Y, X)) only a FULLY observed block (weight > 0 at every voxel) is a candidate,
+    and a sample with no such block does not score. The value is 0 when nothing scores.
 
     The transform is normalised by the number of vertices of a sub-block, so the value does not depend on
     `block`; it is 0 for identical inputs and finite for any input."""
@@ -586,9 +586,11 @@ def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5, w=N
     for s in range(B):
         cand = grid
         if w is not None:
+            # FULLY observed blocks only: a block with any zero-weight voxel has unknown target there,
+            # and the Euler characteristic of a partly unknown block is not a target (pass-3 P3-12)
             ws = w[s, :1]
             cand = [g for g in grid
-                    if float(ws[:, g[0]:g[0] + block, g[1]:g[1] + block, g[2]:g[2] + block].sum()) > 0]
+                    if bool((ws[:, g[0]:g[0] + block, g[1]:g[1] + block, g[2]:g[2] + block] > 0).all())]
         if not cand:
             continue
         if gen is not None:
