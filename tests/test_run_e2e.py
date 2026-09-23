@@ -601,3 +601,25 @@ def test_a_resumed_walk_skips_what_it_visited_past_a_waiting_region(tmp_path):
     assert snap["workers"]["0"]["done"] == [1, 2]
     after = list(itertools.islice(iter(_stub_walk(out, L=4, start=snap)), 6))
     assert after[0] == 39 and 38 not in after and 37 not in after
+
+
+def test_round_r_student_passes_use_the_frozen_round_teacher(tmp_path, monkeypatch):
+    """Round 0's verso passes track the live student.pt; round r >= 1 uses the frozen
+    ckpt/teacher_round_<r>.pt from state.json, never the student being trained, and the slot knows
+    the sha256 of what it loaded (the producer writes it into the store attrs)."""
+    import hashlib
+    from rvsm import infer
+    out = tmp_path / "slot"
+    (out / "ckpt").mkdir(parents=True)
+    (out / "ckpt" / "student.pt").write_bytes(b"live")
+    tp = out / "ckpt" / "teacher_round_1.pt"
+    loads = []
+    monkeypatch.setattr(infer, "student_fn", lambda p, device=None, compile=True: loads.append(p) or p)
+    slot = RUN.StudentSlot(str(out), compile=False)
+    assert slot.get(0) == str(out / "ckpt" / "student.pt")
+    assert slot.sha == hashlib.sha256(b"live").hexdigest()
+    assert slot.get(1, str(tp)) is None, "round 1 must not fall back to the live student"
+    tp.write_bytes(b"frozen")
+    assert slot.get(1, str(tp)) == str(tp) and slot.sha == hashlib.sha256(b"frozen").hexdigest()
+    (out / "ckpt" / "student.pt").write_bytes(b"live, newer")          # training moves on ...
+    assert slot.get(1, str(tp)) == str(tp) and loads.count(str(tp)) == 1  # ... round 1 does not

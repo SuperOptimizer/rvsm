@@ -484,26 +484,55 @@ def torch_full_like_u8(t, v):
     return torch.full_like(t, int(v), dtype=torch.uint8)
 
 
+def file_sha256(path, _cache={}):
+    """sha256 of a checkpoint file, cached per (path, mtime, size): a store's attrs name the exact
+    weights that wrote it."""
+    import hashlib
+    st = os.stat(path)
+    key = (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+    if key not in _cache:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for blk in iter(lambda: f.read(1 << 24), b""):
+                h.update(blk)
+        _cache[key] = h.hexdigest()
+    return _cache[key]
+
+
 class StudentSlot:
-    """The latest `ckpt/student.pt`, reloaded when its step changes and not otherwise."""
+    """The student the producer runs, reloaded when its file changes and not otherwise.
+
+    Round 0 (the verso passes) tracks the LIVE `ckpt/student.pt`. Round r >= 1 (the self passes that
+    write round r's targets) uses the FROZEN round teacher `state["teacher"]`
+    (`ckpt/teacher_round_<r>.pt`, the EMA snapshotted when round r opened): a round's targets must come
+    from one fixed network, not from the student that is being trained on them."""
 
     def __init__(self, out, device=None, compile=True):
-        self.path = os.path.join(str(out), "ckpt", "student.pt")
+        self.out = str(out)
+        self.path = os.path.join(self.out, "ckpt", "student.pt")
         self.device, self.compile = device, bool(compile)
-        self.st, self.mtime = None, None
+        self.st, self.mtime, self.loaded, self.sha = None, None, None, None
 
-    def get(self):
+    def source(self, round_=0, teacher=None):
+        """The checkpoint this round's student passes must use (None: not there yet)."""
+        if int(round_) >= 1:
+            return teacher if teacher and os.path.exists(teacher) else None
+        return self.path if os.path.exists(self.path) else None
+
+    def get(self, round_=0, teacher=None):
         from rvsm import infer
-        if not os.path.exists(self.path):
+        p = self.source(round_, teacher)
+        if p is None:
             return None
-        m = os.path.getmtime(self.path)
-        if self.st is None or m != self.mtime:
+        m = os.path.getmtime(p)
+        if self.st is None or p != self.loaded or m != self.mtime:
             try:
-                self.st = infer.student_fn(self.path, device=self.device, compile=self.compile)
-                self.mtime = m
+                st = infer.student_fn(p, device=self.device, compile=self.compile)
+                self.st, self.mtime, self.loaded = st, m, p
+                self.sha = file_sha256(p)
             except Exception as e:  # noqa: BLE001  -- a checkpoint caught mid-rename comes back next loop
                 print(f"[produce] student reload: {e!r}", flush=True)
-                return self.st
+                return self.st if self.loaded == p else None
         return self.st
 
 
@@ -778,7 +807,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if job == "teacher" and bank is None:
                     bank = TeacherBank(cfg, out, device=device, backend=backend)
                     pre.pop((lo, job), None)        # read before the bank existed: no CT in it
-                if job in ("verso", "self") and slot.get() is None:
+                if job in ("verso", "self") and slot.get(round_, st.get("teacher")) is None:
                     break
                 t0 = time.time()
                 _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "job": job,
@@ -800,12 +829,13 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                 ("rw", W.cpu().numpy(), 8, "prob_u8")]
                         del P, W
                     else:
-                        stu = slot.get()
+                        stu = slot.get(round_, st.get("teacher"))
                         heads = "verso" if job == "verso" else "all"
                         sign = -1.0 if job == "verso" else 1.0
                         want = [str(stu.layout.channels[0])] if heads == "verso" else "all"
                         planes = _student_planes(stu, ct_local, ax, lo, size, sign, want, meta5, pyr)
                         attrs = {"producer": "student", "ckpt": stu.ckpt, "step": int(stu.step),
+                                 "ckpt_sha256": slot.sha, "frozen_teacher": bool(round_ >= 1),
                                  "radial_sign": int(sign), "window": int(stu.cfg.infer_window),
                                  "halo": int(stu.cfg.infer_halo),
                                  "cascade_depth": int(stu.cfg.cascade_depth),
