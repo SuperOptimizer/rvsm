@@ -1370,6 +1370,10 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
         p.start()
         return p
 
+    # a produce.json left by the previous process (a crash, a reboot) is hours old: the first
+    # heartbeat read it as a silent producer and restarted the one it had just spawned
+    _write_json(os.path.join(out, "workers", "produce.json"),
+                {"pid": None, "phase": "spawning", "last_ts": time.time()})
     procs["produce"] = spawn_producer()
     hb = threading.Thread(target=heartbeat, args=(out, place, stop_ev, procs, spawn_producer),
                           daemon=True)

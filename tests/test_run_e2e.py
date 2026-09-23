@@ -156,7 +156,8 @@ def _first_done(out, channel, round_):
     return got[0]
 
 
-def test_rvsm_stop_ends_the_run_within_one_unit(region_cfg, fake_teacher, tmp_path, has_volcomp):
+def test_rvsm_stop_ends_the_run_within_one_unit(region_cfg, fake_teacher, tmp_path, has_volcomp,
+                                              monkeypatch):
     """`rvsm stop` touches STOP; the trainer checkpoints at its next evaluation and exits, and the
     producer stops after the region it is on. Nothing is killed."""
     if not has_volcomp:
@@ -167,6 +168,20 @@ def test_rvsm_stop_ends_the_run_within_one_unit(region_cfg, fake_teacher, tmp_pa
                   heldout=1, workers=0, min_regions_before_train=1, reserve_gb=0.001,
                   infer_window=64, infer_halo=8, cascade_depth=1)
     box = {}
+    # what a crashed run leaves behind: an hours-old producer heartbeat and a RAM-guard pause marker.
+    # Neither may outlive the restart (the stale heartbeat read as a silent producer and restarted the
+    # one just spawned; a stale pause would hold the producer forever)
+    os.makedirs(os.path.join(cfg.out, "workers"), exist_ok=True)
+    RUN._write_json(os.path.join(cfg.out, "workers", "produce.json"),
+                    {"pid": 1, "phase": "round0", "last_ts": time.time() - 7000})
+    open(os.path.join(cfg.out, RUN.PAUSE_FILE), "w").close()
+    real = RUN.produce_loop
+
+    def slow_start(*a, **k):             # a spawned producer takes seconds to stamp its first heartbeat
+        time.sleep(1.5)
+        return real(*a, **k)
+
+    monkeypatch.setattr(RUN, "produce_loop", slow_start)
 
     def go():
         box["ck"] = RUN.run(cfg, out=cfg.out)
@@ -186,6 +201,9 @@ def test_rvsm_stop_ends_the_run_within_one_unit(region_cfg, fake_teacher, tmp_pa
     assert not th.is_alive(), "the run did not stop"
     assert os.path.exists(box["ck"]) and box["ck"].endswith("student.pt")
     assert RUN.read_state(cfg.out)["round"] == 0
+    sched = RUN.tail_jsonl(os.path.join(cfg.out, "logs", "sched.jsonl"), 10 ** 4)
+    assert not [r for r in sched if r.get("kind") == "restart"], "a stale heartbeat restarted the producer"
+    assert not RUN.producer_paused(cfg.out)
 
 
 # =============================================================== the pieces, without a run around them
