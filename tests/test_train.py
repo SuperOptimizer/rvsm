@@ -305,6 +305,49 @@ def test_evaluate_skips_windows_with_no_weight(full_cfg):
     assert out["dice"] > 0.99 and out["bce"] < 1e-3, out
 
 
+class _Fixed(torch.nn.Module):
+    """A 'net' that says +12 (sheet) everywhere: right on the band, confidently wrong off it."""
+
+    def __init__(self, cout):
+        super().__init__()
+        self.cout = cout
+
+    def forward(self, x):
+        return torch.full((x.shape[0], self.cout) + tuple(x.shape[2:]), 12.0)
+
+
+def test_evaluate_is_voxel_weighted_and_the_headline_is_the_fine_rungs(full_cfg):
+    """A coarse window with a sliver of weight counts that sliver, not a whole window: pooled over
+    voxels, and the headline dice / bce pool rungs 2-4 only while dice_coarse / bce_coarse carry 5-11.
+    Per-window averaging let a handful of rung 7-11 corner voxels drive the paris4 headline bce to ~1."""
+    lay = full_cfg.layout()
+    fine = _item(full_cfg, k=2, dist_w=0, verso_w=0)
+    fine2 = _item(full_cfg, k=3, dist_w=0, verso_w=0, seed=1)
+    coarse = _item(full_cfg, k=9, dist_w=0, verso_w=0, seed=2)
+    wc = torch.zeros_like(coarse["w"])
+    wc[0, :2, :2, :2] = 255                               # eight weighted voxels in a corner ...
+    coarse["w"] = wc
+    coarse["tgt"] = torch.zeros_like(coarse["tgt"])       # ... all background, all called sheet
+    net = _Fixed(lay.cout)
+    alone = TR.evaluate(net, [fine, fine2], torch.device("cpu"), lay)
+    both = TR.evaluate(net, [fine, coarse, fine2], torch.device("cpu"), lay)
+    assert both["n_scored"] == 3 and both["fine_rungs"] == [2, 3]
+    for k in ("dice", "bce", "mae", "dice_r2", "dice_r3", "dice_recto"):
+        assert both[k] == pytest.approx(alone[k]), k       # the coarse sliver cannot move the headline
+    assert both["bce_r9"] == pytest.approx(12.0, abs=1e-3) and both["dice_r9"] == 0.0
+    assert both["bce_coarse"] == pytest.approx(both["bce_r9"]) and both["dice_coarse"] == 0.0
+    assert "bce_coarse" not in alone
+
+    # and inside the fine rungs the pooling is by voxel: the headline is the two rungs' pooled sums,
+    # which is the weight-weighted mean of their bce (not the mean of the two per-rung numbers)
+    w2, w3 = float(fine["w"][0].sum()), float(fine2["w"][0].sum())
+    want = (alone["bce_r2"] * w2 + alone["bce_r3"] * w3) / (w2 + w3)
+    assert alone["bce"] == pytest.approx(want, rel=1e-5)
+
+    only_coarse = TR.evaluate(net, [coarse], torch.device("cpu"), lay)   # no fine rung: fall back
+    assert only_coarse["fine_rungs"] == [9] and only_coarse["bce"] == pytest.approx(12.0, abs=1e-3)
+
+
 def test_a_run_with_no_verso_and_no_distance_stores_still_trains(tiny_cfg):
     """Round 0 before the verso gate: those channels arrive with weight 0, and nothing special-cases
     them -- the losses stay finite and the head rows they own get no gradient."""

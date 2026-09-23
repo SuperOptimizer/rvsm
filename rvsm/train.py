@@ -226,29 +226,49 @@ def _rungs_of(b):
     return [int(v) for v in b["rung"].reshape(-1).tolist()]
 
 
+FINE_RUNGS = (2, 3, 4)   # the rungs the headline `dice` / `bce` / `mae` are pooled over
+
+
+def _pool_eval(acc):
+    """(bce, dice, mae, overlap) of pooled voxel sums: every weighted voxel counts once, whatever
+    window or rung it came from."""
+    n = max(acc["w"], 1e-6)
+    return (acc["bce"] / n, 2.0 * acc["tp"] / (acc["den"] + 1.0), acc["ae"] / n,
+            acc["ov"] / max(acc["vox"], 1.0))
+
+
 @torch.no_grad()
 def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
     """bce / dice / mae over the validation grid, plus the metrics the layout makes meaningful.
 
     Every entry is a compact rung sample (`sample.rung_item`), whose input is built on the device by
-    `prep.prepare`; its per-voxel weights scale every metric, and each rung is also scored on its own
-    (`dice_r2`, `dice_r3`, ...) with `dice` the mean over the rungs present -- every rung counts the
-    same, whatever share of the grid it holds. bce / dice / mae are PROBABILITY-head metrics only. A
-    window with no probability weight at all is skipped (it has nothing to score), `n_scored` counts the
-    windows that were scored, and a rung made only of such windows has no `dice_r{k}`.
+    `prep.prepare`. The metrics are VOXEL-WEIGHTED: bce / mae are sums of the per-voxel value times the
+    per-voxel weight over sums of the weight, and dice is 2 sum(h t w) / (sum(h w) + sum(t w)) over the
+    same voxels -- pooled over windows, never a mean of per-window numbers. So a coarse window with
+    eight weighted corner voxels counts eight voxels, not as much as a full rung-2 window (at paris4
+    step 2000 exactly such rung 7-11 windows, confidently wrong on a sliver of weight, dragged the
+    per-window mean bce to ~1.0 while rungs 2-4 sat at 0.44-0.54, the training value).
 
-    Per probability channel there is a `dice_<name>` (`dice_recto`, `dice_verso`), computed only over
-    the patches whose WEIGHT says anything about that channel, so the verso channel is silently absent
-    until a verso store covers the held-out boxes. With two probability channels there is also
-    `overlap`, the mean excess `relu(p_recto + p_verso - 1)` -- measured, never a loss term. The
-    DISTANCE heads are a regression and are scored in voxels as `mae_midline` / `mae_thickness`.
+    Each rung is scored on its own (`dice_r{k}`, `bce_r{k}`). The HEADLINE `dice` / `bce` / `mae` pool
+    the FINE rungs `FINE_RUNGS` (2-4) only -- they are what the plateau fit of the round gate and the
+    verso gate's pre-screen read -- and `dice_coarse` / `bce_coarse` pool rungs 5-11. A grid with no
+    fine window falls back to every rung for the headline. bce / dice / mae are PROBABILITY-head
+    metrics only. A window with no probability weight at all is skipped, `n_scored` counts the windows
+    that were scored, and a rung made only of such windows has no `dice_r{k}`.
+
+    Per probability channel there is a `dice_<name>` (`dice_recto`, `dice_verso`), pooled over the
+    fine rungs (the same fallback) and only over voxels whose WEIGHT says anything about that channel,
+    so the verso channel is absent until a verso store covers the held-out boxes. With two probability
+    channels there is also `overlap`, the mean excess `relu(p_recto + p_verso - 1)` over the fine
+    rungs' voxels -- measured, never a loss term. The DISTANCE heads are a regression and are scored in
+    voxels as `mae_midline` / `mae_thickness` (a mean over windows, as before).
 
     The affinity heads are a training-only head: never scored, never drawn.
     """
     was = net.training
     net.eval()
-    m = torch.zeros(4)
-    per, pch, scored = {}, {}, 0
+    per, pch, dch, scored = {}, {}, {}, 0
+    np_ = layout.nprob
     for item in grid:
         b = _batch(item)
         x, tg, ww = prep.prepare(b, dev, cascade=cascade)
@@ -266,46 +286,63 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
         # the PROBABILITY heads only: rows nprob..cout_t are distance regressions (voxels, not logits,
         # against a code/255 target), scored above as mae_midline / mae_thickness. Pooling them in here
         # put a sigmoid of a distance into bce/dice/mae wherever a distance store has weight.
-        np_ = layout.nprob
         logit, tgt, w = y[:, :np_], tg[:, :np_], ww[:, :np_]
         if calib_keep is not None:     # the calibration's logits, off THIS forward (see calib.keep)
             from rvsm import calib as _cal
             _cal.keep(calib_keep, logit, tgt, w, rung)
         if float(w.sum()) <= 0:
             # no probability weight anywhere in the window (a held-out box with no store at this rung):
-            # it says nothing, so it is not scored -- counted, it was a dice of 0 and a bce of 0 that
-            # dragged every mean, and a rung made only of such windows reported dice_r{k} = 0
+            # it says nothing, so it is not scored
             continue
         scored += 1
         p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tgt >= 0.5).float()
-        ov = float((p[:, :1] + p[:, 1:2] - 1).clamp_min(0).mean()) if np_ >= 2 else 0.0
-        n = w.sum().clamp_min(1e-6)
-        dice = float(2 * (h * t * w).sum() / ((h * w).sum() + (t * w).sum() + 1))
+        a = per.setdefault(int(rung), {"bce": 0.0, "w": 0.0, "tp": 0.0, "den": 0.0, "ae": 0.0,
+                                       "ov": 0.0, "vox": 0.0})
+        a["bce"] += float((F.binary_cross_entropy_with_logits(logit, tgt, reduction="none") * w).sum())
+        a["w"] += float(w.sum())
+        a["tp"] += float((h * t * w).sum())
+        a["den"] += float((h * w).sum() + (t * w).sum())
+        a["ae"] += float(((p - tgt).abs() * w).sum())
+        if np_ >= 2:
+            a["ov"] += float((p[:, :1] + p[:, 1:2] - 1).clamp_min(0).sum())
+            a["vox"] += float(p[:, :1].numel())
         for c in range(np_):
             wc = w[:, c]
             if float(wc.sum()) > 0:
-                pch.setdefault(c, []).append(
-                    float(2 * (h[:, c] * t[:, c] * wc).sum() / ((h[:, c] * wc).sum() + (t[:, c] * wc).sum() + 1)))
-        m += torch.tensor([
-            float((F.binary_cross_entropy_with_logits(logit, tgt, reduction="none") * w).sum() / n),
-            dice, float(((p - tgt).abs() * w).sum() / n), ov])
-        per.setdefault(int(rung), []).append(dice)
+                q = dch.setdefault(int(rung), {}).setdefault(c, [0.0, 0.0])
+                q[0] += float((h[:, c] * t[:, c] * wc).sum())
+                q[1] += float((h[:, c] * wc).sum() + (t[:, c] * wc).sum())
     net.train(was)
-    m /= max(scored, 1)
-    out = {"bce": m[0].item(), "dice": m[1].item(), "mae": m[2].item(), "n_scored": scored}
+
+    def pooled(rungs):
+        acc = {"bce": 0.0, "w": 0.0, "tp": 0.0, "den": 0.0, "ae": 0.0, "ov": 0.0, "vox": 0.0}
+        for k in rungs:
+            for f in acc:
+                acc[f] += per[k][f]
+        return acc
+
+    fine = [k for k in sorted(per) if k in FINE_RUNGS] or sorted(per)
+    coarse = [k for k in sorted(per) if k not in FINE_RUNGS]
+    bce, dice, mae, ov = _pool_eval(pooled(fine)) if per else (0.0, 0.0, 0.0, 0.0)
+    out = {"bce": bce, "dice": dice, "mae": mae, "n_scored": scored,
+           "fine_rungs": [int(k) for k in fine]}
+    if coarse:
+        cb, cd, cm_, _ = _pool_eval(pooled(coarse))
+        out.update({"bce_coarse": cb, "dice_coarse": cd, "mae_coarse": cm_})
     for k in sorted(per):
-        out[f"dice_r{k}"] = float(np.mean(per[k]))
-    if per:
-        out["dice"] = float(np.mean([out[f"dice_r{k}"] for k in sorted(per)]))
+        kb, kd, _, _ = _pool_eval(per[k])
+        out[f"dice_r{k}"], out[f"bce_r{k}"] = kd, kb
     names = list(layout.channels)
-    for c in sorted(pch, key=str):
-        if isinstance(c, str):
-            out[c] = float(np.mean(pch[c]))
-        else:
-            out[f"dice_{names[c] if c < len(names) else f'c{c}'}"] = float(np.mean(pch[c]))
-    if layout.nprob >= 2:
-        out["overlap"] = m[3].item()
+    for c in range(np_):
+        num = sum(dch.get(k, {}).get(c, [0.0, 0.0])[0] for k in fine)
+        den = sum(dch.get(k, {}).get(c, [0.0, 0.0])[1] for k in fine)
+        if any(c in dch.get(k, {}) for k in fine):
+            out[f"dice_{names[c] if c < len(names) else f'c{c}'}"] = 2.0 * num / (den + 1.0)
+    for key in sorted(k for k in pch if isinstance(k, str)):
+        out[key] = float(np.mean(pch[key]))
+    if np_ >= 2:
+        out["overlap"] = ov
     return out
 
 
