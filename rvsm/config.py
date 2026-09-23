@@ -284,6 +284,20 @@ class Config:
 _TYPES = {f.name: f.type for f in fields(Config)}
 
 
+def stored_fingerprint(stored):
+    """The fingerprint of a STORED config (`Config.to_json()`: `<out>/config.json`, a checkpoint's
+    `cfg`) as THIS code computes it: its field values rebuilt into a Config (fields it predates take
+    their defaults) and hashed with today's FINGERPRINT_EXCLUDE. Comparing that, not the hash written
+    at the time, is what "everything but FINGERPRINT_EXCLUDE must match" means: moving a field into
+    the exclude set changes every hash, and paris4's resume after `cascade` / `cascade_drop` were
+    excluded failed on the stale one although every remaining field matched. A stored config without
+    its field values falls back to the hash it carries."""
+    d = (stored or {}).get("config")
+    if not isinstance(d, dict):
+        return (stored or {}).get("fingerprint")
+    return Config(**{k: _coerce(k, v) for k, v in d.items() if k in _TYPES}).fingerprint()
+
+
 def _coerce(name, v):
     """TOML / CLI value -> the field's type (tuple fields accept a list, int fields a float)."""
     cur = getattr(Config(), name)

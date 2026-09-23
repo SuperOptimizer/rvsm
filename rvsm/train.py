@@ -35,6 +35,7 @@ import torch
 import torch.nn.functional as F
 
 from rvsm import aug as A
+from rvsm import config as CFG
 from rvsm import losses as L
 from rvsm import model as M
 from rvsm import prep
@@ -671,7 +672,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     ck.parent.mkdir(parents=True, exist_ok=True)
     if resume and ck.exists():
         st = torch.load(ck, map_location=dev, weights_only=False)
-        got = (st.get("cfg") or {}).get("fingerprint")
+        got = CFG.stored_fingerprint(st.get("cfg") or {})
         assert got == cfg.fingerprint(), \
             f"resume: the checkpoint's config fingerprint is {got}, this run's is {cfg.fingerprint()}"
         net.load_state_dict(st["model"])

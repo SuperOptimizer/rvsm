@@ -1221,7 +1221,7 @@ def setup(cfg, out=None):
     cp = os.path.join(out, "config.json")
     old = _read_json(cp)
     if old:
-        got = old.get("fingerprint")
+        got = CFG.stored_fingerprint(old)
         assert got == cfg.fingerprint(), (
             f"resume: {cp} was written by a config whose fingerprint is {got}, this run's is "
             f"{cfg.fingerprint()}. Everything but {CFG.FINGERPRINT_EXCLUDE} must match.")

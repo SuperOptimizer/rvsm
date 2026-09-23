@@ -48,3 +48,17 @@ def test_to_json_is_serialisable():
     import json
     j = Config().to_json()
     assert json.loads(json.dumps(j))["layout"]["cin"] == 21
+
+
+def test_a_resume_compares_field_values_not_the_stale_stored_hash():
+    """Moving a field into FINGERPRINT_EXCLUDE changes every hash; a run's stored config must still
+    resume when every field outside the exclude set matches (paris4 at step 12000, when `cascade` and
+    `cascade_drop` joined it), and must still be refused when one of them differs."""
+    from rvsm import config as CFG
+    stored = Config(ct="x", cascade="mix", cascade_drop=0.1).to_json()
+    stored["fingerprint"] = "written-by-older-code"
+    stored["config"].pop("self_p_end_step")                  # a field the stored config predates
+    assert CFG.stored_fingerprint(stored) == Config(ct="x").fingerprint()
+    stored["config"]["patch"] = 128
+    assert CFG.stored_fingerprint(stored) != Config(ct="x").fingerprint()
+    assert CFG.stored_fingerprint({"fingerprint": "abc"}) == "abc"
