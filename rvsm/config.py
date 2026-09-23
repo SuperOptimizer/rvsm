@@ -162,15 +162,15 @@ class Config:
     out: str = "out"                   # the run directory; everything else is derived from it
     size: str = "30m6"                 # student preset (1m, 5m, 15m, 30m6, 60m)
     patch: int = 256                   # training patch edge, in rung-k voxels
-    batch: int = 2                     # patches per forward per GPU
-    accum: int = 1                     # forwards accumulated per optimiser step (batch 1 x accum 2 is
+    batch: int = 1                     # patches per forward per GPU
+    accum: int = 2                     # forwards accumulated per optimiser step (batch 1 x accum 2 is
                                        # batch 2's step at half the activation memory)
-    ckpt_act: int = 1                  # activation-checkpointing level (0 = off, higher = more recompute)
+    ckpt_act: int = 0                  # activation-checkpointing level (0 = off, higher = more recompute)
     gpus: tuple = (0,)                 # CUDA device ordinals available to the run
     mode: str = "auto"                 # auto | resident (one big card) | timeshare (alternating phases)
     rounds: int = 3                    # self-distillation rounds, round 0 = the teacher bootstrap
     steps: int = 20000                 # optimiser steps per round
-    workers: int = 4                   # sampler worker processes
+    workers: int = 6                   # sampler worker processes
     tifxyz: str = ""                   # optional directory of human tifxyz meshes, for eval only
     teacher_ckpts: dict = field(default_factory=dict)  # {"recto": path, "m7": path} local teacher weights
     cache_gb: float = 64.0             # CT shard cache budget on disk/RAM
@@ -178,8 +178,8 @@ class Config:
     pin_memory: bool = False           # the trainer's loader pins its batches. Off: on Thunder's A100 the
                                        # trainer hung inside CUDA calls in every run that pinned (none that
                                        # did not), and pinned H2D was slower there anyway (2.2 vs 2.7 GB/s)
-    vram_train_gb: float = 46.0        # the resident budget table (GB on an 80 GB card): the trainer ...
-    vram_produce_gb: float = 30.0      # ... and the producer; each becomes a per-process memory fraction
+    vram_train_gb: float = 50.0        # the resident budget table (GB on an 80 GB card): the trainer ...
+    vram_produce_gb: float = 26.0      # ... and the producer; each becomes a per-process memory fraction
     ct_seed: str = ""                  # a local, possibly partial mirror of a URL `ct`: shards it has are
                                        # hard-linked into the cache instead of fetched
 # (ckpt_act and compile are in FINGERPRINT_EXCLUDE: they change the speed and the memory, never the math)
