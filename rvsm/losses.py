@@ -57,11 +57,14 @@ def losses_tw(logit, tgt, wv=None, ridge_w=0.0):
     else:
         bce = F.binary_cross_entropy_with_logits(logit, tgt)
     p, d = torch.sigmoid(logit), (0, 2, 3, 4)
-    if wv is not None:
-        p, tgt = p * wv, tgt * wv
-    per = 1 - (2 * (p * tgt).sum(d) + 1) / (p.sum(d) + tgt.sum(d) + 1)   # per head
     if wv is None:
+        per = 1 - (2 * (p * tgt).sum(d) + 1) / (p.sum(d) + tgt.sum(d) + 1)   # per head
         return bce, per.mean()
+    # the WEIGHTED soft dice: (2 sum(w p t) + 1) / (sum(w p) + sum(w t) + 1). Weighting p and t
+    # separately (the old form) put w^2 in the intersection and w in the denominator, so a PERFECT
+    # prediction under a fractional weight (the teacher agreement weight, pooled coarse weights) scored
+    # a dice below 1 and was pushed to over-predict
+    per = 1 - (2 * (wv * p * tgt).sum(d) + 1) / ((wv * p).sum(d) + (wv * tgt).sum(d) + 1)
     live = (wv.sum(d) > 0).to(per.dtype)          # the channels this batch says anything about
     return bce, (per * live).sum() / live.sum().clamp_min(1.0)
 

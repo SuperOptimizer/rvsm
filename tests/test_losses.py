@@ -184,3 +184,27 @@ def test_aux_losses_reads_every_head_index_from_the_layout():
                                               + 0.05 * float(out["skel"]) + 0.1 * float(out["affinity"]),
                                               rel=1e-5)
     assert L.aux_losses(logit, tgt, w, lay) == {}          # every weight 0 -> nothing computed
+
+
+def test_the_weighted_dice_of_a_perfect_prediction_is_zero_under_fractional_weights():
+    """(2 sum(w p t) + 1) / (sum(w p) + sum(w t) + 1): a perfect prediction scores dice loss ~0 whatever
+    the weights. The old form put w^2 in the intersection, so a fractional weight charged it; the
+    live-channel rule still drops a channel with no weight at all, and pair_dice goes through the same
+    function (train.py scores it with `losses_tw`)."""
+    torch.manual_seed(0)
+    t = (torch.rand(1, 2, 16, 16, 16) > 0.7).float()
+    logit = (t * 2 - 1) * 30.0                                   # p = t to float precision
+    w = torch.rand(1, 2, 16, 16, 16) * 0.5 + 0.1                 # fractional everywhere
+    _, d = L.losses_tw(logit, t, w)
+    assert float(d) < 1e-3, float(d)
+    w0 = w.clone()
+    w0[:, 1] = 0                                                 # channel 1 says nothing: not live
+    wrong = logit.clone()
+    wrong[:, 1] = -logit[:, 1]
+    _, d0 = L.losses_tw(wrong, t, w0)
+    assert float(d0) < 1e-3, "a channel with no weight must not score"
+    # and a wrong prediction is charged exactly the weighted formula
+    p = torch.sigmoid(torch.zeros_like(logit))
+    _, dz = L.losses_tw(torch.zeros_like(logit), t, w)
+    want = 1 - (2 * (w * p * t).sum((0, 2, 3, 4)) + 1) / ((w * p).sum((0, 2, 3, 4)) + (w * t).sum((0, 2, 3, 4)) + 1)
+    assert float(dz) == pytest.approx(float(want.mean()), rel=1e-5)
