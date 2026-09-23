@@ -606,3 +606,34 @@ def test_the_prob_dice_and_pair_weights_scale_their_terms_only(tiny_cfg, monkeyp
         assert float(r["loss"]) == pytest.approx(r["bce"] + 0.25 * r["dice"] + other, rel=1e-3, abs=1e-3)
         assert r["w_prob_dice"] == 0.25 and r["w_pair"] == 0.0
         assert r.get("pair_bce", 0.0) == 0.0 and r.get("pair_dice", 0.0) == 0.0
+
+
+def test_the_pair_trains_only_where_paired_support_exists():
+    """No field targets (midline weight 0 everywhere, round 0 before verso): the constructed pair
+    scores 0 and sends NO gradient into the midline / thickness heads, and the ECT reads the learned
+    recto head; with support it is scored there only."""
+    from rvsm.config import Config
+    lay = Config(channels=("recto", "verso")).layout()
+    cfg = Config()
+    torch.manual_seed(0)
+    S = 16
+    d = torch.randn(1, 1, S, S, S, requires_grad=True)
+    th = torch.rand(1, 1, S, S, S).mul(4).add(1).requires_grad_(True)
+    tgt2 = (torch.rand(1, 2, S, S, S) > 0.7).float()
+    w2 = torch.ones(1, 2, S, S, S)
+    none = torch.zeros(1, 1, S, S, S)
+    lr_, lv_ = TR.L.pair_logits(d, th, half=cfg.pair_band, tau=cfg.pair_tau)
+    b, dd = TR.pair_terms(lr_, lv_, tgt2, w2, none)
+    assert float(b) == 0.0 and float(dd) == 0.0
+    (b + dd).backward()
+    assert d.grad is None or float(d.grad.abs().max()) == 0.0
+    assert th.grad is None or float(th.grad.abs().max()) == 0.0
+    some = torch.zeros(1, 1, S, S, S)
+    some[..., :8] = 1
+    lr_, lv_ = TR.L.pair_logits(d, th, half=cfg.pair_band, tau=cfg.pair_tau)
+    b2, _ = TR.pair_terms(lr_, lv_, tgt2, w2, some)
+    b2.backward()
+    assert float(b2) > 0 and float(d.grad[..., 8:].abs().max()) == 0.0 and float(d.grad.abs().max()) > 0
+    y0 = torch.randn(1, lay.cout, S, S, S)
+    band = TR.ect_band(y0, d.detach(), th.detach(), none, lay, cfg)
+    assert torch.allclose(band, torch.sigmoid(y0[:, :1]))           # no support: the learned recto

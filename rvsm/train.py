@@ -246,6 +246,26 @@ def self_p_at(cfg, step, nsteps=None):
     return hi + (end - hi) * (s - m) / (e - m)
 
 
+def pair_terms(lr_, lv_, tgt2, w2, paired):
+    """(bce, dice) of the constructed pair (recto, verso logits built from midline / thickness) against
+    the two probability targets, with the weight map multiplied by the PAIRED support (the midline
+    target's weight > 0). A batch with no paired support scores 0 and sends no gradient into the
+    midline / thickness heads."""
+    return L.losses_tw(torch.cat([lr_, lv_], 1), tgt2, w2 * paired)
+
+
+def ect_band(y0, d, th, paired, layout, cfg):
+    """The probability the ECT term reads, per sample: the band CONSTRUCTED from midline / thickness
+    where the sample has paired support, the learned recto head where it has none (in round 0 before
+    the verso fields exist, the constructed band is invented geometry)."""
+    rec = torch.sigmoid(y0[:, :1])
+    if layout.nprob < 2:
+        return rec
+    con = torch.sigmoid(L.pair_logits(d, th, cfg.pair_band, cfg.pair_tau)[0])
+    has = (paired.flatten(1).sum(1) > 0).to(rec.dtype).view(-1, 1, 1, 1, 1)
+    return has * con + (1 - has) * rec
+
+
 def ect_seed(step, micro=0):
     """The ECT block draw's seed: the step AND the accumulation microbatch, so the microbatches of one
     step draw different blocks, and a resume replays the same ones."""
@@ -965,13 +985,19 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         # ---- PHASE C: `--pair construct`. The pair is BUILT from (midline, thickness), never crossed,
         # and scored against the same probability targets as the learned rows -- which is what makes the
         # two faces non-overlapping by construction rather than by a penalty.
+        # The pair is scored only where PAIRED support exists -- the midline target has weight there
+        # (a finished verso and its fields): elsewhere its gradient trained midline / thickness against
+        # geometry nobody measured and competed with the recto head in round 0.
+        paired = (wd > 0).to(wt.dtype)
+        reg_extra = {"pair_support": float(paired.mean())}
         if layout.nprob >= 2:
             lr_, lv_ = L.pair_logits(d, th, half=cfg.pair_band, tau=cfg.pair_tau)
-            pb_, pd_ = L.losses_tw(torch.cat([lr_, lv_], 1), tg[:, :2], wt[:, :2])
+            pb_, pd_ = pair_terms(lr_, lv_, tg[:, :2], wt[:, :2], paired)
             r["pair_bce"], r["pair_dice"] = float(cfg.loss_pair) * pb_, float(cfg.loss_pair) * pd_
         for k_, v_ in r.items():
             loss = loss + v_
         reg_log = {k_: float(v_.detach()) for k_, v_ in r.items()}
+        reg_log.update(reg_extra)
 
         ph.mark("sdist+eikonal+thick+pair")
         # ---- the topology pilot, at ONE rung, on interior sub-blocks only
@@ -979,8 +1005,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             sel = [i for i, k in enumerate(ks) if k == int(cfg.ect_rung)]
             if sel:
                 idx = torch.tensor(sel, device=y0.device)
-                pr = torch.sigmoid(L.pair_logits(d, th, cfg.pair_band, cfg.pair_tau)[0]) \
-                    if layout.nprob >= 2 else torch.sigmoid(y0[:, :1])
+                pr = ect_band(y0, d, th, paired, layout, cfg)
                 # ect_n is the number of DIRECTIONS (it was passed as the block count); the blocks
                 # are drawn per sample from a generator seeded by the step AND the microbatch index
                 # (accumulation microbatches draw different blocks), so a resume replays them
