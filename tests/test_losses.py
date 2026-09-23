@@ -249,3 +249,31 @@ def test_the_ect_draw_differs_between_microbatches_of_a_step():
             for m in range(4)}
     assert len({TR.ect_seed(100, m) for m in range(4)} | {TR.ect_seed(101, 0)}) == 5
     assert len(vals) > 1
+
+
+def test_no_auxiliary_loss_reads_a_zero_weight_label():
+    """The held-out-label intervention: rewrite the TARGET wherever its weight is zero and every
+    auxiliary loss must be unchanged -- an unknown label may not reach the skeleton recall (its
+    skeleton depends on a neighbourhood) or the affinity targets (a min over the whole segment), only
+    the two segment ends were checked before (pass-3 P3-14)."""
+    from rvsm.config import Config
+    lay = Config(channels=("recto", "verso"), aff_offsets=(8,)).layout()
+    torch.manual_seed(0)
+    S = 32
+    tgt = torch.zeros(1, lay.cout_t, S, S, S)
+    tgt[:, 0, :, 12:17, :] = 1.0                                   # a recto slab
+    tgt[:, 1, :, 18:22, :] = 1.0
+    wv = torch.ones_like(tgt)
+    wv[:, :, :, :, 20:26] = 0                                      # an unknown stripe through both
+    logit = torch.randn(1, lay.cout, S, S, S)
+    kw = dict(w_excl=0.1, w_selfcons=0.1, w_skel=0.1, w_affinity=0.1, cascade=torch.rand(1, 1, S, S, S),
+              cascade_self=torch.ones(1), skel_iters=4)
+    base = L.aux_losses(logit, tgt, wv, lay, **kw)
+    for seed in range(3):
+        g = torch.Generator().manual_seed(seed)
+        mut = tgt.clone()
+        noise = (torch.rand(tgt.shape, generator=g) > 0.5).float()
+        mut = torch.where(wv > 0, mut, noise)                      # only the unknown labels change
+        got = L.aux_losses(logit, mut, wv, lay, **kw)
+        for k in ("skel", "affinity", "excl", "selfcons"):
+            assert float(got[k]) == pytest.approx(float(base[k]), abs=1e-6), (k, seed)

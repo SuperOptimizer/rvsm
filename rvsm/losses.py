@@ -174,7 +174,10 @@ def skel_recall(p, tgt, wv=None, iters=4, thr=0.5):
     `merge_frac` must be watched while it is on.
     """
     s = skeleton(tgt, iters=iters, thr=thr)
-    w = s if wv is None else s * wv
+    # a skeleton voxel is a function of the target within `iters + 1` voxels (iters 3^3 erosions and one
+    # 3^3 max-pool), so it is only a LABEL where that whole neighbourhood is known (weight > 0): the
+    # known mask is eroded by that radius, the patch outside counting as known (pass-3 P3-14)
+    w = s if wv is None else s * wv * known_within(wv, int(iters) + 1)
     d = (0, 2, 3, 4)
     num, den = (p * w).sum(d), w.sum(d)
     live = (den > 0).to(p.dtype)
@@ -214,6 +217,16 @@ def _shift(x, axis, n):
     return y.narrow(axis, 0 if n > 0 else abs(n), x.shape[axis])
 
 
+def known_within(wv, r):
+    """1 where every voxel within Chebyshev radius `r` has weight > 0 (a cubic erosion of the known
+    mask), else 0. Outside the patch counts as known: the patch face is a convention of the crop, not
+    an unknown label."""
+    k = (wv > 0).to(wv.dtype)
+    if r <= 0:
+        return k
+    return -F.max_pool3d(F.pad(-k, (int(r),) * 6, value=-1.0), 2 * int(r) + 1, stride=1)
+
+
 def _pad_axis(axis, h):
     pad = [0] * 6
     i = 2 * (4 - axis)
@@ -242,7 +255,8 @@ def affinity_targets(tgt, wv=None, offsets=(8, 16, 32), thr=0.5, fg_only=True):
     256^3 patch and, precomputed in the loader, would not survive `aug.spatial`'s rotations; this form is
     three pooling ops on the augmented target.
 
-    Weight: `w(v - d/2) * w(v + d/2)`, zero where the pair leaves the patch (the shifts are zero-padded),
+    Weight: `w(v - d/2) * w(v + d/2)`, times zero unless EVERY voxel on the segment has weight > 0,
+    zero where the pair leaves the patch (the shifts are zero-padded),
     and with `fg_only` (the default) zero unless BOTH voxels are foreground -- the same/different
     question is only meaningful for a pair of band voxels, and without the restriction the channel is
     >95% trivial "one end is air" zeros.
@@ -252,15 +266,20 @@ def affinity_targets(tgt, wv=None, offsets=(8, 16, 32), thr=0.5, fg_only=True):
     offs = _offsets(offsets)
     fg = (tgt[:, :1] >= thr).to(tgt.dtype)
     w0 = torch.ones_like(fg) if wv is None else wv[:, :1]
+    kn = (w0 > 0).to(fg.dtype)
     ts, ws = [], []
     for d in offs:
         h = d // 2
         for a in (2, 3, 4):
             seg = -F.max_pool3d(F.pad(-fg, _pad_axis(a, h), value=0.0), _k_axis(a, d + 1), stride=1)
+            # the target is a min over the WHOLE segment, so it is a label only where every voxel on the
+            # segment is known -- not just the two ends (pass-3 P3-14)
+            seg_known = -F.max_pool3d(F.pad(-kn, _pad_axis(a, h), value=0.0), _k_axis(a, d + 1),
+                                      stride=1)
             lo, hi = _shift(fg, a, h), _shift(fg, a, -h)
             wl, wh = _shift(w0, a, h), _shift(w0, a, -h)
             ts.append(seg)
-            ws.append(wl * wh * (lo * hi if fg_only else 1.0))
+            ws.append(wl * wh * seg_known * (lo * hi if fg_only else 1.0))
     if not ts:
         z = tgt[:, :0]
         return z, z
