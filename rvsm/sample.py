@@ -642,6 +642,42 @@ def _grid_corners(cfg, heldout, p, rungs=None, limit=8):
     return out
 
 
+GRID_SCHEMA = "grid-v2"   # bump when what a grid item holds changes
+
+
+def grid_heads(ds, heldout):
+    """The probability heads the held-out regions carry targets for: ("recto",), plus "verso" once
+    EVERY held-out region has a finished verso store."""
+    heads = ["recto"]
+    if heldout and all(ds.cat.done("verso", tuple(int(v) for v in h["lo"])) for h in heldout):
+        heads.append("verso")
+    return tuple(heads)
+
+
+def grid_key(cfg, corners, round_, heads):
+    """The identity of a validation grid: the corners, the store round, which heads have targets, the
+    schema and target-definition versions and the config fields an item is built from -- NOT the whole
+    config fingerprint, which moves whenever an unrelated field joins its exclusions and rebuilt the
+    grid (12 min) for nothing."""
+    import hashlib
+    import json
+    from rvsm import targets as TG
+    return hashlib.sha256(json.dumps({
+        "corners": [[k, [int(v) for v in lo]] for k, lo in corners], "round": int(round_),
+        "heads": list(heads), "schema": GRID_SCHEMA, "target_def": TG.TARGET_DEF,
+        "keys": list(RUNG_ITEM_KEYS), "patch": int(cfg.patch), "ctx": [int(v) for v in cfg.ctx],
+        "channels": [str(c) for c in cfg.channels], "planes": str(cfg.planes),
+        "rungs": [int(v) for v in cfg.rungs]}, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def grid_dir(spill, heads):
+    """Where the grid for `heads` lives: the recto-only grid in `spill` itself, a grid with more heads
+    in its own sibling generation (`<spill>_recto+verso`), so the recto reference grid stays exactly
+    as it was when the verso targets appear."""
+    heads = tuple(heads)
+    return spill if heads == ("recto",) else f"{str(spill).rstrip('/')}_{'+'.join(heads)}"
+
+
 def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, limit=8, spill=None,
              threads=1, **kw):
     """A FIXED set of windows over the held-out regions: the same corners at every evaluation, so two
@@ -651,8 +687,9 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
     A grid item is ~310 MB (the CT and nine context cubes at 256^3 are 160 MB of it), and eight held-out
     regions make ~190 items: ~60 GB, which is the whole host on a 64 GB machine. With `spill=<dir>` the
     grid is written there compressed as it is built and returned as a `DiskGrid`, which holds ONE item
-    in memory at a time; a directory whose manifest matches this grid is reused as it is, so a restart
-    does not rebuild it. `threads` builds items concurrently (the reads are volcomp decodes, which run
+    in memory at a time; a directory whose manifest matches this grid (`grid_key`) is reused as it is, so
+    a restart does not rebuild it. Once every held-out region has a verso store, the grid with the
+    verso targets is a NEW generation in its own directory (`grid_dir`); the recto grid is untouched. `threads` builds items concurrently (the reads are volcomp decodes, which run
     without the GIL); the item order, and so the grid, does not depend on it."""
     ds = Patches(cfg, root=root, ct=ct, ax=ax, round_=round_, region_records=list(heldout),
                  sym=False, **kw)
@@ -679,12 +716,11 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
 
     if spill is None:
         return list(items())
-    import hashlib
     import json
     import os
-    key = hashlib.sha256(json.dumps({
-        "corners": [[k, [int(v) for v in lo]] for k, lo in corners], "round": int(round_),
-        "fingerprint": cfg.fingerprint(), "keys": list(RUNG_ITEM_KEYS)}).encode()).hexdigest()[:16]
+    heads = grid_heads(ds, heldout)
+    key = grid_key(cfg, corners, round_, heads)
+    spill = grid_dir(spill, heads)
     os.makedirs(spill, exist_ok=True)
     man = os.path.join(spill, "grid.json")
     try:

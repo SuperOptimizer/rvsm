@@ -1,11 +1,12 @@
 """The sampler and the GPU prep: the item contract, where weight comes from, and the channel order."""
+import json
 import os
 
 import numpy as np
 import pytest
 import torch
 
-from rvsm import ladder, model as M, prep, sample
+from rvsm import ladder, model as M, prep, sample, stores
 from rvsm.config import RUNG_ITEM_KEYS, Config
 
 
@@ -270,9 +271,10 @@ def test_a_spilled_val_grid_is_the_grid_and_is_reused(synth_run, tmp_path):
             else:
                 assert np.array_equal(np.asarray(va), np.asarray(vb)), k
     assert len(g[:2]) == min(2, len(ref))
-    m = os.path.getmtime(d / "grid.json")
+    dd = type(d)(sample.grid_dir(str(d), ("recto", "verso")))    # the fixture has verso stores
+    m = os.path.getmtime(dd / "grid.json")
     g2 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
-    assert len(g2) == len(g) and os.path.getmtime(d / "grid.json") == m
+    assert len(g2) == len(g) and os.path.getmtime(dd / "grid.json") == m
 
 
 def test_the_cascade_self_pass_takes_a_module_without_len(small_cfg):
@@ -675,3 +677,37 @@ def test_rung_3_and_4_distances_read_their_own_rung_stores_never_a_pool(synth_ru
     assert PAD not in np.unique(v4).tolist()
     h = int(p[0]) // 2
     assert ins4[:h, :h, :h].all() and not ins4[h:, h:, h:].any()
+
+
+def test_verso_targets_make_a_new_grid_generation_and_leave_the_recto_grid(synth_run, tmp_path):
+    """The grid key carries the schema, the store round and the heads with targets; when every
+    held-out region gets a verso store, the verso-bearing grid is built in its own directory and the
+    recto reference grid is not touched (pass-3 P3-04)."""
+    import shutil
+    held = [r for r in synth_run.regions if r["k"] == 2][:1]
+    kw = dict(root=synth_run.root, ct=synth_run.cfg.ct, ax=synth_run.ax, rungs=(2,))
+    d = tmp_path / "grid"
+    lo = tuple(int(v) for v in held[0]["lo"])
+    vp = stores.store_path(synth_run.root, "verso", lo, 0)
+    shutil.move(vp, vp + ".aside")                                           # round 0 before verso
+    try:
+        g = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+    finally:
+        shutil.move(vp + ".aside", vp)                                       # ... the verso appears
+    m = os.path.getmtime(d / "grid.json")
+    key0 = json.load(open(d / "grid.json"))["key"]
+    g2 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+    d2 = tmp_path / "grid_recto+verso"
+    assert d2.is_dir() and json.load(open(d2 / "grid.json"))["key"] != key0
+    assert os.path.getmtime(d / "grid.json") == m, "the recto reference grid must not be rebuilt"
+    assert len(g2) == len(g)
+    assert any(float(it["tgt"][1].float().sum()) > 0 for it in g2)          # verso targets present
+    assert not any(float(it["tgt"][1].float().sum()) > 0 for it in g)       # ... and not in the old
+    corners = [(2, np.zeros(3, np.int64))]
+    c = synth_run.cfg
+    k = sample.grid_key(c, corners, 0, ("recto",))
+    assert k != sample.grid_key(c, corners, 1, ("recto",))                  # the store round
+    assert k != sample.grid_key(c, corners, 0, ("recto", "verso"))          # the heads
+    import unittest.mock as um
+    with um.patch.object(sample, "GRID_SCHEMA", "grid-v999"):
+        assert k != sample.grid_key(c, corners, 0, ("recto",))              # the schema
