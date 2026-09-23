@@ -26,6 +26,10 @@ import torch.nn.functional as F
 BINARY_FRAC = 0.5   # a rung counts as a BINARY band when at most this share of its weighted target mass
                     # is strictly between `BINARY_EPS` and 1 - `BINARY_EPS`
 BINARY_EPS = 0.02
+CALIB_RUNGS = (2, 3, 4)   # always calibrated: their target is a (soft) teacher PROBABILITY of the band
+                          # or its 2x/4x pool, and `binary_frac` cannot tell a soft probability from a
+                          # pooled fraction -- the paris4 rung-2 teacher target reads 0.986 "not binary",
+                          # so no rung was ever calibrated (temps = {} through step 8000)
 T_LO, T_HI = 0.2, 5.0
 
 
@@ -130,8 +134,8 @@ def stack(per):
 def run(net, grid_iter, layout=None, device=None, all_rungs=False, per=None):
     """Fit one temperature per rung over `grid_iter` and return `{"temps": {rung: T}, "rungs": [row, ...]}`.
 
-    A rung whose target is a pooled FRACTION (`binary_frac` above `BINARY_FRAC`) is reported but NOT
-    given a temperature unless `all_rungs`: a temperature fitted against a fraction is not a calibration.
+    A rung whose target is a pooled FRACTION (`binary_frac` above `BINARY_FRAC`, outside `CALIB_RUNGS`)
+    is reported but NOT given a temperature unless `all_rungs`: a temperature fitted against a fraction is not a calibration.
     The caller writes `temps` into the checkpoint; nothing here touches a file. `per` is a precollected
     `stack(keep(...))` (the trainer's evaluation collects it on its own forward), and then `net` and
     `grid_iter` are not used."""
@@ -143,7 +147,7 @@ def run(net, grid_iter, layout=None, device=None, all_rungs=False, per=None):
         T = fit_temp(lg, tg, w)
         row = {"rung": k, "n_patches": int(lg.shape[0]), "binary_frac": round(bf, 4),
                "bce_T1": round(bce_at(lg, tg, w, 1.0), 6), "bce_T": round(bce_at(lg, tg, w, T), 6),
-               "T": round(T, 4), "binary": bool(bf <= BINARY_FRAC)}
+               "T": round(T, 4), "binary": bool(bf <= BINARY_FRAC or int(k) in CALIB_RUNGS)}
         if row["binary"] or all_rungs:
             temps[k] = round(T, 4)
         else:

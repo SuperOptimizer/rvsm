@@ -227,6 +227,18 @@ def _rungs_of(b):
 
 
 FINE_RUNGS = (2, 3, 4)   # the rungs the headline `dice` / `bce` / `mae` are pooled over
+NBINS = 200              # probability bins of the threshold-free (best-threshold) dice
+
+
+def _best_dice(hp, ha):
+    """(best dice, its threshold) over the bin edges of weighted histograms of p: `hp` over the
+    target-positive weight, `ha` over all weight. Dice at threshold j/NBINS is
+    2 sum_{b>=j} hp / (sum_{b>=j} ha + sum hp + 1), the same smoothing as the thresholded dice."""
+    tp = torch.flip(torch.cumsum(torch.flip(hp, [0]), 0), [0])
+    pp = torch.flip(torch.cumsum(torch.flip(ha, [0]), 0), [0])
+    d = 2 * tp / (pp + hp.sum() + 1.0)
+    j = int(torch.argmax(d))
+    return float(d[j]), j / float(len(hp))
 
 
 def _pool_eval(acc):
@@ -238,7 +250,7 @@ def _pool_eval(acc):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
+def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
     """bce / dice / mae over the validation grid, plus the metrics the layout makes meaningful.
 
     Every entry is a compact rung sample (`sample.rung_item`), whose input is built on the device by
@@ -263,6 +275,15 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
     rungs' voxels -- measured, never a loss term. The DISTANCE heads are a regression and are scored in
     voxels as `mae_midline` / `mae_thickness` (a mean over windows, as before).
 
+    THRESHOLD-FREE numbers, per fine rung and pooled over them: `dice_best` (the best dice over
+    `NBINS` probability thresholds, and `thr_best` the threshold that gives it) and `dice_soft`
+    (2 sum(p t w) / (sum(p w) + sum(t w))). They say whether the model RANKS the band well when the
+    0.5 threshold cuts in the wrong place. Note that a temperature cannot help the thresholded dice:
+    sigmoid(l / T) >= 0.5 exactly when l >= 0, for every T > 0, so a calibrated `dice` is the raw one.
+    `dice_raw` is written as an alias of `dice` to make that explicit in the logs.
+
+    `rungs` scores only the windows of those rungs (the mask-cascade pass scores the fine ones).
+
     The affinity heads are a training-only head: never scored, never drawn.
     """
     was = net.training
@@ -272,7 +293,10 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
     for item in grid:
         b = _batch(item)
         x, tg, ww = prep.prepare(b, dev, cascade=cascade)
-        x, rung = x.to(memory_format=M.memfmt()), _rungs_of(b)[0]
+        rung = _rungs_of(b)[0]
+        if rungs is not None and int(rung) not in rungs:
+            continue
+        x = x.to(memory_format=M.memfmt())
         with prep.autocast(dev):
             y = net(x)
         y = (y[0] if isinstance(y, (list, tuple)) else y).float()
@@ -298,12 +322,19 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
         p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tgt >= 0.5).float()
         a = per.setdefault(int(rung), {"bce": 0.0, "w": 0.0, "tp": 0.0, "den": 0.0, "ae": 0.0,
-                                       "ov": 0.0, "vox": 0.0})
+                                       "ov": 0.0, "vox": 0.0, "sp": 0.0, "sd": 0.0,
+                                       "hp": torch.zeros(NBINS, dtype=torch.float64),
+                                       "ha": torch.zeros(NBINS, dtype=torch.float64)})
         a["bce"] += float((F.binary_cross_entropy_with_logits(logit, tgt, reduction="none") * w).sum())
         a["w"] += float(w.sum())
         a["tp"] += float((h * t * w).sum())
         a["den"] += float((h * w).sum() + (t * w).sum())
         a["ae"] += float(((p - tgt).abs() * w).sum())
+        a["sp"] += float((p * t * w).sum())
+        a["sd"] += float((p * w).sum() + (t * w).sum())
+        bi = (p * NBINS).long().clamp_(0, NBINS - 1).flatten()
+        a["hp"] += torch.bincount(bi, weights=(t * w).flatten().double(), minlength=NBINS).cpu()
+        a["ha"] += torch.bincount(bi, weights=w.flatten().double(), minlength=NBINS).cpu()
         if np_ >= 2:
             a["ov"] += float((p[:, :1] + p[:, 1:2] - 1).clamp_min(0).sum())
             a["vox"] += float(p[:, :1].numel())
@@ -315,18 +346,28 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
                 q[1] += float((h[:, c] * wc).sum() + (t[:, c] * wc).sum())
     net.train(was)
 
-    def pooled(rungs):
-        acc = {"bce": 0.0, "w": 0.0, "tp": 0.0, "den": 0.0, "ae": 0.0, "ov": 0.0, "vox": 0.0}
-        for k in rungs:
+    def pooled(ks):
+        acc = {"bce": 0.0, "w": 0.0, "tp": 0.0, "den": 0.0, "ae": 0.0, "ov": 0.0, "vox": 0.0,
+               "sp": 0.0, "sd": 0.0, "hp": torch.zeros(NBINS, dtype=torch.float64),
+               "ha": torch.zeros(NBINS, dtype=torch.float64)}
+        for k in ks:
             for f in acc:
-                acc[f] += per[k][f]
+                acc[f] = acc[f] + per[k][f]
         return acc
+
+    def free(acc):
+        db, th = _best_dice(acc["hp"], acc["ha"])
+        return db, th, 2.0 * acc["sp"] / (acc["sd"] + 1.0)
 
     fine = [k for k in sorted(per) if k in FINE_RUNGS] or sorted(per)
     coarse = [k for k in sorted(per) if k not in FINE_RUNGS]
     bce, dice, mae, ov = _pool_eval(pooled(fine)) if per else (0.0, 0.0, 0.0, 0.0)
-    out = {"bce": bce, "dice": dice, "mae": mae, "n_scored": scored,
+    out = {"bce": bce, "dice": dice, "dice_raw": dice, "mae": mae, "n_scored": scored,
            "fine_rungs": [int(k) for k in fine]}
+    if per:
+        out["dice_best"], out["thr_best"], out["dice_soft"] = free(pooled(fine))
+        for k in fine:
+            out[f"dice_best_r{k}"], out[f"thr_best_r{k}"], out[f"dice_soft_r{k}"] = free(per[k])
     if coarse:
         cb, cd, cm_, _ = _pool_eval(pooled(coarse))
         out.update({"bce_coarse": cb, "dice_coarse": cd, "mae_coarse": cm_})
@@ -622,6 +663,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         evfwd = torch.compile(evnet, mode="max-autotune-no-cudagraphs", dynamic=False)
     casval = prep.Cascade("self" if cfg.cascade in ("self", "mix") else "mask", self_p=1.0, drop=0.0,
                           noise=False, net=evnet, fwd=(evfwd if evfwd is not evnet else None))
+    casmask = prep.Cascade("mask", self_p=0.0, drop=0.0, noise=False) \
+        if cfg.cascade in ("self", "mix") else None
 
     acfg = _aug_cfg(cfg)
     model = torch.compile(net) if cfg.compile else net
@@ -642,6 +685,17 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         te = time.time()
         kept = {} if cfg.calibrate else None
         rec = {"step": step, **evaluate(evfwd, grid, dev, layout, cascade=casval, calib_keep=kept)}
+        if casmask is not None:
+            # the same fine windows with the MASK cascade source (the pooled target, no noise): the
+            # trajectory of what the model does with a good coarse prediction, beside the self-cascade
+            # one the gates read. A leak by construction, so an upper bracket, never a gate input.
+            tm = time.time()
+            mk = evaluate(evfwd, grid, dev, layout, cascade=casmask, rungs=FINE_RUNGS)
+            rec.update({"dice_mask": mk["dice"], "bce_mask": mk["bce"],
+                        "dice_best_mask": mk.get("dice_best"),
+                        **{f"dice_mask_r{k}": mk[f"dice_r{k}"] for k in FINE_RUNGS
+                           if f"dice_r{k}" in mk}})
+            rec["mask_s"] = round(time.time() - tm, 1)
         t_ev = time.time() - te
         try:
             (out / "eval").mkdir(parents=True, exist_ok=True)
@@ -653,6 +707,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             from rvsm import calib
             temps = {str(k): v for k, v in
                      calib.run(evnet, None, layout=layout, per=calib.stack(kept)).get("temps", {}).items()}
+            rec["temps"] = dict(temps)
         rec["eval_s"] = {"evaluate": round(t_ev, 1), "val_png": round(t_png, 1),
                          "calibrate": round(time.time() - te - t_ev - t_png, 1)}
         _log(str(out / "logs" / "eval.jsonl"), rec)

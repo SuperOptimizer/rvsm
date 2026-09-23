@@ -62,7 +62,7 @@ def test_run_fits_one_temperature_per_rung_and_skips_the_pooled_rungs():
     lay = Config(channels=("recto", "verso"), aff_offsets=(8,)).layout()
     torch.manual_seed(0)
     grid = []
-    for rung, T, soft in ((2, 2.0, False), (3, 1.0, True)):
+    for rung, T, soft in ((2, 2.0, False), (5, 1.0, True)):
         for _ in range(4):
             z = torch.empty(1, 1, 8, 8, 8).uniform_(-6, 6)
             p = torch.sigmoid(z)
@@ -72,12 +72,30 @@ def test_run_fits_one_temperature_per_rung_and_skips_the_pooled_rungs():
             grid.append((x, tt, torch.ones_like(tt), rung))
     rep = calib.run(_Net(lay.cout, 2.0), grid, layout=lay)
     rows = {r["rung"]: r for r in rep["rungs"]}
-    assert set(rows) == {2, 3}
+    assert set(rows) == {2, 5}
     assert rows[2]["binary"] and rows[2]["T"] == pytest.approx(2.0, rel=0.25)
     assert 2 in rep["temps"]
-    assert not rows[3]["binary"] and 3 not in rep["temps"]        # a pooled fraction is not calibrated
-    assert "skipped" in rows[3]
-    assert 3 in calib.run(_Net(lay.cout, 2.0), grid, layout=lay, all_rungs=True)["temps"]
+    assert not rows[5]["binary"] and 5 not in rep["temps"]        # a pooled fraction is not calibrated
+    assert "skipped" in rows[5]
+    assert 5 in calib.run(_Net(lay.cout, 2.0), grid, layout=lay, all_rungs=True)["temps"]
+
+
+def test_the_fine_rungs_are_calibrated_even_on_a_soft_teacher_target():
+    """A soft teacher probability reads as 'not binary' to `binary_frac` (paris4's rung-2 target:
+    0.986), which left temps = {} for a whole run. Rungs 2-4 always get their temperature."""
+    lay = Config(channels=("recto", "verso"), aff_offsets=(8,)).layout()
+    torch.manual_seed(1)
+    grid = []
+    for rung in (2, 3, 4, 6):
+        z = torch.empty(1, 1, 8, 8, 8).uniform_(-6, 6)
+        t = torch.sigmoid(z / 2.0)                                  # a soft probability target
+        x = torch.cat([z, torch.zeros(1, lay.cin - 1, 8, 8, 8)], 1)
+        tt = torch.cat([t] + [torch.zeros_like(t)] * (lay.cout_t - 1), 1)
+        grid.append((x, tt, torch.ones_like(tt), rung))
+    rep = calib.run(_Net(lay.cout, 2.0), grid, layout=lay)
+    rows = {r["rung"]: r for r in rep["rungs"]}
+    assert all(rows[k]["binary_frac"] > calib.BINARY_FRAC for k in (2, 3, 4, 6))
+    assert set(rep["temps"]) == {2, 3, 4}                           # 6 is a pooled fraction
 
 
 def test_collect_drops_weightless_batches():

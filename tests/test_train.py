@@ -235,8 +235,13 @@ def test_twenty_steps_of_the_full_recipe(full_cfg):
     assert len(ev) >= 2
     last = ev[-1]
     for k in ("bce", "dice", "mae", "overlap", "dice_recto", "dice_verso", "dice_r2", "dice_r3",
-              "mae_midline", "mae_thickness"):
+              "mae_midline", "mae_thickness", "dice_raw", "dice_best", "thr_best", "dice_soft"):
         assert k in last and math.isfinite(last[k]), f"{k}: {last.get(k)}"
+    if cfg.cascade in ("self", "mix"):       # the mask-cascade bracket beside the self-cascade numbers
+        for k in ("dice_mask", "bce_mask", "dice_mask_r2"):
+            assert k in last and math.isfinite(last[k]), f"{k}: {last.get(k)}"
+    if cfg.calibrate:
+        assert "2" in last["temps"], last.get("temps")         # rung 2 is always calibrated now
     assert sorted(p.name for p in (out / "eval").glob("val_*.png"))
     from PIL import Image
     im = Image.open(sorted((out / "eval").glob("val_*.png"))[-1])
@@ -346,6 +351,35 @@ def test_evaluate_is_voxel_weighted_and_the_headline_is_the_fine_rungs(full_cfg)
 
     only_coarse = TR.evaluate(net, [coarse], torch.device("cpu"), lay)   # no fine rung: fall back
     assert only_coarse["fine_rungs"] == [9] and only_coarse["bce"] == pytest.approx(12.0, abs=1e-3)
+
+
+class _Shrunk(torch.nn.Module):
+    """A net that RANKS the band perfectly but never crosses 0.5: logit -1 on the band, -4 off it."""
+
+    def __init__(self, tgt, cout, nprob):
+        super().__init__()
+        self.tgt, self.cout, self.nprob = tgt, cout, nprob
+
+    def forward(self, x):
+        y = torch.full((x.shape[0], self.cout) + tuple(x.shape[2:]), -4.0)
+        y[:, :self.nprob] = (self.tgt[:, :self.nprob] >= 0.5).float() * 3 - 4
+        return y
+
+
+def test_evaluate_reports_a_threshold_free_dice(full_cfg):
+    """An under-confident net that ranks the band perfectly scores dice 0 at the 0.5 threshold (and
+    no temperature changes that: sigmoid(l/T) >= 0.5 iff l >= 0), but dice_best finds the threshold
+    that separates it and dice_soft sees the ranking."""
+    lay = full_cfg.layout()
+    it = _item(full_cfg, dist_w=0, verso_w=0)
+    _, tg, _ = prep.prepare(prep.batch1(it), torch.device("cpu"))
+    out = TR.evaluate(_Shrunk(tg, lay.cout, lay.nprob), [it], torch.device("cpu"), lay)
+    assert out["dice"] < 0.01 and out["dice_raw"] == out["dice"]
+    assert out["dice_best"] > 0.99 and 0.018 < out["thr_best"] <= 0.27     # between off and on
+    assert out["dice_best_r2"] == pytest.approx(out["dice_best"])
+    assert 0.0 < out["dice_soft"] < out["dice_best"]
+    only3 = TR.evaluate(_Shrunk(tg, lay.cout, lay.nprob), [it], torch.device("cpu"), lay, rungs=(3,))
+    assert only3["n_scored"] == 0                                    # the rung filter
 
 
 def test_a_run_with_no_verso_and_no_distance_stores_still_trains(tiny_cfg):
