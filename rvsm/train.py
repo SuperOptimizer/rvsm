@@ -776,7 +776,10 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             rung_n[r] = rung_n.get(r, 0) + 1
         if cas.on:
             cas.sync(ema)   # the self-mode coarse pass always runs on the current EMA weights
-            cas.self_p = self_p_at(cfg, step, nsteps)
+            # the schedule means something only for "mix"; "self" is 1.0 (every non-dropped sample),
+            # "mask" 0.0 -- and that is what the log says
+            cas.self_p = self_p_at(cfg, step, nsteps) if cas.mode == "mix" else \
+                (1.0 if cas.mode == "self" else 0.0)
         cas.clock = ph.on
         ct, tg, wt = prep.prepare(b, dev, cascade=cas, layout=layout)
         ph.mark("prepare+cascade")

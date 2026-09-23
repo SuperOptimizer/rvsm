@@ -202,9 +202,15 @@ class Cascade:
               contexts are ctx_2..ctx_9 plus the tenth cube `cx`, its scale plane is (k+1-2)/9, its
               radial vector is recomputed at rung k+1 from `cyx1`/`lo1`, and its own cascade channel is
               ZERO (one-level truncation). The central half of the output is the patch footprint.
-      "mix"   per sample, "self" with probability `self_p`, else "mask" (+ noise). The production mode:
-              "mask" alone leaks the target, "self" alone never shows the model a coarse prediction
-              better than its own, and the mixture brackets what inference actually feeds it.
+      "mix"   per sample, "self" with probability `self_p`, else "mask" (+ noise). Kept, but NO LONGER
+              the default: it was argued that "self" alone never shows the model a coarse prediction
+              better than its own and that the mixture brackets what inference feeds it. In practice the
+              mask source is the coarse TARGET, and the student learned to read the target out of the
+              channel instead of the recto out of the CT: the paris4 diagnostic at step 12000 (rungs 2-4,
+              held-out grid) had the CT-only path (channel zeroed) FLAT -- recto probability 0.27 on
+              target foreground vs 0.24 on background -- and the self path the same, while the mask path
+              separated them 0.88 / 0.13. Since then the default is "self" with `drop` 0.3 (the zeroed,
+              CT-only case is a third of the samples).
 
     `drop`: probability that a sample's channel is zeroed altogether, so inference WITHOUT a coarse
     prediction stays in distribution. The top rung is always zero: there is no rung above it."""

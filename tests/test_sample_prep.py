@@ -553,3 +553,38 @@ def test_a_visit_keeps_at_most_its_air_budget_of_air_windows(synth_run, monkeypa
     pass1 = calls[:len(calls)]
     assert pass1.count(False) >= 8 * 8 - 1, "the spent budget must reject every later air window"
     assert n_first < len(calls)
+
+
+def test_the_default_cascade_is_self_with_drop_0_3():
+    """The mask source is off by default (the student read the target out of it: paris4 step 12000),
+    and a run can switch cascade source on resume."""
+    from rvsm.config import Config
+    c = Config()
+    assert c.cascade == "self" and c.cascade_drop == pytest.approx(0.3)
+    assert Config(cascade="mix", cascade_drop=0.1).fingerprint() == c.fingerprint()
+
+
+def test_a_self_cascade_never_reads_the_coarse_target(small_cfg):
+    """`Cascade("self")` builds its channel from the model's own coarse pass (or zeros): the coarse
+    TARGET block `cm` is never touched, whatever the draw."""
+    L = small_cfg.layout()
+    b = dict(prep.batch1(_fake_item(nctx=L.nctx, p=8, k=2)))
+
+    class NoCm(dict):
+        def __getitem__(self, k):
+            assert k != "cm", "the self cascade read the coarse target"
+            return super().__getitem__(k)
+
+        def get(self, k, d=None):
+            assert k != "cm", "the self cascade read the coarse target"
+            return super().get(k, d)
+    nb = NoCm(b)
+    x = torch.zeros((1, L.cin, 8, 8, 8))
+    net = M.build("1m", cin=L.cin, cout=L.cout, verbose=False)
+    for seed in range(12):
+        c = prep.Cascade("self", self_p=0.0, drop=0.3, noise=True, net=net, seed=seed)
+        out = c.channel(nb, x, b["norm"], torch.float32)
+        assert out.shape == (1, 1, 8, 8, 8)
+        assert float(c.last_self[0]) in (0.0, 1.0)     # self-scored, or dropped -- never mask
+        if float(c.last_self[0]) == 0.0:
+            assert float(out.abs().sum()) == 0.0
