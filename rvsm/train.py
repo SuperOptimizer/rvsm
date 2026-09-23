@@ -406,28 +406,48 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
     return out
 
 
-def val_png(path, net, grid, dev, layout, cascade=None):
+def _verso_on(path):
+    """`verso_on` from the run's state.json beside `<out>/eval/<png>`, or None when there is none."""
+    import json
+    import os
+    sp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(str(path)))), "state.json")
+    try:
+        with open(sp) as f:
+            return bool(json.load(f).get("verso_on", False))
+    except (OSError, ValueError):
+        return None
+
+
+def val_png(path, net, grid, dev, layout, cascade=None, verso=None):
     """The middle z-slice of the first four validation patches, three tiles wide:
 
-        CT (gray) | recto target red + verso target blue | prediction, the same two colours
+        CT (gray) | recto target (red) | recto prediction (red)
 
-    A verso target the held-out box has no store for adds nothing to its tile; overlap comes out purple,
-    which is the fastest way to see the exclusivity term failing. The affinity and distance heads are
-    never drawn.
+    and, once VERSO IS ON, the verso target and prediction in blue on the same two tiles (overlap
+    comes out purple, the fastest way to see the exclusivity term failing). Before that -- round 0
+    until the verso gate fires -- the verso head is untrained (it saturates near 1 and painted the
+    whole prediction tile blue over the recto), so only the recto is drawn. `verso`: True / False, or
+    None to read `verso_on` from the run's state.json (two levels above `path`), falling back to
+    whether the patch carries any verso target weight. The affinity and distance heads are never drawn.
     """
     from PIL import Image
     rows = []
     was = net.training
     net.eval()
+    on = _verso_on(path) if verso is None else bool(verso)
     with torch.no_grad():
         for item in grid[:4]:
             b = _batch(item)
-            x, t, _ = prep.prepare(b, dev, cascade=cascade)
+            x, t, ww = prep.prepare(b, dev, cascade=cascade)
             with prep.autocast(dev):
                 y = net(x.to(memory_format=M.memfmt()))
             y = (y[0] if isinstance(y, (list, tuple)) else y).float()
             p = torch.sigmoid(y[:, :layout.nprob])[0].cpu()
             x, t = x[0].cpu(), t[0].cpu()
+            nch = 1
+            if layout.nprob >= 2:
+                show = on if on is not None else bool(float(ww[0, 1].sum()) > 0)
+                nch = 2 if show else 1
             z = x.shape[1] // 2
             c = x[0, z].numpy()
             c = (c - c.min()) / (c.max() - c.min() + 1e-6) * 255 * 0.9
@@ -440,8 +460,8 @@ def val_png(path, net, grid, dev, layout, cascade=None):
                 al = np.maximum.reduce(a) * 0.85
                 col = sum(ai * ci for ai, ci in zip(a, cols)) / np.maximum(wsum, 1e-6)
                 return gray * (1 - al) + col * al
-            tt = t[:layout.nprob, z].numpy()
-            pp = p[:, z].numpy()
+            tt = t[:nch, z].numpy()
+            pp = p[:nch, z].numpy()
             rows.append(np.concatenate([gray, overlay(list(tt)), overlay(list(pp))], 1))
     net.train(was)
     Image.fromarray(np.concatenate(rows, 0).astype(np.uint8)).save(path)

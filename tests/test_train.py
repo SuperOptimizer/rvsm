@@ -481,3 +481,32 @@ def test_the_self_p_schedule_has_two_breakpoints():
     old = replace(c, self_p_mid_step=0)                  # the old whole-run schedule
     assert old.fingerprint() == c.fingerprint() == replace(c, self_p_end=0.5).fingerprint()
     assert TR.self_p_at(old, 30000, 60000) == pytest.approx(0.4)
+
+
+def test_val_png_draws_the_verso_only_once_verso_is_on(full_cfg, tmp_path):
+    """Round 0 before the gate: the untrained verso head (saturated near 1) must not paint the
+    prediction tile blue over the recto. With verso off the tiles carry no blue; on, they do."""
+    from PIL import Image
+    lay = full_cfg.layout()
+    it = _item(full_cfg, dist_w=0)
+    _, tg, _ = prep.prepare(prep.batch1(it), torch.device("cpu"))
+
+    class Verso1(torch.nn.Module):          # recto = the target, verso saturated everywhere
+        def forward(self, x):
+            y = torch.full((x.shape[0], lay.cout) + tuple(x.shape[2:]), -12.0)
+            y[:, 0] = (tg[:, 0] >= 0.5).float() * 24 - 12
+            y[:, 1] = 12.0
+            return y
+
+    ev = tmp_path / "run" / "eval"
+    ev.mkdir(parents=True)
+    (tmp_path / "run" / "state.json").write_text('{"verso_on": false}')
+    TR.val_png(ev / "off.png", Verso1(), [it], torch.device("cpu"), lay)
+    TR.val_png(ev / "on.png", Verso1(), [it], torch.device("cpu"), lay, verso=True)
+    off = np.asarray(Image.open(ev / "off.png")).astype(int)
+    on = np.asarray(Image.open(ev / "on.png")).astype(int)
+    w = off.shape[1] // 3
+    pred_off, pred_on = off[:, 2 * w:], on[:, 2 * w:]
+    blue = lambda a: ((a[..., 2] - a[..., 0]) > 60).mean()   # noqa: E731
+    assert blue(pred_off) == 0.0 and (pred_off[..., 0] - pred_off[..., 2] > 60).any()   # recto red
+    assert blue(pred_on) > 0.5                                  # the saturated verso, when asked for
