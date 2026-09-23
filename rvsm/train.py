@@ -858,7 +858,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             pred = model(ct)
             outs = [o.float() for o in pred] if isinstance(pred, (list, tuple)) else [pred.float()]
             bce, dice = L.deep_losses(outs if len(outs) > 1 else outs[0], tg, wt, layout=layout)
-        loss = bce + dice
+        loss = bce + float(cfg.loss_prob_dice) * dice
         y0 = outs[0]
         reg_log = {}
         ph.mark("forward+deep_losses")
@@ -880,7 +880,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         # two faces non-overlapping by construction rather than by a penalty.
         if layout.nprob >= 2:
             lr_, lv_ = L.pair_logits(d, th, half=cfg.pair_band, tau=cfg.pair_tau)
-            r["pair_bce"], r["pair_dice"] = L.losses_tw(torch.cat([lr_, lv_], 1), tg[:, :2], wt[:, :2])
+            pb_, pd_ = L.losses_tw(torch.cat([lr_, lv_], 1), tg[:, :2], wt[:, :2])
+            r["pair_bce"], r["pair_dice"] = float(cfg.loss_pair) * pb_, float(cfg.loss_pair) * pd_
         for k_, v_ in r.items():
             loss = loss + v_
         reg_log = {k_: float(v_.detach()) for k_, v_ in r.items()}
@@ -954,6 +955,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                   "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0,
                   "rung": {str(k): rung_n[k] for k in sorted(rung_n)},
                   "self_p": round(float(cas.self_p), 4) if cas.on else None,
+                  "w_prob_dice": float(cfg.loss_prob_dice), "w_pair": float(cfg.loss_pair),
                   "train_wait_s": round(wait_s, 3), **ph.take()})
             rung_n, wait_s, nvox, t0 = {}, 0.0, 0, time.time()
         if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:

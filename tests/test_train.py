@@ -576,3 +576,33 @@ def test_the_augmentation_reads_the_frozen_metadata(full_cfg, tmp_path, monkeypa
     assert TR.aug_for(cfg, SM.fetch(str(vol))) != before   # the altered source WOULD change it
     monkeypatch.setattr(SM, "fetch", lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetched")))
     assert TR._aug_cfg(cfg, out) == before                 # ... the augmentation does not
+
+
+def test_the_prob_dice_and_pair_weights_scale_their_terms_only(tiny_cfg, monkeypatch):
+    """loss_prob_dice multiplies the learned probability heads' dice and nothing else; loss_pair the
+    pair's bce + dice; both are logged and neither enters the resume fingerprint (pass-3 P3-01)."""
+    from pathlib import Path
+    assert replace(tiny_cfg, loss_prob_dice=0.3, loss_pair=0.0).fingerprint() == tiny_cfg.fingerprint()
+    seen = []
+    real = TR.L.deep_losses
+
+    def spy(*a, **k):
+        b, d = real(*a, **k)
+        seen.append((float(b), float(d)))
+        return b, d
+    monkeypatch.setattr(TR.L, "deep_losses", spy)
+    cfg = replace(tiny_cfg, out=str(Path(tiny_cfg.out).parent / "wts"), loss_prob_dice=0.25,
+                  loss_pair=0.0, steps=20, eval_every=10 ** 6)
+    TR.train(cfg, patches_factory=_factory(cfg), val_items=[_item(cfg, k=2, seed=7)], device="cpu")
+    rows = [json.loads(q) for q in (Path(cfg.out) / "logs" / "train.jsonl").read_text().splitlines()]
+    assert seen
+    step_rows = [r for r in rows if "loss" in r]
+    assert step_rows
+    for r in step_rows:
+        # the logged loss holds bce + 0.25 * dice (+ the other logged terms): with every other term
+        # at its logged value, the difference is exactly the down-weighted dice
+        other = sum(float(r.get(k, 0.0)) for k in ("sdist", "eikonal", "thick", "pair_bce", "pair_dice",
+                                                   "aux")) + cfg.loss_ect * float(r.get("ect", 0.0))
+        assert float(r["loss"]) == pytest.approx(r["bce"] + 0.25 * r["dice"] + other, rel=1e-3, abs=1e-3)
+        assert r["w_prob_dice"] == 0.25 and r["w_pair"] == 0.0
+        assert r.get("pair_bce", 0.0) == 0.0 and r.get("pair_dice", 0.0) == 0.0

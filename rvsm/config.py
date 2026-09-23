@@ -155,7 +155,9 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        "self_p_mid_step", "self_p_end", "self_p_end_step",
                        # the cascade source: paris4 switched mix -> self (drop 0.1 -> 0.3) at step 12000 on
                        # a user decision; a resume may change it, and the switch is recorded in the run log
-                       "cascade", "cascade_drop", "self_p_lo", "self_p_hi")
+                       "cascade", "cascade_drop", "self_p_lo", "self_p_hi",
+                       # loss weights a running experiment may retune on resume (pass-3 P3-01)
+                       "loss_prob_dice", "loss_pair")
 
 
 @dataclass
@@ -226,6 +228,8 @@ class Config:
     aff_offsets: tuple = (8, 16, 32)   # affinity offsets in voxels; 3 heads (z, y, x) each
 
     # ------------------------------------------------------------------ fixed recipe: losses
+    loss_prob_dice: float = 1.0        # weight of the LEARNED probability heads' soft dice (bce stays 1)
+    loss_pair: float = 1.0             # weight of the constructed pair's bce + dice
     loss_excl: float = 0.1             # recto/verso mutual exclusion
     loss_selfcons: float = 0.1         # cross-rung self-consistency
     loss_skel: float = 0.05            # soft-skeleton (clDice) term
