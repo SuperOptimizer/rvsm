@@ -552,15 +552,20 @@ def ect(p, dirs, res=16):
     return out.cumsum(-1)
 
 
-def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5):
+def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5, w=None, gen=None):
     """Mean squared difference between the ECT of the predicted probability and of the target, over
     interior sub-blocks.
 
     The crop is the single most important detail: a topology loss computed on a cropped patch sees every
     sheet truncated at the patch face and produces a spurious gradient at every crop edge, which is the
     known failure mode of the whole persistent-homology family. So the loss is computed only on
-    `nblocks` sub-blocks of side `block` taken from the interior of the patch, at least `margin` voxels
-    from every face, chosen on a fixed stride (no rng: a resume replays the same loss).
+    sub-blocks of side `block` from the interior of the patch, at least `margin` voxels from every face.
+
+    `dirs` is the number of ECT directions (`fib_dirs`). Per SAMPLE, `nblocks` blocks are drawn at
+    random from the interior grid with `gen` (a seeded torch.Generator: a resume replays the same draw;
+    without one the blocks are the first of the grid, the old fixed choice). With `w` (the target
+    weight, (B, 1+, Z, Y, X)) a block whose weight is all zero is not a candidate -- it says nothing --
+    and a sample with no valid block does not score. The value is 0 when nothing scores.
 
     The transform is normalised by the number of vertices of a sub-block, so the value does not depend on
     `block`; it is 0 for identical inputs and finite for any input."""
@@ -574,15 +579,32 @@ def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5):
         n = max((hi[i] - lo[i]) // block, 1)
         starts.append([lo[i] + j * (hi[i] - lo[i] - block) // max(n - 1, 1) for j in range(n)])
     grid = [(z, y, x) for z in starts[0] for y in starts[1] for x in starts[2]]
-    step = max(len(grid) // max(int(nblocks), 1), 1)
-    grid = grid[::step][:max(int(nblocks), 1)]
+    nb = max(int(nblocks), 1)
     d = fib_dirs(int(dirs), device=p.device)
     t = (tgt[:, :1] >= thr).to(p.dtype)
-    # every sub-block of every sample is stacked into the BATCH dimension, so the whole term is two
-    # `ect` calls whatever `nblocks` is: the transform is 8 products and 8 index_adds per direction and
-    # the kernel launches, not the arithmetic, are what it costs.
-    pb = torch.cat([p[:, :1, z:z + block, y:y + block, x:x + block] for (z, y, x) in grid])
-    tb = torch.cat([t[:, :1, z:z + block, y:y + block, x:x + block] for (z, y, x) in grid])
+    pbs, tbs = [], []
+    for s in range(B):
+        cand = grid
+        if w is not None:
+            ws = w[s, :1]
+            cand = [g for g in grid
+                    if float(ws[:, g[0]:g[0] + block, g[1]:g[1] + block, g[2]:g[2] + block].sum()) > 0]
+        if not cand:
+            continue
+        if gen is not None:
+            pick = torch.randperm(len(cand), generator=gen)[:nb].tolist()
+            chosen = [cand[j] for j in pick]
+        else:
+            chosen = cand[:nb]
+        for (z, y, x) in chosen:
+            pbs.append(p[s:s + 1, :1, z:z + block, y:y + block, x:x + block])
+            tbs.append(t[s:s + 1, :1, z:z + block, y:y + block, x:x + block])
+    if not pbs:
+        return p.sum() * 0.0
+    # every chosen block of every sample is stacked into the BATCH dimension, so the whole term is two
+    # `ect` calls: the transform is 8 products and 8 index_adds per direction and the kernel launches,
+    # not the arithmetic, are what it costs.
+    pb, tb = torch.cat(pbs), torch.cat(tbs)
     n = float(block ** 3)
     with torch.no_grad():
         b = ect(tb, d, res) / n

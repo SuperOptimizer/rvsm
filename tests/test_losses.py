@@ -208,3 +208,30 @@ def test_the_weighted_dice_of_a_perfect_prediction_is_zero_under_fractional_weig
     _, dz = L.losses_tw(torch.zeros_like(logit), t, w)
     want = 1 - (2 * (w * p * t).sum((0, 2, 3, 4)) + 1) / ((w * p).sum((0, 2, 3, 4)) + (w * t).sum((0, 2, 3, 4)) + 1)
     assert float(dz) == pytest.approx(float(want.mean()), rel=1e-5)
+
+
+def test_ect_blocks_are_drawn_per_sample_and_skip_weightless_ones():
+    """ect_loss takes `dirs` directions and `nblocks` blocks per sample drawn from a seeded generator
+    (the same seed, the same draw), and never a block whose target weight is all zero (review T07)."""
+    torch.manual_seed(0)
+    t = (torch.rand(2, 1, 40, 40, 40) > 0.5).float()
+    p = torch.rand(2, 1, 40, 40, 40)
+    w = torch.zeros_like(t)
+    w[0, :, 4:20, 4:20, 4:20] = 1                              # sample 0: only the first block is live
+    a = L.ect_loss(p, t, dirs=3, res=8, margin=4, block=16, nblocks=1, w=w,
+                   gen=torch.Generator().manual_seed(5))
+    b = L.ect_loss(p, t, dirs=3, res=8, margin=4, block=16, nblocks=1, w=w,
+                   gen=torch.Generator().manual_seed(5))
+    assert float(a) == float(b) and float(a) > 0               # seeded: replayable
+    only0 = L.ect_loss(p[:1], t[:1], dirs=3, res=8, margin=4, block=16, nblocks=4, w=w[:1],
+                       gen=torch.Generator().manual_seed(1))
+    first = L.ect_loss(p[:1], t[:1], dirs=3, res=8, margin=4, block=16, nblocks=1)
+    assert float(only0) == pytest.approx(float(first))         # the one live block, whatever the draw
+    none = L.ect_loss(p, t, dirs=3, res=8, margin=4, block=16, nblocks=2, w=torch.zeros_like(w))
+    assert float(none) == 0.0                                   # nothing live: nothing scores
+    seen = set()
+    for s in range(12):                                         # the draw really moves around
+        g = torch.Generator().manual_seed(s)
+        seen.add(round(float(L.ect_loss(p[1:], t[1:], dirs=1, res=8, margin=4, block=16, nblocks=1,
+                                        gen=g)), 8))
+    assert len(seen) > 1

@@ -879,7 +879,11 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                 idx = torch.tensor(sel, device=y0.device)
                 pr = torch.sigmoid(L.pair_logits(d, th, cfg.pair_band, cfg.pair_tau)[0]) \
                     if layout.nprob >= 2 else torch.sigmoid(y0[:, :1])
-                e = L.ect_loss(pr[idx], tg[idx, :1], block=cfg.ect_block, nblocks=cfg.ect_n)
+                # ect_n is the number of DIRECTIONS (it was passed as the block count); the blocks
+                # are drawn per sample from a generator seeded by the step, so a resume replays them
+                e = L.ect_loss(pr[idx], tg[idx, :1], dirs=cfg.ect_n, block=cfg.ect_block,
+                               nblocks=cfg.ect_blocks, w=wt[idx, :1],
+                               gen=torch.Generator().manual_seed(1_000_003 * int(step) + 17))
                 loss = loss + cfg.loss_ect * e
                 reg_log["ect"] = float(e.detach())
 

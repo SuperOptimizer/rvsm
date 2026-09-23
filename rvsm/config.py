@@ -237,6 +237,7 @@ class Config:
     pair_tau: float = 0.5              # pair-construction probability threshold
     loss_ect: float = 0.05             # Euler-characteristic-transform term (rung 2 only)
     ect_n: int = 1                     # ECT directions per step
+    ect_blocks: int = 1                # interior ECT blocks per sample, drawn at random (seeded by step)
     ect_rung: int = 2                  # the rung the ECT term applies at
     ect_block: int = 64                # ECT block edge
 
