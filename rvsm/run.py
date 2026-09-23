@@ -676,16 +676,28 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             f.result()
 
     def finish(kind, lo, round_, t0, rows, attrs, pooled=None, extra=None):
+        chained = False
         try:
             write_rows(out, lo, rows, cfg, round_, attrs)
             if pooled is not None or (kind == "self" and rows):
                 feed_coarse_once(out, lo, round_, rows[0][1], shape2, pooled=pooled)
             jlog(out, "produce", {"kind": kind, "region": list(lo), "round": round_,
                                   "s": round(time.time() - t0, 2), **(extra or {})})
+            # the unit that makes a region's fields possible hands it straight to the fields pool
+            # (still busy): waiting for the GPU loop's next pass over the window left the fields
+            # of every verso region undone until a whole window of ~1 min verso passes had run
+            if kind in ("verso", "self") and not stopping():
+                with lock:
+                    pend.append(fielder.submit(fields, lo, round_, time.time(), cursor_now()))
+                chained = True
         finally:
-            with lock:
-                busy.discard(lo)
+            if not chained:
+                with lock:
+                    busy.discard(lo)
             wslots.release()
+
+    def cursor_now():
+        return max(read_cursor(out), 0)
 
     def fields(lo, round_, t0, cursor):
         try:
