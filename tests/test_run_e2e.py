@@ -284,6 +284,23 @@ def test_the_walk_is_the_same_on_both_sides_and_holds_the_heldout_first(small_cf
     assert w[0] == route[0] and len(w) < len(route)
 
 
+def test_the_window_reaches_past_the_fastest_worker(tmp_path):
+    """Workers drift apart by whole visits. The window must cover the FASTEST worker's next visit, not
+    only `L` past the slowest one -- otherwise that worker waits on a store nobody produces, the
+    in-order DataLoader waits on it, the cursor never moves: the paris4 deadlock after the resume."""
+    out = str(tmp_path / "c")
+    for w, p in enumerate((7, 5, 5, 5, 5, 6)):            # the paris4 cursor files at the deadlock
+        RUN._write_json(os.path.join(RUN.cursor_dir(out), f"w{w}.json"),
+                        {"pos": p, "stride": 6, "worker": w})
+    assert RUN.read_cursor(out) == 30 and RUN.read_cursor_head(out) == 42
+    route = [("h",)] + [(n,) for n in range(100)]
+    pos = {(n,): n for n in range(100)}
+    old = RUN._window(route, pos, 30, 9, [None])
+    new = RUN._window(route, pos, 30, 9, [None], head=RUN.read_cursor_head(out))
+    assert (42,) not in old, "the old window stopped short of worker 0's next visit"
+    assert (42,) in new and (51,) in new and (52,) not in new and (29,) not in new
+
+
 def test_the_lookahead_is_re_estimated_from_the_logs(tmp_path, small_cfg):
     """L = ceil(T_produce / T_train) * K_active + extra, from `logs/produce.jsonl` and state.json."""
     out = str(tmp_path / "L")

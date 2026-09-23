@@ -729,10 +729,11 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             # copy: that one is only rewritten at an evaluation, every `eval_every` steps -- dozens of
             # visits -- and a window that lags that far behind the trainer starves it
             cursor = max(read_cursor(out), 0)
+            head = max(read_cursor_head(out), cursor)
             if time.time() - t_reest > REEST_S:
                 L, t_reest = lookahead(cfg, out, k_active), time.time()
             _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "last_ts": time.time(),
-                             "L": L, "cursor": cursor})
+                             "L": L, "cursor": cursor, "head": head})
 
             # one-card timeshare: no PHASE file means nobody is taking turns
             if os.path.exists(os.path.join(out, PHASE_FILE)) and read_phase(out) != "produce":
@@ -750,7 +751,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
 
             cat = RG.Catalog(out, round_, ttl=1.0)
             units = []
-            for lo in _window(route, pos, cursor, L, held):
+            for lo in _window(route, pos, cursor, L, held, head=head):
                 with lock:
                     if lo in busy:
                         continue
@@ -865,15 +866,24 @@ def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr):
                                 as_tensor=True)
 
 
-def _window(route, pos, cursor, L, held):
+def _window(route, pos, cursor, L, held, head=None):
     """The producer's working set: every held-out region that is not finished, then the regions whose
-    walk position is within `L` visits of the trainer's cursor."""
+    walk position lies between the trainer's cursor (the SLOWEST worker) and `L` visits past the
+    FASTEST worker's `head` (`read_cursor_head`; the cursor when omitted).
+
+    Both ends matter. Each worker walks its own stride of the walk and the DataLoader takes their
+    batches in turn, so the workers drift apart by whole visits (a mostly-air visit ends early) --
+    and a window of `L` past the slowest one can end before the fastest one's next visit. That
+    worker then waits for a store nobody will produce, the in-order DataLoader waits for that worker,
+    the slow workers never advance the cursor, and the run deadlocks (paris4 after the resume at step
+    2000: cursor 30, window to 39, worker 0 waiting on 42)."""
+    top = max(int(cursor), int(head if head is not None else cursor)) + int(L)
     out = [lo for lo in route[:len(held)]]
     for lo in route[len(held):]:
         n = pos.get(lo)
         if n is None or n < cursor:
             continue
-        if n <= cursor + int(L):
+        if n <= top:
             out.append(lo)
     return out
 
@@ -1111,6 +1121,18 @@ def read_cursor(out):
         if r and isinstance(r.get("pos"), int):
             vals.append(int(r["pos"]) * max(int(r.get("stride", 1)), 1))
     return min(vals) if vals else 0
+
+
+def read_cursor_head(out):
+    """The walk position of the FASTEST sampler worker's next visit: worker w of W at its own position
+    p is at `p * W + w` of the shared walk. The producer's window must reach past this one too."""
+    d = cursor_dir(out)
+    vals = []
+    for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        r = _read_json(os.path.join(d, n))
+        if r and isinstance(r.get("pos"), int):
+            vals.append(int(r["pos"]) * max(int(r.get("stride", 1)), 1) + int(r.get("worker", 0)))
+    return max(vals) if vals else 0
 
 
 def region_seconds(out):
