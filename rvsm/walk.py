@@ -45,7 +45,8 @@ class WalkPatches(sample.Patches):
         self._publish(w, W, 0, 0.0)     # this walk starts at 0: overwrite whatever an earlier one left
         while True:
             while len(pend) < max(self.L, 1) and pos < len(mine):
-                pend.append(mine[pos])
+                if not self._dead(self.visits[mine[pos]]):   # held-out home: never a target
+                    pend.append(mine[pos])
                 pos += 1
             if not pend:                       # the walk is exhausted: start it again
                 pos = 0

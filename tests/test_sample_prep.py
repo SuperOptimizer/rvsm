@@ -394,6 +394,8 @@ def test_the_uint8_targets_are_the_float_formula(synth_run):
         on = np.array([zc, np.interp(zc, ak[0], ak[1]), np.interp(zc, ak[0], ak[2])]) - p // 2
         cands.append(np.clip(on.astype(np.int64), np.minimum(rlo, hi), hi))
         for lo in cands:
+            if ds._region_of(k, lo) is None:
+                continue          # a straddling window is stitched now: see the test below
             ct = ladder.read_rung(ds.pyr, k, lo, p, dtype=np.uint8)
             a, b = ds._rung_target(k, lo, ct), _old_rung_target(ds, k, lo, ct)
             assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1]), (k, lo)
@@ -401,3 +403,98 @@ def test_the_uint8_targets_are_the_float_formula(synth_run):
             near += int(ds._near_axis(k, lo, p).any())
     assert n > 0, "no window carried any weight: the comparison proved nothing"
     assert near > 0, "no window touched the axis: the near-axis path went untested"
+
+
+def test_rungs_3_to_6_stitch_region_stores_per_voxel(synth_run, monkeypatch):
+    """paris4 step 400: a rung-3 window straddling two region stores got weight 0 everywhere, and a
+    window at rungs 4-6 (as large as a region's footprint or larger) nearly always straddles -- those
+    rungs trained on nothing. Each voxel now takes its own region store's target and `inside`: the
+    stitched window equals the per-region reads, a missing store zeroes only its own voxels, and a
+    held-out region never supplies a target."""
+    import shutil
+
+    from rvsm import stores
+    monkeypatch.setattr(sample, "AXIS_R_UM", 0.0)
+    ds = _patches(synth_run)
+    ds._open()
+    R, p = int(synth_run.cfg.region), ds.patch
+    k = 3
+    # a rung-3 window centred on the corner shared by all eight regions: it straddles every one
+    c3 = np.full(3, R // 2, np.int64)
+    lo = c3 - p // 2
+    assert ds._region_of(k, lo) is None
+    ct = ladder.read_rung(ds.pyr, k, lo, p, dtype=np.uint8)
+    tg, w = ds._rung_target(k, lo, ct)
+    ri = ds.channels.index("recto")
+    assert w[ri].max() > 0, "a straddling rung-3 window must be supervised"
+    # every octant equals that region's own store read at rung 3
+    h = int(p[0]) // 2
+    for r in synth_run.lo:
+        o = (np.array(r, np.int64) >> 1) - lo
+        o = np.clip(o, 0, h)
+        a = ds.cat.open("recto", np.array(r, np.int64))
+        want, ins = stores.read_store(a, k, lo + o, np.full(3, h, np.int64))
+        sl = tuple(slice(int(o[j]), int(o[j]) + h) for j in range(3))
+        assert ins.all()
+        assert np.array_equal(np.where(ct[sl] > 0, want, 0), tg[ri][sl])
+    # remove one region's recto store: only its octant loses the weight
+    gone = np.array(synth_run.lo[-1], np.int64)
+    shutil.rmtree(stores.store_path(synth_run.root, "recto", gone))
+    ds.cat = type(ds.cat)(ds.root, ds.round, ttl=0.0)
+    tg2, w2 = ds._rung_target(k, lo, ct)
+    og = np.clip((gone >> 1) - lo, 0, h)
+    sl = tuple(slice(int(og[j]), int(og[j]) + h) for j in range(3))
+    assert not w2[ri][sl].any()
+    keep = w2[ri].copy()
+    keep[sl] = 0
+    ref = w[ri].copy()
+    ref[sl] = 0
+    assert np.array_equal(keep, ref)
+    # a held-out region is never a stitched neighbour
+    first = np.array(synth_run.lo[0], np.int64)
+    dh = _patches(synth_run, heldout=[{"lo": [int(v) for v in first], "size": [R] * 3, "k": 2}])
+    dh._open()
+    _, wh = dh._rung_target(k, lo, ct)
+    o0 = np.clip((first >> 1) - lo, 0, h)
+    sl0 = tuple(slice(int(o0[j]), int(o0[j]) + h) for j in range(3))
+    assert not wh[ri][sl0].any() and wh[ri].max() > 0
+
+
+def test_rung_3_to_6_windows_are_drawn_on_the_home_region(synth_run):
+    """A visit at rungs 3-6 draws around the one region the producer made for it: at rung 3 (footprint
+    larger than a window) wholly inside it, and every drawn window reads a finished store."""
+    ds = _patches(synth_run, seed=3)
+    ds._open()
+    recs = [v for v in ds.visits if int(v["k"]) == 3]
+    assert recs
+    rng = np.random.default_rng(0)
+    p = ds.patch
+    for rec in recs[:4]:
+        home = np.array(ds._home(rec), np.int64)
+        box = ds._draw_rec(rec)
+        f0, fs = home >> 1, int(synth_run.cfg.region) >> 1
+        blo, bsz = np.array(box["lo"]), np.array(box["size"])
+        if fs > int(p[0]):
+            assert (blo >= f0).all() and (blo + bsz <= f0 + fs).all()
+        for _ in range(4):
+            lo = rng.integers(blo, np.maximum(blo + bsz - p, blo) + 1)
+            assert ds._region_of(3, lo) is not None and tuple(ds._region_of(3, lo)) == tuple(home)
+
+
+def test_a_visit_whose_home_region_is_held_out_is_dead(synth_run):
+    """A rung 3-6 visit whose home region is held out can only draw weight-0 windows (the held-out
+    store is never a target and nothing else is produced for it): the walk skips it, at every rung
+    3-6, and never a rung-2 or coarse visit."""
+    recs = [v for v in synth_run.regions if int(v["k"]) == 3]
+    assert recs
+    ds0 = _patches(synth_run)
+    ds0._open()
+    home = ds0._home(recs[0])
+    ds = _patches(synth_run, heldout=[{"lo": list(home), "size": [int(synth_run.cfg.region)] * 3, "k": 2}])
+    ds._open()
+    assert ds._dead(recs[0]) and not ds0._dead(recs[0])
+    assert not any(ds._dead(v) for v in ds.visits if int(v["k"]) == 2)
+    it = iter(ds)
+    for _ in range(30):
+        item = next(it)
+        assert int(item["rung"]) != 3 or ds._home_r != home

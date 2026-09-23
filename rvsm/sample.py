@@ -14,8 +14,14 @@ Where a target comes from is the one thing that changes with the rung:
     rungs 4-6   the same store pooled 2^(k-2) on the fly      (`regions.pooled`)
     rungs 7-11  the whole-scroll coarse array x its coverage  (`regions.read_coarse`)
 
-and a window that straddles two regions at rungs 2-6 is simply skipped for that channel (weight 0),
-because a store is a per-region object and stitching two of them would invent a seam.
+A rung-2 window is drawn inside its region, so it reads exactly one store (and a rung-2 window that
+straddles two, which `_draw` never makes, gets weight 0). At rungs 3-6 one window covers several
+region stores -- a rung-4 window is a whole region's footprint, a rung-5 one eight -- so a "one store or
+nothing" rule gave those rungs weight 0 almost always (paris4, step 400). There the target is STITCHED
+per voxel: every voxel is read from the region store it lies in, with that store's own `inside`, so a
+voxel whose store is not finished (or is a held-out region's) carries weight 0 and nothing is invented.
+The window is drawn around the visit's HOME region -- the one region `run.region_route` produced for
+that visit -- so it always overlaps a finished store and reads the shards just fetched for it.
 
 The REJECTION RULES are one rule. usrm2 had four -- air, minimum foreground, density power, all-masked
 -- and three of them needed a label to evaluate, which is exactly what rvsm does not have when it starts.
@@ -148,6 +154,20 @@ def target_channels(cfg):
     return list(cfg.channels) + list(DIST_CHANNELS)
 
 
+def _clip_read(arr, o, n):
+    """(cube, inside) of `arr[o:o+n]` with whatever part lies outside `arr` zero and not inside."""
+    o, n = np.asarray(o, np.int64), np.asarray(n, np.int64)
+    out, ins = np.zeros(tuple(n), np.uint8), np.zeros(tuple(n), np.float32)
+    S = np.array(arr.shape, np.int64)
+    a, b = np.maximum(o, 0), np.minimum(o + n, S)
+    if (b > a).all():
+        st = a - o
+        blk = arr[a[0]:b[0], a[1]:b[1], a[2]:b[2]]
+        sl = tuple(slice(int(st[j]), int(st[j]) + blk.shape[j]) for j in range(3))
+        out[sl], ins[sl] = blk, 1.0
+    return out, ins
+
+
 class Patches(torch.utils.data.IterableDataset):
     """An endless stream of compact samples, drawn along the region walk.
 
@@ -194,6 +214,9 @@ class Patches(torch.utils.data.IterableDataset):
         self.meta5 = (np.asarray(self._meta_in, np.float32) if self._meta_in is not None
                       else SM.scan_planes(SM.fetch(self.ct)))
         self.shape2 = ladder.rung_shape(self.pyr, 2)
+        # held-out region stores never supply a training target, even as a stitched neighbour
+        self._held = {tuple(int(v) for v in h["lo"]) for h in self.heldout
+                      if int(h.get("k", 2)) == 2}
 
     # ---- where a target comes from --------------------------------------
 
@@ -219,24 +242,63 @@ class Patches(torch.utils.data.IterableDataset):
         if k >= RG.COARSE_RUNGS[0]:
             v, cov = RG.read_coarse(self.root, chan, k, lo, shape, self.round)
             return v, cov
+        if k >= 3:
+            return self._stitched(chan, k, lo, shape)
         r = self._region_of(k, lo, shape)
         if r is None:
             return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
-        if k == 3:                           # the store's 2x pool, decoded ONCE per visit (see _pool3)
-            got = self._pool3(chan, r)
-            if got is None:
-                return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
-            o = np.asarray(lo, np.int64) - (np.asarray(r, np.int64) >> 1)
-            v = got[o[0]:o[0] + shape[0], o[1]:o[1] + shape[1], o[2]:o[2] + shape[2]]
-            return v, np.ones(tuple(shape), np.float32)
-        if k <= 3:
-            a = self.cat.open(chan, r)
-            if a is None:
-                return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
-            v, ins = stores.read_store(a, k, lo, shape)
-        else:
-            v, ins = RG.pooled_window(self.root, chan, r, k, lo, shape, self.round)
+        a = self.cat.open(chan, r)
+        if a is None:
+            return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
+        v, ins = stores.read_store(a, k, lo, shape)
         return v, ins.astype(np.float32)
+
+    def _regions_over(self, k, lo, shape):
+        """The rung-2 origins of every region whose footprint meets the rung-k window [lo, lo+shape)."""
+        d, R = int(k) - 2, int(self.cfg.region)
+        lo2 = np.maximum(np.asarray(lo, np.int64) << d, 0)
+        hi2 = (np.asarray(lo, np.int64) + ladder.shape3(shape)) << d
+        if (hi2 <= lo2).any():
+            return []
+        a, b = lo2 // R, (hi2 - 1) // R
+        return [np.array([z, y, x], np.int64) * R for z in range(int(a[0]), int(b[0]) + 1)
+                for y in range(int(a[1]), int(b[1]) + 1) for x in range(int(a[2]), int(b[2]) + 1)]
+
+    def _stitched(self, chan, k, lo, shape):
+        """Rungs 3-6: (cube, inside) with every voxel read from the region store it lies in. A region
+        whose store is not finished, or that is held out, leaves its voxels at inside = 0."""
+        k, d, R = int(k), int(k) - 2, int(self.cfg.region)
+        shape = ladder.shape3(shape)
+        lo = np.asarray(lo, np.int64)
+        out = np.zeros(tuple(shape), np.uint8)
+        ins = np.zeros(tuple(shape), np.float32)
+        home = getattr(self, "_home_r", None)
+        for r in self._regions_over(k, lo, shape):
+            if tuple(int(v) for v in r) in getattr(self, "_held", ()):
+                continue
+            f0 = r >> d
+            plo = np.maximum(lo, f0)
+            phi = np.minimum(lo + shape, (r + R) >> d)
+            if (phi <= plo).any():
+                continue
+            pn = phi - plo
+            if k == 3 and home is not None and tuple(int(v) for v in r) == home:
+                got = self._pool3(chan, r)     # the visit's own region: pooled once per visit
+                if got is None:
+                    continue
+                v, i_ = _clip_read(got, plo - f0, pn)
+            elif k == 3:
+                a = self.cat.open(chan, r)
+                if a is None:
+                    continue
+                v, i_ = stores.read_store(a, 3, plo, pn)
+            else:
+                v, i_ = RG.pooled_window(self.root, chan, r, k, plo, pn, self.round)
+            o = plo - lo
+            sl = tuple(slice(int(o[j]), int(o[j] + pn[j])) for j in range(3))
+            out[sl] = v
+            ins[sl] = i_
+        return out, ins
 
     def _pool3(self, chan, r):
         """The whole region store of `chan` read at rung 3 (its 2x mean pool), kept for the visit.
@@ -291,9 +353,11 @@ class Patches(torch.utils.data.IterableDataset):
         air = ct > 0
         near = None
         rw8 = None
-        r = self._region_of(k, lo)
-        if r is not None and int(k) <= 6 and self.cat.done(RW, r):
-            rw8 = self._source(RW, k, lo, p)[0]
+        if int(k) <= 6:
+            # the agreement weight where an rw store covers the voxel, full weight where none does
+            rv, rf = self._source(RW, k, lo, p)
+            if (rf > 0).any():
+                rw8 = np.where(rf > 0, rv, np.uint8(255))
         for c, chan in enumerate(self.channels):
             dist = chan in DIST_CHANNELS
             if dist and int(k) > DIST_MAX_RUNG:
@@ -378,9 +442,38 @@ class Patches(torch.utils.data.IterableDataset):
 
     # ---- drawing ---------------------------------------------------------
 
+    def _home(self, rec):
+        """The rung-2 origin of the region a visit's producer job makes: the region holding the record's
+        corner (`run.region_route`'s rule)."""
+        d, R = max(int(rec["k"]) - 2, 0), int(self.cfg.region)
+        return tuple(int(v) // R * R for v in (np.array(rec["lo"], np.int64) << d))
+
+    def _draw_rec(self, rec):
+        """The box a visit's windows are drawn from, as a record (`lo`, `size`; `_ctx_cube` keys and
+        sizes its super-cube on it). Rung 2 and the coarse rungs: the record itself. Rungs 3-6: around
+        the HOME region's rung-k footprint -- wholly inside it when the footprint is larger than a
+        window (rung 3), otherwise with the window centre inside it (rungs 4-6), so every window
+        overlaps the store the producer made for this visit."""
+        k = int(rec["k"])
+        if not 3 <= k <= 6 or self.label_free:
+            return rec
+        d, p = k - 2, ladder.shape3(self.patch).astype(np.int64)
+        f0 = np.array(self._home(rec), np.int64) >> d
+        fs = np.full(3, max(int(self.cfg.region) >> d, 1), np.int64)
+        lo_a = np.where(fs > p, f0, f0 - p // 2)
+        lo_b = np.where(fs > p, f0 + fs - p, f0 + fs - 1 - p // 2)
+        top = np.maximum(np.asarray(ladder.rung_shape(self.pyr, k), np.int64) - p, 0)
+        lo_a, lo_b = np.clip(lo_a, 0, top), np.clip(lo_b, 0, top)
+        lo_b = np.maximum(lo_a, lo_b)
+        return dict(rec, lo=[int(v) for v in lo_a], size=[int(v) for v in lo_b - lo_a + p])
+
     def _draw(self, rng, rec):
         """One window inside one region, or None when the CT-air rule rejects it."""
-        p, k = self.patch, int(rec["k"])
+        k = int(rec["k"])
+        if 3 <= k <= 6:
+            self._home_r = self._home(rec)
+            rec = self._draw_rec(rec)
+        p = self.patch
         rlo, rsz = np.array(rec["lo"], np.int64), np.array(rec["size"], np.int64)
         hi = np.maximum(rlo + rsz - p, rlo)
         lo = rng.integers(np.minimum(rlo, hi), hi + 1)
@@ -392,6 +485,14 @@ class Patches(torch.utils.data.IterableDataset):
         cx = [self._ctx_cube(rec, k, d, lo, ct.shape) for d in self.ctx] if self.ctx else ()
         return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, self.ax, sym,
                          **self._plane_extras(k), **self._cascade_extras(k, lo, ct.shape, rec=rec))
+
+    def _dead(self, rec):
+        """A rung 3-6 visit whose HOME region is held out: the producer makes no store for it (the
+        held-out store is never a training target), so every window it could draw is weight 0 -- and
+        a rung-5/6 record is visited up to `visits_max` times. The walk skips it for good."""
+        k = int(rec["k"])
+        return (3 <= k <= 6 and not self.label_free
+                and self._home(rec) in getattr(self, "_held", ()))
 
     def _visitable(self, rec):
         """Is this visit worth making? A fine region with no finished store would yield only zero
@@ -416,7 +517,7 @@ class Patches(torch.utils.data.IterableDataset):
             served = 0
             for i in mine:
                 rec = self.visits[i]
-                if not self._visitable(rec):
+                if self._dead(rec) or not self._visitable(rec):
                     continue
                 left, fails = self.windows, 0
                 while left > 0 and fails < 8 * max(self.windows, 1):
