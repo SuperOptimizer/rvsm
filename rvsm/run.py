@@ -746,8 +746,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             # the LIVE cursor (the sampler workers publish it after every visit), not state.json's
             # copy: that one is only rewritten at an evaluation, every `eval_every` steps -- dozens of
             # visits -- and a window that lags that far behind the trainer starves it
-            cursor = max(read_cursor(out), 0)
-            head = max(read_cursor_head(out), cursor)
+            cursor = max(read_cursor(out, round_), 0)
+            head = max(read_cursor_head(out, round_), cursor)
             if time.time() - t_reest > REEST_S:
                 L, t_reest = lookahead(cfg, out, k_active), time.time()
             _write_json(hb, {"pid": os.getpid(), "phase": f"round{round_}", "last_ts": time.time(),
@@ -1166,14 +1166,50 @@ def cursor_dir(out):
     return os.path.join(str(out), "logs", "cursor")
 
 
-def read_cursor(out):
-    """The walk position of the SLOWEST sampler worker: the producer must stay ahead of that one."""
+def round_transition(out, nxt, quiesce=None, **state):
+    """Move the run to round `nxt`, in the one order that cannot let the old round's walk leak into the
+    new one:
+
+    1. state.json gets the new round first. From here every old-round walk stops by itself (its wait
+       loop and its draw loop check the round), its `_publish` refuses to write, and every cursor
+       reader rejects a record stamped with the old round.
+    2. `quiesce()` (the trainer's `train.DevicePrefetch.close`): the background H2D fetch is waited for
+       (bounded) and the loader's persistent workers are shut down -- a worker still in the middle of a
+       draw is terminated, not left to publish later.
+    3. Only then is the cursor directory reset: the next round walks from the start again (the old
+       round's cursor would put the producer's window past the positions the new sampler asks for
+       first -- a deadlock the end-to-end test hit whenever those regions fell outside the old window).
+    """
+    write_state(out, round=int(nxt), cursor=0, walk=None, **state)
+    if quiesce is not None:
+        quiesce()
+    shutil.rmtree(cursor_dir(out), ignore_errors=True)
+
+
+def cursor_records(out, round_=None):
+    """The sampler workers' cursor files of the CURRENT round (`round_`, default state.json's): a record
+    stamped with another round is a stale writer -- an old-round worker or prefetch that published after
+    the round transition reset the directory -- and is ignored. An unstamped record (a run older than
+    the stamp) is taken as it is."""
+    if round_ is None:
+        round_ = read_state(out).get("round")
     d = cursor_dir(out)
-    vals = []
+    out_ = []
     for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not n.endswith(".json"):
+            continue
         r = _read_json(os.path.join(d, n))
-        if r and isinstance(r.get("pos"), int):
-            vals.append(int(r["pos"]) * max(int(r.get("stride", 1)), 1))
+        if not r or not isinstance(r.get("pos"), int):
+            continue
+        if round_ is not None and r.get("round") is not None and int(r["round"]) != int(round_):
+            continue
+        out_.append(r)
+    return out_
+
+
+def read_cursor(out, round_=None):
+    """The walk position of the SLOWEST sampler worker: the producer must stay ahead of that one."""
+    vals = [int(r["pos"]) * max(int(r.get("stride", 1)), 1) for r in cursor_records(out, round_)]
     return min(vals) if vals else 0
 
 
@@ -1181,12 +1217,8 @@ def walk_snapshot(out, round_=None):
     """The sampler workers' walk positions, from their cursor files: `{"stride", "round", "workers":
     {w: {"pos", "done", "pass"}}}`, or None when there are none. Written into state.json at every
     checkpoint so a resume continues the walk where the checkpoint left it (`WalkPatches(start=)`)."""
-    d = cursor_dir(out)
     ws, stride = {}, None
-    for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-        r = _read_json(os.path.join(d, n))
-        if not r or not isinstance(r.get("pos"), int):
-            continue
+    for r in cursor_records(out, round_):
         stride = int(r.get("stride", 1))
         ws[str(int(r.get("worker", 0)))] = {"pos": int(r["pos"]), "done": list(r.get("done") or []),
                                             "pass": int(r.get("pass", 0))}
@@ -1208,26 +1240,18 @@ def resume_walk(out, round_):
     return None
 
 
-def read_cursor_head(out):
+def read_cursor_head(out, round_=None):
     """The walk position of the FASTEST sampler worker's next visit: worker w of W at its own position
     p is at `p * W + w` of the shared walk. The producer's window must reach past this one too."""
-    d = cursor_dir(out)
-    vals = []
-    for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-        r = _read_json(os.path.join(d, n))
-        if r and isinstance(r.get("pos"), int):
-            vals.append(int(r["pos"]) * max(int(r.get("stride", 1)), 1) + int(r.get("worker", 0)))
+    vals = [int(r["pos"]) * max(int(r.get("stride", 1)), 1) + int(r.get("worker", 0))
+            for r in cursor_records(out, round_)]
     return max(vals) if vals else 0
 
 
-def region_seconds(out):
+def region_seconds(out, round_=None):
     """Seconds per consumed walk entry, averaged over the workers (T_train of the lookahead rule)."""
-    d = cursor_dir(out)
-    vals = []
-    for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-        r = _read_json(os.path.join(d, n)) or {}
-        if isinstance(r.get("region_s"), (int, float)) and r["region_s"] > 0:
-            vals.append(float(r["region_s"]))
+    vals = [float(r["region_s"]) for r in cursor_records(out, round_)
+            if isinstance(r.get("region_s"), (int, float)) and r["region_s"] > 0]
     return float(np.mean(vals)) if vals else 0.0
 
 
@@ -1555,8 +1579,8 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     def hook(info):
         """Every `eval_every` steps: publish the state, honour STOP and PHASE, run the two gates."""
         step = int(info["step"])
-        write_state(out, step=step, round=state["round"], cursor=read_cursor(out),
-                    region_s=region_seconds(out), walk=walk_snapshot(out, state["round"]),
+        write_state(out, step=step, round=state["round"], cursor=read_cursor(out, state["round"]),
+                    region_s=region_seconds(out, state["round"]), walk=walk_snapshot(out, state["round"]),
                     verso_on=bool(read_state(out).get("verso_on", False)))
         if stop_requested(out):
             jlog(out, "sched", {"kind": "stop", "step": step})
@@ -1599,12 +1623,8 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                 if state["round"] == 0 or not state["ref"]:
                     state["ref"] = why.get("rows")          # round 0's stats anchor every later round
                 state["round"] = nxt
-                # the next round walks from the start again: the old round's cursor would put the
-                # producer's window past the positions the new sampler asks for first (a deadlock
-                # the end-to-end test hit whenever those regions fell outside the old window)
-                shutil.rmtree(cursor_dir(out), ignore_errors=True)
-                write_state(out, round=nxt, teacher=tp, round_step=step, cursor=0, walk=None,
-                            round_ref=state["ref"])
+                round_transition(out, nxt, info.get("quiesce"), teacher=tp, round_step=step,
+                                 round_ref=state["ref"])
                 jlog(out, "sched", {"kind": "round", "round": nxt, "teacher": tp, "step": step})
                 return True
         return False

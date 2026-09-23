@@ -582,50 +582,137 @@ def _prepared(grid, dev, layout, cascade=None):
         yield x.to(memory_format=M.memfmt()), t, w, _rungs_of(b)[0]
 
 
-def to_device_iter(src, dev, side=True):
+QUIESCE_S = 60.0     # the longest `DevicePrefetch.close` waits for a fetch in flight before it stops waiting
+
+
+def _spawn(fn):
+    """`fn()` on a fresh DAEMON thread, as a Future. Not a ThreadPoolExecutor: its threads are joined
+    at interpreter exit and by its context manager, so one `next(loader)` that never returns (an old
+    round's walk waiting on a store nobody will produce) blocked the trainer's shutdown with it."""
+    import concurrent.futures as cf
+    import threading
+    fut = cf.Future()
+
+    def run():
+        if not fut.set_running_or_notify_cancel():
+            return
+        try:
+            fut.set_result(fn())
+        except BaseException as e:  # noqa: BLE001  -- re-raised by fut.result() on the caller's side
+            fut.set_exception(e)
+    threading.Thread(target=run, name="rvsm-h2d", daemon=True).start()
+    return fut
+
+
+def _shutdown_loader(src, it):
+    """Stop a loader's worker processes NOW, persistent ones included: `_shutdown_workers` joins each
+    worker briefly and terminates the ones still alive, and the DataLoader forgets the iterator, so no
+    worker of this loader can publish anything afterwards. A plain generator is closed instead."""
+    for obj in (it, getattr(src, "_iterator", None)):
+        fn = getattr(obj, "_shutdown_workers", None)
+        if fn is not None:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
+    if getattr(src, "_iterator", None) is not None:
+        src._iterator = None
+    close = getattr(it, "close", None)
+    if close is not None and not hasattr(it, "_shutdown_workers"):
+        try:
+            close()
+        except Exception:  # noqa: BLE001  -- "generator already executing": the abandoned fetch owns it
+            pass
+
+
+class DevicePrefetch:
     """Batches from `src` with every tensor already on `dev`, fetched and copied AHEAD: a helper thread
     takes batch i+1 from the loader and copies it (on a side CUDA stream) while the caller runs step i;
-    the default stream waits on the copy's event before it touches the batch.
+    the default stream waits on the copy's event before it touches the batch. On a CPU device the batches
+    pass straight through.
 
     The thread is what makes this overlap at all: from pageable memory a `non_blocking` copy is still
     synchronous for the calling thread (~110 ms for one 256^3 sample's ~300 MB of uint8 over
     Thunder's 2.7 GB/s link), and pinned memory is not an option there (the trainer hung inside CUDA
-    calls whenever the loader pinned). `side=False` copies on the default stream instead."""
-    if dev.type != "cuda":
-        yield from src
-        return
-    import concurrent.futures as cf
-    stream = torch.cuda.Stream(dev) if side else None
-    it = iter(src)
+    calls whenever the loader pinned). `side=False` copies on the default stream instead.
 
-    def fetch():
+    `close()` is the SHUTDOWN PROTOCOL (review T19): it stops handing out batches, waits (at most
+    `timeout` seconds) for the fetch in flight, and shuts the loader's workers down. The round
+    transition calls it before it resets the cursor directory; relying on the generator's GC left a
+    pending fetch and the persistent workers free to publish old-round positions into the new round."""
+
+    def __init__(self, src, dev, side=True):
+        self.src, self.dev, self.side = src, dev, bool(side)
+        self._it = self._fut = None
+        self._closed = False
+        self.clean = None           # after close(): True when nothing was still running
+
+    def _fetch(self, stream):
         try:
-            item = next(it)
+            item = next(self._it)
         except StopIteration:
             return None
         b = _batch(item)
         if stream is None:
-            return {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}, None
+            return {k: (v.to(self.dev, non_blocking=True) if torch.is_tensor(v) else v)
+                    for k, v in b.items()}, None
         with torch.cuda.stream(stream):
-            d = {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
+            d = {k: (v.to(self.dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
             ev = torch.cuda.Event()
             ev.record(stream)
         return d, ev
 
-    with cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-h2d") as ex:
-        fut = ex.submit(fetch)
-        while True:
-            got = fut.result()
-            if got is None:
+    def __iter__(self):
+        self._it = iter(self.src)
+        if self.dev.type != "cuda":
+            while not self._closed:
+                try:
+                    item = next(self._it)
+                except StopIteration:
+                    return
+                yield item
+            return
+        stream = torch.cuda.Stream(self.dev) if self.side else None
+        self._fut = _spawn(lambda: self._fetch(stream))
+        while not self._closed:
+            got = self._fut.result()
+            if got is None or self._closed:
+                self._fut = None
                 return
-            fut = ex.submit(fetch)
+            self._fut = _spawn(lambda: self._fetch(stream))
             cur, ev = got
             if ev is not None:
-                torch.cuda.current_stream(dev).wait_event(ev)
+                torch.cuda.current_stream(self.dev).wait_event(ev)
                 for v in cur.values():
                     if torch.is_tensor(v) and v.is_cuda:
-                        v.record_stream(torch.cuda.current_stream(dev))
+                        v.record_stream(torch.cuda.current_stream(self.dev))
             yield cur
+
+    def close(self, timeout=QUIESCE_S):
+        """Quiesce: no further batch, the fetch in flight finished (or given up on after `timeout`
+        seconds -- its daemon thread is then abandoned, never joined), the loader's workers shut down.
+        Idempotent. Returns True when nothing was left running."""
+        if self._closed:
+            return bool(self.clean)
+        self._closed = True
+        clean = True
+        fut, self._fut = self._fut, None
+        if fut is not None:
+            import concurrent.futures as cf
+            try:
+                fut.result(timeout=max(float(timeout), 0.0))
+            except cf.TimeoutError:
+                clean = False
+            except Exception:  # noqa: BLE001  -- a failing last fetch is not the transition's problem
+                pass
+        _shutdown_loader(self.src, self._it)
+        self.clean = clean
+        return clean
+
+
+def to_device_iter(src, dev, side=True):
+    """`DevicePrefetch(src, dev, side)`: the name the step loop has always used."""
+    return DevicePrefetch(src, dev, side=side)
 
 
 class _Phases:
@@ -961,9 +1048,13 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:
             do_eval()
             save()
+            # `quiesce` is the loader's shutdown protocol: a round transition calls it before it
+            # resets the round's cursor state (review T19)
             if hook is not None and hook({"step": step, "net": net, "opt": opt, "ema": ema,
-                                          "temps": temps, "out": str(out), "ckpt": str(ck)}):
+                                          "temps": temps, "out": str(out), "ckpt": str(ck),
+                                          "quiesce": src.close}):
                 break
             t0, tw = time.time(), time.time()
+    src.close()
     save()
     return str(ck)

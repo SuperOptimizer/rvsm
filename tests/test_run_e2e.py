@@ -695,3 +695,124 @@ def test_the_metadata_probe_tells_a_404_from_a_transport_failure(tmp_path):
     finally:
         srv.shutdown()
     assert SM.probe(f"http://127.0.0.1:{srv.server_port}/v.zarr", timeout=2)[1] == "error"
+
+
+# --------------------------------------------------------------------------- T19: the round transition
+
+def test_a_stale_old_round_publish_after_the_reset_is_rejected(tmp_path):
+    """Review T19: a pending old-round fetch (or a persistent loader worker) can publish its cursor
+    AFTER the round transition reset the directory. The transition bumps the round first, a stale
+    walk's `_publish` then refuses to write, and every cursor reader rejects a record stamped with an
+    old round even when one does land (the check and the write are not atomic)."""
+    out = tmp_path / "t19"
+    os.makedirs(out / "logs")
+    RUN.write_state(str(out), round=0)
+    ds = _stub_walk(out)                               # round 0
+    assert ds._publish(0, 1, 7, 1.0) is True
+    assert RUN.read_cursor(str(out)) == 7
+    published = []
+
+    def quiesce():                                     # the old round's last fetch lands mid-transition
+        published.append(ds._publish(0, 1, 9, 1.0))
+    RUN.round_transition(str(out), 1, quiesce, round_step=5)
+    assert published == [False], "a stale writer published after the round was bumped"
+    assert RUN.read_state(str(out))["round"] == 1 and RUN.read_state(str(out))["cursor"] == 0
+    assert not os.path.exists(RUN.cursor_dir(str(out)))
+    # a late old-round publish after the reset: refused, and the directory is not recreated
+    assert ds._publish(0, 1, 11, 1.0) is False
+    assert not os.path.exists(RUN.cursor_dir(str(out)))
+    # one that raced past the check anyway is ignored by every reader; the new round's own counts
+    RUN._write_json(os.path.join(RUN.cursor_dir(str(out)), "w0.json"),
+                    {"pos": 11, "stride": 1, "worker": 0, "round": 0, "region_s": 3.0})
+    assert RUN.read_cursor(str(out)) == 0 and RUN.read_cursor_head(str(out)) == 0
+    assert RUN.walk_snapshot(str(out), 1) is None and RUN.region_seconds(str(out)) == 0.0
+    new = _stub_walk(out)
+    new.round = 1
+    assert new._publish(1, 2, 4, 2.0) is True
+    assert RUN.read_cursor(str(out)) == 8 and RUN.walk_snapshot(str(out), 1)["workers"] == {
+        "1": {"pos": 4, "done": [], "pass": 0}}
+
+
+def test_an_old_round_walk_stops_in_its_wait_loop_and_between_windows(tmp_path):
+    """The walk's wait loop checks the round as well as STOP (it waited forever for old-round stores
+    nobody will produce), and a visit in progress stops at its next window."""
+    import itertools
+    out = tmp_path / "t19w"
+    os.makedirs(out / "logs")
+    RUN.write_state(str(out), round=0)
+    waiting = _stub_walk(out, wait_until=set(range(40)))   # nothing is ever ready
+    got = []
+    th = threading.Thread(target=lambda: got.extend(iter(waiting)), daemon=True)
+    th.start()
+    time.sleep(0.2)
+    assert th.is_alive(), "the walk should be waiting"
+    RUN.write_state(str(out), round=1)
+    th.join(5.0)
+    assert not th.is_alive() and got == []
+    # mid-visit: the round moves on after the first window of a three-window visit
+    RUN.write_state(str(out), round=0)
+    ds = _stub_walk(out)
+    ds.windows = 3
+    n = {"i": 0}
+
+    def draw(rng, rec, air_ok=True):
+        n["i"] += 1
+        if n["i"] == 2:
+            RUN.write_state(str(out), round=1)
+        return rec["id"]
+    ds._draw = draw
+    assert list(itertools.islice(iter(ds), 10)) == [39, 39]
+
+
+class _Endless(torch.utils.data.IterableDataset):
+    def __iter__(self):
+        i = 0
+        while True:
+            i += 1
+            yield torch.tensor([i])
+
+
+def test_close_quiesces_the_loader_and_its_persistent_workers():
+    """`DevicePrefetch.close` is the shutdown protocol the round transition calls: no further batch,
+    and the loader's persistent workers are gone before it returns (they can publish nothing after)."""
+    import itertools
+
+    from rvsm import train as TR
+    dl = torch.utils.data.DataLoader(_Endless(), batch_size=None, num_workers=2,
+                                     persistent_workers=True, prefetch_factor=2,
+                                     multiprocessing_context="forkserver")
+    src = TR.DevicePrefetch(dl, torch.device("cpu"))
+    it = iter(src)
+    assert int(next(it)[0]) >= 1
+    workers = list(dl._iterator._workers)
+    assert workers and all(w.is_alive() for w in workers)
+    t0 = time.time()
+    assert src.close(timeout=10.0) is True
+    assert time.time() - t0 < 30.0
+    assert dl._iterator is None
+    for w in workers:
+        w.join(5.0)
+    assert not any(w.is_alive() for w in workers)
+    assert list(itertools.islice(it, 3)) == []          # nothing after close
+    assert src.close() is True                           # idempotent
+
+
+def test_close_gives_up_on_a_fetch_that_never_returns():
+    """A fetch in flight that never returns (an old-round walk blocked forever) does not block the
+    transition past its timeout: the daemon thread is abandoned, never joined."""
+    import threading as th
+    from rvsm import train as TR
+    gate = th.Event()
+
+    def stuck():
+        yield {"x": torch.zeros(1)}
+        gate.wait()                                     # never set: the next batch never comes
+        yield {"x": torch.zeros(1)}
+    src = TR.DevicePrefetch(stuck(), torch.device("cpu"))
+    src._it = stuck()
+    next(src._it)
+    src._fut = TR._spawn(lambda: next(src._it))
+    t0 = time.time()
+    assert src.close(timeout=0.5) is False
+    assert time.time() - t0 < 5.0
+    gate.set()

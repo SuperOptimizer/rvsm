@@ -12,7 +12,7 @@ import time
 import numpy as np
 
 from rvsm import sample
-from rvsm.run import WAIT_S, _write_json, cursor_dir, jlog, stop_requested
+from rvsm.run import WAIT_S, _write_json, cursor_dir, jlog, read_state, stop_requested
 
 
 class WalkPatches(sample.Patches):
@@ -28,11 +28,24 @@ class WalkPatches(sample.Patches):
         self.wait_s = float(wait_s)
         self.start = start or None
 
+    def _stale(self):
+        """Has the run moved past this walk's round? The trainer bumps `round` in state.json at a round
+        transition BEFORE it quiesces the loader and resets the cursor directory, so a walk of the old
+        round sees it here and stops -- in its wait loop, between windows, and before any publish."""
+        r = (read_state(self.out) or {}).get("round")
+        return r is not None and int(r) != int(self.round)
+
     def _publish(self, w, W, pos, region_s, done=(), npass=0):
+        """Publish this worker's walk position, stamped with its round. A walk whose round is over does
+        not write at all (the readers in `run` reject a record of another round as well: this check and
+        the write are not atomic)."""
+        if self._stale():
+            return False
         _write_json(os.path.join(cursor_dir(self.out), f"w{int(w)}.json"),
-                    {"pos": int(pos), "stride": int(W), "worker": int(w),
+                    {"pos": int(pos), "stride": int(W), "worker": int(w), "round": int(self.round),
                      "region_s": float(region_s), "t": time.time(),
                      "done": sorted(int(q) for q in done), "pass": int(npass)})
+        return True
 
     def _region_lo(self, rec):
         k = int(rec["k"])
@@ -79,7 +92,7 @@ class WalkPatches(sample.Patches):
                 continue
             pick = next((j for j, (_, i) in enumerate(pend) if self._visitable(self.visits[i])), None)
             if pick is None:
-                if stop_requested(self.out):
+                if stop_requested(self.out) or self._stale():
                     return
                 jlog(self.out, "train", {"kind": "wait", "worker": int(w),
                                          "train_wait_s": self.wait_s, "pending": len(pend)},
@@ -106,6 +119,8 @@ class WalkPatches(sample.Patches):
             self._publish(w, W, f, region_s, visited, npass)
             left, fails, air = self.windows, 0, self.air_budget()
             while left > 0 and fails < 8 * max(self.windows, 1):
+                if self._stale():
+                    return
                 got = self._draw(rng, rec, air_ok=air > 0)
                 if got is None:
                     fails += 1
