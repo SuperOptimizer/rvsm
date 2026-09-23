@@ -254,18 +254,6 @@ def pair_terms(lr_, lv_, tgt2, w2, paired):
     return L.losses_tw(torch.cat([lr_, lv_], 1), tgt2, w2 * paired)
 
 
-def ect_band(y0, d, th, paired, layout, cfg):
-    """The probability the ECT term reads, per sample: the band CONSTRUCTED from midline / thickness
-    where the sample has paired support, the learned recto head where it has none (in round 0 before
-    the verso fields exist, the constructed band is invented geometry)."""
-    rec = torch.sigmoid(y0[:, :1])
-    if layout.nprob < 2:
-        return rec
-    con = torch.sigmoid(L.pair_logits(d, th, cfg.pair_band, cfg.pair_tau)[0])
-    has = (paired.flatten(1).sum(1) > 0).to(rec.dtype).view(-1, 1, 1, 1, 1)
-    return has * con + (1 - has) * rec
-
-
 def ect_seed(step, micro=0):
     """The ECT block draw's seed: the step AND the accumulation microbatch, so the microbatches of one
     step draw different blocks, and a resume replays the same ones."""
@@ -1037,13 +1025,18 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             sel = [i for i, k in enumerate(ks) if k == int(cfg.ect_rung)]
             if sel:
                 idx = torch.tensor(sel, device=y0.device)
-                pr = ect_band(y0, d, th, paired, layout, cfg)
+                rec_p = torch.sigmoid(y0[:, :1])
+                con_p = torch.sigmoid(L.pair_logits(d, th, cfg.pair_band, cfg.pair_tau)[0]) \
+                    if layout.nprob >= 2 else rec_p
                 # ect_n is the number of DIRECTIONS (it was passed as the block count); the blocks
                 # are drawn per sample from a generator seeded by the step AND the microbatch index
                 # (accumulation microbatches draw different blocks), so a resume replays them
-                e = L.ect_loss(pr[idx], tg[idx, :1], dirs=cfg.ect_n, block=cfg.ect_block,
+                # per BLOCK: the constructed band only where the whole block has paired support, the
+                # learned recto head elsewhere (pass-4 P4-05)
+                e = L.ect_loss(con_p[idx], tg[idx, :1], dirs=cfg.ect_n, block=cfg.ect_block,
                                nblocks=cfg.ect_blocks, w=wt[idx, :1],
-                               gen=torch.Generator().manual_seed(ect_seed(step, micro)))
+                               gen=torch.Generator().manual_seed(ect_seed(step, micro)),
+                               alt=rec_p[idx], support=paired[idx])
                 loss = loss + cfg.loss_ect * e
                 reg_log["ect"] = float(e.detach())
 

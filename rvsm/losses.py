@@ -571,7 +571,8 @@ def ect(p, dirs, res=16):
     return out.cumsum(-1)
 
 
-def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5, w=None, gen=None):
+def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5, w=None, gen=None,
+             alt=None, support=None):
     """Mean squared difference between the ECT of the predicted probability and of the target, over
     interior sub-blocks.
 
@@ -585,6 +586,11 @@ def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5, w=N
     without one the blocks are the first of the grid, the old fixed choice). With `w` (the target
     weight, (B, 1+, Z, Y, X)) only a FULLY observed block (weight > 0 at every voxel) is a candidate,
     and a sample with no such block does not score. The value is 0 when nothing scores.
+
+    `alt` / `support` (pass-4 P4-05): `p` is then the band CONSTRUCTED from midline / thickness and
+    `alt` the learned recto head; a chosen block reads `p` only when `support` (the paired support,
+    (B, 1, Z, Y, X)) is non-zero at EVERY voxel of it, and `alt` otherwise -- per block, not per
+    sample, so a corner of paired support cannot route a whole block's gradient into the fields.
 
     The transform is normalised by the number of vertices of a sub-block, so the value does not depend on
     `block`; it is 0 for identical inputs and finite for any input."""
@@ -618,7 +624,12 @@ def ect_loss(p, tgt, dirs=1, res=16, margin=8, block=32, nblocks=4, thr=0.5, w=N
         else:
             chosen = cand[:nb]
         for (z, y, x) in chosen:
-            pbs.append(p[s:s + 1, :1, z:z + block, y:y + block, x:x + block])
+            src = p
+            if alt is not None:
+                full = support is not None and bool(
+                    (support[s:s + 1, :1, z:z + block, y:y + block, x:x + block] > 0).all())
+                src = p if full else alt
+            pbs.append(src[s:s + 1, :1, z:z + block, y:y + block, x:x + block])
             tbs.append(t[s:s + 1, :1, z:z + block, y:y + block, x:x + block])
     if not pbs:
         return p.sum() * 0.0

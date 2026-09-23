@@ -638,9 +638,37 @@ def test_the_pair_trains_only_where_paired_support_exists():
     b2, _ = TR.pair_terms(lr_, lv_, tgt2, w2, some)
     b2.backward()
     assert float(b2) > 0 and float(d.grad[..., 8:].abs().max()) == 0.0 and float(d.grad.abs().max()) > 0
-    y0 = torch.randn(1, lay.cout, S, S, S)
-    band = TR.ect_band(y0, d.detach(), th.detach(), none, lay, cfg)
-    assert torch.allclose(band, torch.sigmoid(y0[:, :1]))           # no support: the learned recto
+
+
+def test_the_ect_reads_the_constructed_band_only_in_fully_supported_blocks():
+    """P4-05: per sampled block, the constructed band only where paired support covers the whole
+    block; a block with paired support in one corner reads the learned recto, so no ECT gradient
+    reaches midline / thickness from it."""
+    from rvsm.config import Config
+    cfg = Config()
+    torch.manual_seed(0)
+    S, blk = 40, 16
+    d = torch.randn(1, 1, S, S, S, requires_grad=True)
+    th = torch.rand(1, 1, S, S, S).mul(4).add(1).requires_grad_(True)
+    rec = torch.rand(1, 1, S, S, S, requires_grad=True)
+    tgt = (torch.rand(1, 1, S, S, S) > 0.5).float()
+    w = torch.ones_like(tgt)
+    con = torch.sigmoid(TR.L.pair_logits(d, th, cfg.pair_band, cfg.pair_tau)[0])
+    corner = torch.zeros_like(tgt)
+    corner[..., :6, :6, :6] = 1                                  # paired support in one corner only
+    e = TR.L.ect_loss(con, tgt, dirs=2, res=8, margin=4, block=blk, nblocks=4, w=w,
+                      gen=torch.Generator().manual_seed(0), alt=rec, support=corner)
+    e.backward()
+    assert d.grad is None or float(d.grad.abs().max()) == 0.0
+    assert th.grad is None or float(th.grad.abs().max()) == 0.0
+    assert float(rec.grad.abs().max()) > 0                       # the learned recto carried it
+    d.grad = th.grad = rec.grad = None
+    con = torch.sigmoid(TR.L.pair_logits(d, th, cfg.pair_band, cfg.pair_tau)[0])
+    full = torch.ones_like(tgt)
+    e = TR.L.ect_loss(con, tgt, dirs=2, res=8, margin=4, block=blk, nblocks=4, w=w,
+                      gen=torch.Generator().manual_seed(0), alt=rec, support=full)
+    e.backward()
+    assert float(d.grad.abs().max()) > 0 and (rec.grad is None or float(rec.grad.abs().max()) == 0.0)
 
 
 def test_stop_now_exits_cleanly_and_checkpoints_only_when_worth_it(tiny_cfg, monkeypatch):
