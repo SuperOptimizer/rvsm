@@ -832,6 +832,15 @@ def test_the_walk_leases_its_homes_and_waits_for_an_evicted_one(tmp_path, monkey
     ds.stream_mirror, ds.ctx = True, ()
     for i in (0, 1, 2):
         open(shard((128 * i, 0, 0)), "w").close()       # visit 3's home is not on disk
+    halt = threading.Event()
+
+    def keeper():                                       # the producer's ack: the homes on disk
+        while not halt.is_set():
+            for r in RUN.cursor_records(str(out)):
+                ready = [lo for lo in r.get("lease") or () if os.path.exists(shard(lo))]
+                RUN.write_lease_ack(str(out), r["worker"], r.get("lease_id"), ready)
+            halt.wait(0.01)
+    threading.Thread(target=keeper, daemon=True).start()
     got, it = [], iter(ds)
     got += [next(it) for _ in range(3)]
     assert got == [2, 1, 0], "the non-resident visit 3 must not start"
@@ -848,6 +857,7 @@ def test_the_walk_leases_its_homes_and_waits_for_an_evicted_one(tmp_path, monkey
     th.join(5.0)
     assert got == [2, 1, 0, 3]
     assert (384, 0, 0) in RUN.cursor_leases(str(out))   # held while its windows are drawn
+    halt.set()
 
 
 # --------------------------------------------------------------------------- O10: producer supervision
@@ -1042,3 +1052,40 @@ def test_the_heartbeat_ticker_stamps_during_a_long_unit():
     t.join(2.0)
     assert not t.is_alive() and len(n) >= 5
     assert RUN.HB_TICK_S < RUN.SILENT_MAX_S / 10
+
+
+def test_a_visit_draws_only_after_its_lease_is_acknowledged(tmp_path):
+    """P3-02, the worker's side: after publishing, a visit waits for the producer's ack of THAT lease
+    (an ack of an older lease id does not count), ends on a round change, and after the timeout
+    proceeds loudly rather than stopping training."""
+    from rvsm import walk as WK
+    out = tmp_path / "ack"
+    os.makedirs(out / "logs")
+    RUN.write_state(str(out), round=0)
+    ds = _stub_walk(out)
+    ds.stream_mirror = True
+    assert ds._publish(0, 1, 0, 0.0, lease=[(0, 0, 0)])
+    old = ds._lease_id
+    assert ds._publish(0, 1, 0, 0.0, lease=[(0, 0, 0)])
+    assert ds._lease_id != old
+    RUN.write_lease_ack(str(out), 0, old, [[0, 0, 0]])                   # stale: an older lease
+    got = []
+    th = threading.Thread(target=lambda: got.append(ds._await_ack(0, (0, 0, 0), timeout=10)),
+                          daemon=True)
+    th.start()
+    time.sleep(0.3)
+    assert th.is_alive(), "an ack of another lease id must not release the visit"
+    RUN.write_lease_ack(str(out), 0, ds._lease_id, [[128, 0, 0]])        # this lease, other home
+    time.sleep(0.2)
+    assert th.is_alive()
+    RUN.write_lease_ack(str(out), 0, ds._lease_id, [[0, 0, 0], [128, 0, 0]])
+    th.join(5)
+    assert got == [True]
+    # timeout: proceed, and say so
+    assert ds._await_ack(0, (256, 0, 0), timeout=0.1) is True
+    assert any(r.get("kind") == "lease_ack_timeout"
+               for r in RUN.tail_jsonl(os.path.join(str(out), "logs", "train.jsonl")))
+    # a round change ends the wait
+    RUN.write_state(str(out), round=1)
+    assert ds._await_ack(0, (256, 0, 0), timeout=10) is False
+    assert WK.LEASE_ACK_S == 60.0

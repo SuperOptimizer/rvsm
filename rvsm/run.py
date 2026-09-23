@@ -87,6 +87,8 @@ RAM_RESUME_FRAC = 0.75      # MemTotal pauses the producer; below this share it 
 RAM_CHECK_S = 5.0           # the guard looks this often (the paris4 OOM went 90 % -> 99.5 % in 4 s)
 HEARTBEAT_S = 30.0          # how often the supervisor stamps workers.json / logs/sched.jsonl
 SILENT_MAX_S = 1800.0       # a producer that has not stamped its heartbeat for this long is restarted
+LEASE_POLL_S = 0.25         # how often the producer's lease keeper looks for new leases
+LEASE_RETRY_S = 10.0        # a leased region whose (re-)fetch left it incomplete is retried this often
 HB_TICK_S = 60.0            # the producer's own stamping thread: alive while a long unit runs
 RESTART_MIN_S = 10.0        # a dead producer is restarted AT ONCE; a second death waits this long, doubling
 RESTART_MAX_S = 600.0       # ... up to this
@@ -730,26 +732,21 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
         if (lo, job) not in pre:
             pre[(lo, job)] = reader.submit(need, lo, job)
 
-    leasing = {}                                # lo -> future of a leased region's (re-)fetch
+    lease_state = {}                            # worker -> (lease_id, ready?, last attempt)
 
-    def follow_leases(round_):
-        """The trainer's leases (review D04): their shards are protected from eviction from now on, and
-        a leased region this producer does not hold -- a rung 3-6 revisit of a home the walk released
-        long ago, a region the budget evicted, a restart -- is fetched again on the reader thread. The
-        worker that leased it waits until its shards are all on disk (`WalkPatches._resident`)."""
-        leased = cursor_leases(out, round_)
-        with clock:
-            cache.lease(cache.region_key(lo) for lo in leased)
-        for lo, f in list(leasing.items()):
-            if f.done():
-                leasing.pop(lo)
-                if f.exception() is not None:
-                    jlog(out, "produce", {"kind": "lease_fetch_failed", "region": list(lo),
-                                          "err": repr(f.exception())})
-        for lo in leased:
-            if lo not in keys and lo not in leasing:
-                leasing[lo] = reader.submit(need, lo, "lease")
-        return leased
+    def keep_leases():
+        """The producer's side of a lease (`acknowledge_leases`), on its own thread: a long GPU unit
+        must never delay a worker's acknowledgement."""
+        while not hb_stop.is_set() and not stopping():
+            try:
+                acknowledge_leases(out, cache, keys, clock, lease_state,
+                                   {"ctx": cfg.ctx, "patch": cfg.patch, "region": cfg.region})
+            except Exception as e:  # noqa: BLE001  -- a bad cursor file must not end the keeper
+                jlog(out, "produce", {"kind": "lease_keeper_error", "err": repr(e)}, echo=False)
+            hb_stop.wait(LEASE_POLL_S)
+
+    if cache.remote:
+        threading.Thread(target=keep_leases, name="rvsm-lease", daemon=True).start()
 
     def settle():
         """Raise a background failure here, on the producer's own thread, and forget finished work."""
@@ -806,7 +803,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             head = max(read_cursor_head(out, round_), cursor)
             if time.time() - t_reest > REEST_S:
                 L, t_reest = lookahead(cfg, out, k_active), time.time()
-            leased = follow_leases(round_)
+            leased = cursor_leases(out, round_)
             stamp({"phase": f"round{round_}", "last_ts": time.time(),
                              "L": L, "cursor": cursor, "head": head})
 
@@ -1246,13 +1243,90 @@ def round_transition(out, nxt, quiesce=None, **state):
     if quiesce is not None:
         quiesce()
     shutil.rmtree(cursor_dir(out), ignore_errors=True)
+    shutil.rmtree(ack_dir(out), ignore_errors=True)
+
+
+def acknowledge_leases(out, cache, keys, clock, state, fetch_kw):
+    """One pass of the producer's lease keeper (review D04 / P3-02). Register every worker's lease with
+    the cache; for each NEW lease (worker, lease_id), resolve it -- (re-)fetch a leased home this
+    producer does not hold or that lost shards (a rung 3-6 revisit, an eviction, a restart) -- and
+    ACKNOWLEDGE it with the homes that are protected and fully on disk. A worker draws nothing before
+    that ack (`WalkPatches._await_ack`), and every eviction re-reads the leases itself
+    (`ShardCache.lease_source`), so nothing leased at decision time is taken. Overlapping leases are a
+    union: a home stays protected while ANY worker's current lease names it, and a lease is released
+    by that worker's next publish. `state` is the keeper's memory: worker -> (lease_id, complete, t)."""
+    import numpy as np
+    recs = cursor_records(out)
+    leased = sorted({tuple(int(v) for v in lo) for r in recs for lo in r.get("lease") or ()})
+    with clock:
+        cache.lease(cache.region_key(lo) for lo in leased)
+    acked = []
+    for r in recs:
+        lid, w = r.get("lease_id"), r.get("worker")
+        if lid is None or w is None:
+            continue
+        last = state.get(w)
+        if last is not None and last[0] == lid and (last[1] or time.time() - last[2] < LEASE_RETRY_S):
+            continue
+        homes = [tuple(int(v) for v in lo) for lo in r.get("lease") or ()]
+        ready = []
+        with clock:
+            for lo in homes:
+                k = cache.region_key(lo)
+                if lo not in keys or cache.missing(k):
+                    keys[lo] = cache.fetch_region(np.array(lo, np.int64), evict=False, **fetch_kw)
+                if not cache.missing(k):
+                    ready.append(list(lo))
+            cache.evict()
+        write_lease_ack(out, w, lid, ready, r.get("round"))
+        state[w] = (lid, len(ready) == len(homes), time.time())
+        acked.append((w, lid))
+        if len(ready) < len(homes):
+            jlog(out, "produce", {"kind": "lease_incomplete", "worker": w, "lease_id": lid,
+                                  "missing": [list(lo) for lo in homes if list(lo) not in ready]},
+                 echo=False)
+    return acked
+
+
+def ack_dir(out):
+    return os.path.join(str(out), "logs", "lease_ack")
+
+
+def write_lease_ack(out, worker, lease_id, ready, round_=None):
+    """The producer's acknowledgement of one worker's lease: `ready` lists the leased homes that are
+    protected from eviction and fully on disk."""
+    return _write_json(os.path.join(ack_dir(out), f"w{int(worker)}.json"),
+                       {"worker": int(worker), "lease_id": str(lease_id), "round": round_,
+                        "ready": [list(v) for v in ready], "t": time.time()})
+
+
+def read_lease_ack(out, worker):
+    return _read_json(os.path.join(ack_dir(out), f"w{int(worker)}.json")) or {}
+
+
+_CURSOR_CACHE = {}      # path -> ((mtime_ns, size), record): leases are read before every eviction
+
+
+def _cursor_read(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        _CURSOR_CACHE.pop(path, None)
+        return None
+    sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+    hit = _CURSOR_CACHE.get(path)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    r = _read_json(path)
+    _CURSOR_CACHE[path] = (sig, r)
+    return r
 
 
 def cursor_records(out, round_=None):
     """The sampler workers' cursor files of the CURRENT round (`round_`, default state.json's): a record
     stamped with another round is a stale writer -- an old-round worker or prefetch that published after
     the round transition reset the directory -- and is ignored. An unstamped record (a run older than
-    the stamp) is taken as it is."""
+    the stamp) is taken as it is. A file is re-parsed only when its stat changes."""
     if round_ is None:
         round_ = read_state(out).get("round")
     d = cursor_dir(out)
@@ -1260,7 +1334,7 @@ def cursor_records(out, round_=None):
     for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
         if not n.endswith(".json"):
             continue
-        r = _read_json(os.path.join(d, n))
+        r = _cursor_read(os.path.join(d, n))
         if not r or not isinstance(r.get("pos"), int):
             continue
         if round_ is not None and r.get("round") is not None and int(r["round"]) != int(round_):

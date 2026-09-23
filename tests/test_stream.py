@@ -308,3 +308,75 @@ def test_a_revisit_whose_home_was_evicted_is_fetched_again(ct_origin, tmp_path, 
     RUN._release_passed(c, keys, {A: 0, B: 1}, 5, None, 0, True, out, rungs=(2,), leased=[A])
     assert A in keys and B not in keys
     c.close()
+
+
+def test_a_published_lease_protects_before_the_producer_has_looked(tmp_path):
+    """P3-02, the review's probe: a worker sees its bytes, publishes its lease and draws at once, while
+    the producer is deep in a GPU unit with an old lease snapshot (here: none). Every eviction now
+    re-reads the leases from the run directory itself, so the file is still there for the first draw;
+    once the worker's next publish drops the lease, the shard is evictable again."""
+    from rvsm import run as RUN
+    from rvsm.walk import WalkPatches
+    tmp = str(tmp_path)
+    cache = stream.ShardCache("https://example.invalid/volume", tmp, budget_gb=1)
+    path = os.path.join(cache.base, "0", "c", "0", "0", "0")
+    os.makedirs(os.path.dirname(path))
+    open(path, "wb").write(b"CT-data")
+    key = cache.region_key((0, 0, 0))
+    cache._paths_of[key] = [path]
+    cache.charge(path)
+    cache.hold[path] = {key}
+    cache.regions[key] = {path}
+    cache.release(key)
+    RUN.write_state(tmp, round=0)
+    ds = WalkPatches.__new__(WalkPatches)
+    ds.out, ds.round, ds.stream_mirror = tmp, 0, True
+    ds._rpaths = {(0, 0, 0): [path]}
+    ds._region_lo = lambda rec: (0, 0, 0)
+    assert ds._resident({})
+    assert ds._publish(0, 1, 1, 0, lease=[(0, 0, 0)])
+    assert RUN.cursor_leases(tmp) == [(0, 0, 0)] and not cache.leased   # the owner has not looked
+    cache.budget = 0
+    cache.evict()
+    assert os.path.exists(path), "a published lease must protect at the very next eviction decision"
+    assert ds._publish(0, 1, 2, 0, lease=[])                           # the visit is over
+    cache.evict()
+    assert not os.path.exists(path)
+    cache.close()
+
+
+def test_the_lease_keeper_refetches_and_acknowledges_a_lease(ct_origin, tmp_path, windowed):
+    """One pass of the producer's lease keeper: a NEW lease (worker, lease_id) whose home was evicted is
+    fetched again and acknowledged with that home ready; the same lease is not re-resolved; a new
+    lease id is."""
+    import threading
+
+    from rvsm import run as RUN
+    out = str(tmp_path / "run")
+    c = stream.ShardCache(ct_origin.url, out, budget_gb=1)
+    c.pin_small_levels(max_vox=4_000_000)
+    ka = c.fetch_region(A, **KW)
+    c.release(ka)
+    c.budget = 1
+    kb = c.fetch_region(B, **KW)
+    assert c.missing(ka)
+    RUN.write_state(out, round=0)
+    RUN._write_json(os.path.join(RUN.cursor_dir(out), "w0.json"),
+                    {"pos": 5, "stride": 1, "worker": 0, "round": 0, "lease": [list(A)],
+                     "lease_id": "p.1"})
+    keys, st, lk = {B: kb}, {}, threading.Lock()
+    fk = {"ctx": KW["ctx"], "patch": KW["patch"], "region": KW["region"]}
+    assert RUN.acknowledge_leases(out, c, keys, lk, st, fk) == [(0, "p.1")]
+    ack = RUN.read_lease_ack(out, 0)
+    assert ack["lease_id"] == "p.1" and ack["ready"] == [list(A)]
+    assert A in keys and not c.missing(ka)
+    assert stream.resident(stream.region_paths(c.levels(), A, KW["ctx"], KW["region"]))
+    c.evict()                                        # 1-byte budget: A is leased, so it stays
+    assert not c.missing(ka)
+    assert RUN.acknowledge_leases(out, c, keys, lk, st, fk) == []          # already acknowledged
+    RUN._write_json(os.path.join(RUN.cursor_dir(out), "w0.json"),
+                    {"pos": 6, "stride": 1, "worker": 0, "round": 0, "lease": [list(B)],
+                     "lease_id": "p.2"})
+    assert RUN.acknowledge_leases(out, c, keys, lk, st, fk) == [(0, "p.2")]
+    assert RUN.read_lease_ack(out, 0)["ready"] == [list(B)]
+    c.close()

@@ -314,6 +314,11 @@ class ShardCache:
         self.size, self.ref, self.pin, self.hold, self.regions = {}, {}, set(), {}, {}
         self.cache_bytes, self.clock, self.evicted = 0, 0, 0
         self.linked, self.leased, self._paths_of = set(), set(), {}
+        # where the trainer's leases are read from, right before EVERY eviction decision (review P3-02):
+        # the run directory's cursor files by default, so no snapshot the producer took earlier can be
+        # the one an eviction trusts
+        self.lease_source = self._run_leases if self.remote else None
+        self.region_args = None             # (ctx, region, rung) of fetch_region: a leased key's paths
         self.inventoried = 0
         self._loop = self._sess = self._f = None
         self._meta = False
@@ -542,6 +547,7 @@ class ShardCache:
         key = self.region_key(lo2)
         paths = region_paths(pyr, lo2, ctx, region, rung)
         self._paths_of[key] = paths
+        self.region_args = (tuple(ctx), region, rung)
         t0 = time.time()
         f = self._f
         b0, n0, s0 = (f.bytes, f.fetched, f.seeded) if f is not None else (0, 0, 0)
@@ -580,13 +586,41 @@ class ShardCache:
         by this process)? A local volume never misses anything."""
         if not self.remote:
             return False
-        paths = self._paths_of.get(str(key))
+        paths = self.paths_of(key)
         return paths is None or not resident(paths)
 
+    def _run_leases(self):
+        """The region keys the run directory's cursor files lease right now (`run.cursor_leases`)."""
+        from rvsm import run
+        return [self.region_key(lo) for lo in run.cursor_leases(self.root)]
+
+    def paths_of(self, key):
+        """The shard paths of region `key`: as fetched, or -- a region leased but never fetched by this
+        process (a restart) -- computed from the key with the last `fetch_region` arguments."""
+        key = str(key)
+        got = self._paths_of.get(key)
+        if got is None and self.region_args is not None:
+            try:
+                lo = tuple(int(v) for v in key.split("_"))
+            except ValueError:
+                return None
+            ctx, region, rung = self.region_args
+            got = self._paths_of[key] = region_paths(self.levels(), lo, ctx, region, rung)
+        return got
+
     def _leased_paths(self):
+        """The paths no eviction may take: the leases set with `lease()` (the producer's last look) AND
+        the ones on disk this instant (`lease_source`) -- a stale snapshot can only protect more."""
+        keys = set(self.leased)
+        if self.lease_source is not None:
+            try:
+                self._live = {str(k) for k in self.lease_source()}
+            except Exception as e:  # noqa: BLE001  -- keep the last live set rather than none
+                self.log(f"rvsm cache: lease read failed, keeping the last set: {e!r}")
+            keys |= getattr(self, "_live", set())
         out = set()
-        for k in self.leased:
-            out.update(self._paths_of.get(k, ()))
+        for k in keys:
+            out.update(self.paths_of(k) or ())
         return out
 
     def evict(self):

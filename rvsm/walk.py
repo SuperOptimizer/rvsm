@@ -12,7 +12,11 @@ import time
 import numpy as np
 
 from rvsm import sample
-from rvsm.run import WAIT_S, _write_json, cursor_dir, jlog, read_state, stop_requested
+from rvsm.run import (WAIT_S, _write_json, cursor_dir, jlog, read_lease_ack, read_state,
+                      stop_requested)
+
+LEASE_ACK_S = 60.0      # a visit waits this long for the producer's lease acknowledgement, then proceeds
+ACK_POLL_S = 0.05
 
 
 class WalkPatches(sample.Patches):
@@ -50,12 +54,38 @@ class WalkPatches(sample.Patches):
         in `run` reject a record of another round as well: this check and the write are not atomic)."""
         if self._stale():
             return False
+        n = self.__dict__["_lease_n"] = self.__dict__.get("_lease_n", 0) + 1
+        self._lease_id = f"{os.getpid()}.{n}"      # unique across processes and publishes
         _write_json(os.path.join(cursor_dir(self.out), f"w{int(w)}.json"),
                     {"pos": int(pos), "stride": int(W), "worker": int(w), "round": int(self.round),
                      "region_s": float(region_s), "t": time.time(),
                      "done": sorted(int(q) for q in done), "pass": int(npass),
-                     "lease": [list(lo) for lo in dict.fromkeys(tuple(v) for v in lease)]})
+                     "lease": [list(lo) for lo in dict.fromkeys(tuple(v) for v in lease)],
+                     "lease_id": self._lease_id})
         return True
+
+    def _await_ack(self, w, home, timeout=None):
+        """A published lease is not yet an acquired one (review P3-02): wait until the producer's ack
+        for THIS lease (`lease_id`) lists `home` as protected and on disk. True to draw; False when the
+        walk must end (STOP, or its round is over). On a local volume there is nothing to wait for.
+        After `LEASE_ACK_S` without an ack the visit proceeds anyway, loudly (a dead producer must not
+        stop training on what is already on disk)."""
+        if not getattr(self, "stream_mirror", False):
+            return True
+        want, t0 = list(home), time.time()
+        timeout = LEASE_ACK_S if timeout is None else float(timeout)
+        while True:
+            a = read_lease_ack(self.out, w)
+            if a.get("lease_id") == getattr(self, "_lease_id", None) and want in (a.get("ready") or []):
+                return True
+            if stop_requested(self.out) or self._stale():
+                return False
+            if time.time() - t0 > timeout:
+                jlog(self.out, "train", {"kind": "lease_ack_timeout", "worker": int(w),
+                                         "home": want, "lease_id": getattr(self, "_lease_id", None),
+                                         "s": round(time.time() - t0, 1)})
+                return True
+            time.sleep(ACK_POLL_S)
 
     def _lease(self, visits):
         """The home regions of these visits (walk indices), in order, once each."""
@@ -155,6 +185,8 @@ class WalkPatches(sample.Patches):
             # it), and the homes pending in the lookahead
             self._publish(w, W, f, region_s, visited, npass,
                           lease=self._lease([i] + [j for _, j in pend]))
+            if not self._await_ack(w, lo):
+                return
             left, fails, air = self.windows, 0, self.air_budget()
             while left > 0 and fails < 8 * max(self.windows, 1):
                 if self._stale():
