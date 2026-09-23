@@ -150,7 +150,8 @@ def test_rvsm_run_two_rounds_end_to_end(run_cfg, tmp_path, capsys):
     assert RUN.read_state(out)["round"] == 1
     with pytest.raises(AssertionError, match="fingerprint"):
         RUN.setup(replace(cfg, patch=64), out)
-    assert took < 180, f"the end-to-end run took {took:.0f}s"
+    # a behaviour test, not a benchmark: ~190 s on an idle 8-core box, 450+ s on a loaded laptop
+    assert took < 1200, f"the end-to-end run took {took:.0f}s"
 
 
 def _first_done(out, channel, round_):
@@ -192,7 +193,7 @@ def test_rvsm_stop_ends_the_run_within_one_unit(region_cfg, fake_teacher, tmp_pa
 
     th = threading.Thread(target=go, daemon=True)
     th.start()
-    for _ in range(600):                       # wait for the trainer to be training
+    for _ in range(3000):                      # wait for the trainer to be training (slow under load)
         if int(RUN.read_state(cfg.out).get("step", 0)) >= 1:
             break
         time.sleep(0.1)
@@ -201,7 +202,7 @@ def test_rvsm_stop_ends_the_run_within_one_unit(region_cfg, fake_teacher, tmp_pa
         th.join(60)
         pytest.fail("the trainer never reached its first evaluation")
     assert cli.main(["stop", "--out", cfg.out]) == 0
-    th.join(90)
+    th.join(300)
     assert not th.is_alive(), "the run did not stop"
     assert os.path.exists(box["ck"]) and box["ck"].endswith("student.pt")
     assert RUN.read_state(cfg.out)["round"] == 0
