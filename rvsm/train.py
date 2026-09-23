@@ -314,6 +314,7 @@ def eval_cascade_mode(mode):
     return {"self": "self", "mix": "self", "off": "off", "mask": "mask"}[m]
 
 
+EVAL_SCHEMA = "eval-v3"  # bump when an eval metric changes meaning (the gates compare like with like)
 FINE_RUNGS = (2, 3, 4)   # the rungs the headline `dice` / `bce` / `mae` are pooled over
 NBINS = 200              # probability bins of the threshold-free (best-threshold) dice
 
@@ -463,6 +464,11 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
         kb, kd, _, _ = _pool_eval(per[k])
         out[f"dice_r{k}"], out[f"bce_r{k}"] = kd, kb
     names = list(layout.channels)
+    out["eval_schema"] = EVAL_SCHEMA
+    for k in sorted(dch):                  # per HEAD per rung: dice_recto_r2 is the recto head alone
+        for c, (num_k, den_k) in dch[k].items():
+            nm = names[c] if c < len(names) else f"c{c}"
+            out[f"dice_{nm}_r{k}"] = 2.0 * num_k / (den_k + 1.0)
     for c in range(np_):
         num = sum(dch.get(k, {}).get(c, [0.0, 0.0])[0] for k in fine)
         den = sum(dch.get(k, {}).get(c, [0.0, 0.0])[1] for k in fine)

@@ -1121,13 +1121,33 @@ def _boot(vals, n=200, seed=0, lo=2.5, hi=97.5):
     return float(v.mean()), float(np.percentile(b, lo)), float(np.percentile(b, hi))
 
 
-def eval_r2(out, step, n=2):
-    """The rung-2 self-cascade `dice_r2` of the last `n` evaluations up to and including `step`, oldest
-    first (the rung verso is written at). Fewer when the log has fewer."""
-    rs = [r for r in tail_jsonl(os.path.join(str(out), "logs", "eval.jsonl"), 50)
-          if int(r.get("step", -1)) <= int(step) and isinstance(r.get("dice_r2"), (int, float))]
-    rs.sort(key=lambda r: int(r["step"]))
-    return [float(r["dice_r2"]) for r in rs[-int(n):]]
+GATE_METRIC = "dice_recto_r2"   # the recto head alone at rung 2, against the immutable recto grid
+
+
+def eval_streak(out, step, key=GATE_METRIC):
+    """((previous, current) values of `key`, None) for the evaluation AT `step` and the one at the
+    immediately preceding distinct step -- or (None, why). Fails closed (pass-4 P4-03): no row at
+    the current step, more than one row at either step, a missing / non-finite value, or the two rows
+    from different eval schemas all break the streak."""
+    from rvsm import train as TR
+    rows = [r for r in tail_jsonl(os.path.join(str(out), "logs", "eval.jsonl"), 200)
+            if isinstance(r.get("step"), (int, float)) and int(r["step"]) <= int(step)]
+    cur = [r for r in rows if int(r["step"]) == int(step)]
+    if len(cur) != 1:
+        return None, ("no evaluation row at this step" if not cur else "duplicate rows at this step")
+    before = sorted({int(r["step"]) for r in rows if int(r["step"]) < int(step)})
+    if not before:
+        return None, "no earlier evaluation"
+    prev = [r for r in rows if int(r["step"]) == before[-1]]
+    if len(prev) != 1:
+        return None, "duplicate rows at the previous step"
+    a, b = prev[0], cur[0]
+    if a.get("eval_schema") != TR.EVAL_SCHEMA or b.get("eval_schema") != TR.EVAL_SCHEMA:
+        return None, "eval schema differs from this code's"
+    va, vb = a.get(key), b.get(key)
+    if not all(isinstance(v, (int, float)) and np.isfinite(v) for v in (va, vb)):
+        return None, f"{key} missing or non-finite"
+    return (float(va), float(vb)), None
 
 
 def eval_dice(out, step):
@@ -1162,11 +1182,11 @@ def verso_gate(cfg, out, step, rows_fn=None, screen=None, r2=None):
         # evaluations, so one lucky evaluation cannot start the verso passes
         vals = [float(v) for v in (r2 if r2 is not None else ([] if screen is None else [screen]))]
         ok = len(vals) >= 2 and all(np.isfinite(v) and v >= floor for v in vals[-2:])
-        rec = {"step": int(step), "dice_r2_prev": vals[-2] if len(vals) >= 2 else None,
-               "dice_r2": vals[-1] if vals else None, "verso_min_dice": floor, "eval_dice": screen}
+        rec = {"step": int(step), f"{GATE_METRIC}_prev": vals[-2] if len(vals) >= 2 else None,
+               GATE_METRIC: vals[-1] if vals else None, "verso_min_dice": floor, "eval_dice": screen}
         if not ok:
-            return False, {"why": "verso_after_steps reached, but rung-2 dice is not at verso_min_dice "
-                                  "on two consecutive evaluations: waiting", **rec}
+            return False, {"why": "verso_after_steps reached, but the rung-2 recto dice is not at "
+                                  "verso_min_dice on two consecutive evaluations: waiting", **rec}
         return True, {"why": "verso_after_steps", **rec}
     need = float(getattr(cfg, "verso_gate_dice", 0.6))
     if screen is not None and np.isfinite(screen) and float(screen) < need - GATE_SCREEN:
@@ -1219,12 +1239,12 @@ def maybe_regen_verso(cfg, out, step):
     st = read_state(out)
     if int(st.get("round", 0)) != 0 or not st.get("verso_on") or st.get("verso_regen"):
         return False
-    r2 = eval_r2(out, step, 1)
+    pair_, _why = eval_streak(out, step)          # the EXACT current record, never an older one
     need = float(cfg.verso_min_dice) + float(getattr(cfg, "verso_regen_gain", 0.15))
-    if not (r2 and np.isfinite(r2[-1]) and r2[-1] >= need):
+    if not pair_ or pair_[1] < need:
         return False
-    write_state(out, verso_regen={"step": int(step), "dice_r2": float(r2[-1])})
-    jlog(out, "sched", {"kind": "verso_regen", "step": int(step), "dice_r2": float(r2[-1]),
+    write_state(out, verso_regen={"step": int(step), GATE_METRIC: float(pair_[1])})
+    jlog(out, "sched", {"kind": "verso_regen", "step": int(step), GATE_METRIC: float(pair_[1]),
                         "need": need})
     return True
 
@@ -2099,8 +2119,11 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
 
         if state["round"] == 0 and not st.get("verso_on"):
             t_g = time.time()
+            pair_, why_r2 = eval_streak(out, step)
             ok, why = verso_gate(cfg, out, step, rows_fn, screen=eval_dice(out, step),
-                                 r2=eval_r2(out, step, 2))
+                                 r2=list(pair_) if pair_ else [])
+            if why_r2:
+                why = {**why, "streak": why_r2}
             why = {**why, "gate_s": round(time.time() - t_g, 1)}
             jlog(out, "sched", {"kind": "verso_gate", "step": step, "pass": bool(ok), **why})
             if ok:

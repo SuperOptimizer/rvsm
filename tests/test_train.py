@@ -707,3 +707,25 @@ def test_a_stuck_fetch_is_abandoned_when_stop_is_requested():
     assert list(it) == []                                   # the iteration ends ...
     assert _t.time() - t0 < 5.0                             # ... within a poll or two of the request
     ev.set()
+
+
+def test_the_recto_gate_metric_does_not_move_when_verso_targets_appear(full_cfg):
+    """dice_recto_r2 scores the recto head alone: the same windows with and without verso targets
+    (a verso grid generation appearing on restart) give the same value, while the pooled dice_r2
+    moves (pass-4 P4-03)."""
+    lay = full_cfg.layout()
+    a = _item(full_cfg, k=2, dist_w=0, verso_w=0)
+    b = _item(full_cfg, k=2, dist_w=0, verso_w=255)
+    _, tg, _ = prep.prepare(prep.batch1(a), torch.device("cpu"))
+
+    class Half(torch.nn.Module):             # recto = the target, verso = wrong everywhere
+        def forward(self, x):
+            y = torch.full((x.shape[0], lay.cout) + tuple(x.shape[2:]), -3.0)
+            y[:, 0] = (tg[:, 0] >= 0.5).float() * 24 - 12
+            y[:, 1] = 12.0
+            return y
+    ra = TR.evaluate(Half(), [a], torch.device("cpu"), lay)
+    rb = TR.evaluate(Half(), [b], torch.device("cpu"), lay)
+    assert ra["eval_schema"] == TR.EVAL_SCHEMA
+    assert ra["dice_recto_r2"] == pytest.approx(rb["dice_recto_r2"]) and ra["dice_recto_r2"] > 0.99
+    assert rb["dice_r2"] < ra["dice_r2"]

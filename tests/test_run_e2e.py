@@ -350,8 +350,8 @@ def test_the_verso_gate_needs_the_dice_and_the_betti_baseline(small_cfg):
     called = []
     ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [], screen=0.2,
                              r2=[0.32, 0.35])                        # the fallback
-    assert ok and why["why"] == "verso_after_steps" and why["dice_r2"] == 0.35
-    assert why["dice_r2_prev"] == 0.32                               # both values are logged
+    assert ok and why["why"] == "verso_after_steps" and why[RUN.GATE_METRIC] == 0.35
+    assert why[RUN.GATE_METRIC + "_prev"] == 0.32                    # both values are logged
     # ... which needs the RUNG-2 dice at verso_min_dice on TWO consecutive evaluations
     ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [], screen=0.2, r2=[0.1, 0.35])
     assert not ok and "two consecutive" in why["why"] and why["verso_min_dice"] == 0.3
@@ -1252,7 +1252,7 @@ def test_the_verso_is_regenerated_once_as_a_new_generation(tmp_path, small_cfg):
     stores made by older checkpoints; the producer rewrites each as generation 1 BESIDE the old one
     (never in place), its fields follow at generation 1, every reader moves to it, and the trigger
     never fires twice (pass-3 item 11)."""
-    from rvsm import regions as RG, stores, targets as TG
+    from rvsm import regions as RG, stores, targets as TG, train as TR
     out = str(tmp_path / "rg")
     cfg = replace(small_cfg, verso_min_dice=0.3, verso_regen_gain=0.15)
     lo = (0, 1024, 2048)
@@ -1264,13 +1264,15 @@ def test_the_verso_is_regenerated_once_as_a_new_generation(tmp_path, small_cfg):
     RUN.write_state(out, round=0, verso_on=True, verso_on_step=10000)
     cat = RG.Catalog(out, 0, ttl=0.0)
     assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4)) is None
-    RUN.jlog(out, "eval", {"step": 20000, "dice_r2": 0.40}, echo=False)
+    sch = {"eval_schema": TR.EVAL_SCHEMA}
+    RUN.jlog(out, "eval", {"step": 18000, RUN.GATE_METRIC: 0.30, **sch}, echo=False)
+    RUN.jlog(out, "eval", {"step": 20000, RUN.GATE_METRIC: 0.40, **sch}, echo=False)
     assert not RUN.maybe_regen_verso(cfg, out, 20000)                    # 0.40 < 0.45
-    RUN.jlog(out, "eval", {"step": 22000, "dice_r2": 0.47}, echo=False)
+    RUN.jlog(out, "eval", {"step": 22000, RUN.GATE_METRIC: 0.47, **sch}, echo=False)
     assert RUN.maybe_regen_verso(cfg, out, 22000)
     regen = RUN.read_state(out)["verso_regen"]
-    assert regen == {"step": 22000, "dice_r2": 0.47}
-    RUN.jlog(out, "eval", {"step": 24000, "dice_r2": 0.6}, echo=False)
+    assert regen == {"step": 22000, RUN.GATE_METRIC: 0.47}
+    RUN.jlog(out, "eval", {"step": 24000, RUN.GATE_METRIC: 0.6, **sch}, echo=False)
     assert not RUN.maybe_regen_verso(cfg, out, 24000), "the regeneration fires once"
     assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4), regen=regen) == "verso"
     g1 = stores.gen_path(stores.store_path(out, "verso", lo, 0), 1)
@@ -1324,3 +1326,34 @@ def test_the_trainer_ram_guard_decides_and_fires_once(tmp_path):
     recs = [r for r in RUN.tail_jsonl(os.path.join(out, "logs", "sched.jsonl")) if r["kind"] == "ram_exit"]
     assert len(recs) == 1 and len(said) == 1                               # fires once
     RUN.RAM_EXIT.pop(out, None)
+
+
+def test_the_gate_streak_needs_the_current_row_and_the_previous_distinct_one(tmp_path):
+    """P4-03: the streak is the evaluation AT the step and the one at the previous distinct step, both
+    of this code's eval schema; duplicates, stale-only rows, a missing value or another schema fail
+    closed. The metric is the recto head alone at rung 2 (dice_recto_r2), which a verso grid
+    appearing on restart does not change."""
+    from rvsm import train as TR
+    sch = {"eval_schema": TR.EVAL_SCHEMA}
+    k = RUN.GATE_METRIC
+    assert k == "dice_recto_r2"
+
+    def log(name, rows):
+        out = str(tmp_path / name)
+        for r in rows:
+            RUN.jlog(out, "eval", r, echo=False)
+        return out
+    good = log("g", [{"step": 2000, k: 0.31, **sch}, {"step": 4000, k: 0.33, **sch}])
+    assert RUN.eval_streak(good, 4000) == ((0.31, 0.33), None)
+    stale = log("s", [{"step": 2000, k: 0.31, **sch}, {"step": 4000, k: 0.33, **sch}])
+    assert RUN.eval_streak(stale, 6000)[0] is None                       # no row at the current step
+    dup = log("d", [{"step": 2000, k: 0.31, **sch}, {"step": 4000, k: 0.33, **sch},
+                    {"step": 4000, k: 0.35, **sch}])
+    assert RUN.eval_streak(dup, 4000) == (None, "duplicate rows at this step")
+    dupp = log("dp", [{"step": 2000, k: 0.31, **sch}, {"step": 2000, k: 0.30, **sch},
+                      {"step": 4000, k: 0.33, **sch}])
+    assert RUN.eval_streak(dupp, 4000)[0] is None
+    miss = log("m", [{"step": 2000, k: 0.31, **sch}, {"step": 4000, "dice_r2": 0.9, **sch}])
+    assert RUN.eval_streak(miss, 4000)[0] is None                        # the pooled metric is not it
+    old = log("o", [{"step": 2000, k: 0.31}, {"step": 4000, k: 0.33, **sch}])
+    assert RUN.eval_streak(old, 4000)[1] == "eval schema differs from this code's"
