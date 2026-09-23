@@ -641,8 +641,48 @@ def test_the_scan_metadata_is_frozen_on_the_first_setup(tmp_path):
     (vol / "metadata.json").unlink()                       # the source is gone (or changed) ...
     meta2, m52 = RUN.frozen_meta(str(out), str(vol))       # ... the resume keeps the frozen copy
     assert m52 == m5 and (out / "meta5.json").read_text() == frozen
+    # a DEFINITE absence (no file / HTTP 404) freezes the defaults with absent: true and zero planes
     fresh = tmp_path / "fresh"
     fresh.mkdir()
-    with pytest.raises(SystemExit, match="metadata.json"):
-        RUN.frozen_meta(str(fresh), str(vol))
-    assert not (fresh / "meta5.json").exists()
+    said = []
+    meta3, m53 = RUN.frozen_meta(str(fresh), str(vol), log=said.append)
+    assert meta3["absent"] is True and m53 == [0.0] * 5 and (fresh / "meta5.json").exists()
+    assert said and "ABSENT" in said[0]
+    # a TRANSPORT failure is an error on a fresh run -- never frozen defaults
+    from rvsm import scanmeta as SM
+    orig = SM.probe
+    try:
+        SM.probe = lambda p, timeout=10.0: (None, "error")
+        err = tmp_path / "err"
+        err.mkdir()
+        with pytest.raises(SystemExit, match="transport"):
+            RUN.frozen_meta(str(err), str(vol))
+        assert not (err / "meta5.json").exists()
+        # ... and a resume never calls the network at all: paris4's frozen defaults stay as they are
+        again, m5again = RUN.frozen_meta(str(fresh), str(vol), log=said.append)
+        assert m5again == [0.0] * 5
+    finally:
+        SM.probe = orig
+
+
+def test_the_metadata_probe_tells_a_404_from_a_transport_failure(tmp_path):
+    """HTTP 404 -> absent; a refused connection -> error (review O13 follow-up)."""
+    import http.server
+    import threading
+    from rvsm import scanmeta as SM
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        assert SM.probe(f"http://127.0.0.1:{srv.server_port}/v.zarr")[1] == "absent"
+    finally:
+        srv.shutdown()
+    assert SM.probe(f"http://127.0.0.1:{srv.server_port}/v.zarr", timeout=2)[1] == "error"

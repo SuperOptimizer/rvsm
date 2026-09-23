@@ -1268,25 +1268,46 @@ def walk_patches():
 # --------------------------------------------------------------------------- #
 # the supervisor
 # --------------------------------------------------------------------------- #
-def frozen_meta(out, ct):
+def _meta_source(ct):
+    """The path / URL `scanmeta.fetch` would read metadata.json from (a level path -> its group)."""
+    p = str(ct or "").rstrip("/")
+    if p and not p.endswith(".json"):
+        head, _, last = p.rpartition("/")
+        if head and last.isdigit():
+            p = head
+    return p
+
+
+def frozen_meta(out, ct, log=print):
     """(metadata dict, the five conditioning values) of the run, FROZEN on the first successful setup.
 
-    A resume loads `<out>/metadata.json` and `<out>/meta5.json` and never rewrites them: the scan
-    planes are a network input, and a resume that fetched them again -- or fell back to the defaults
-    because the fetch failed that day -- would silently change what the checkpoint was trained on. On
-    a fresh run a metadata.json that cannot be read is an ERROR, not the defaults."""
+    A resume loads `<out>/metadata.json` and `<out>/meta5.json` and never rewrites or refetches them
+    (no network call): the scan planes are a network input, and a resume that fetched them again -- or
+    fell back to the defaults because the fetch failed that day -- would silently change what the
+    checkpoint was trained on.
+
+    On a fresh run the fetch has three outcomes (`scanmeta.probe`): read -> frozen as is; DEFINITELY
+    ABSENT (HTTP 404/403, no local file) -> the documented defaults, `absent: true` recorded, the five
+    planes ZERO; anything else (timeout, 5xx, unparsable) -> an ERROR, never the defaults. Either way
+    the startup log says which planes are zero because the metadata is absent."""
     from rvsm import scanmeta as SM
     mp, m5 = os.path.join(str(out), "metadata.json"), os.path.join(str(out), "meta5.json")
     meta, meta5 = _read_json(mp), _read_json(m5)
-    if meta and meta5 and not meta.get("missing"):
-        return meta, [float(v) for v in meta5]
-    meta = SM.fetch(ct)
-    if meta.get("missing"):
-        raise SystemExit(f"rvsm run: no readable metadata.json beside {ct}; the scan planes would be "
-                         f"defaults. Put the volume's metadata.json there (or fix the network) and retry.")
-    meta5 = [float(v) for v in SM.scan_planes(meta)]
-    _write_json(mp, meta)
-    _write_json(m5, meta5)
+    if meta and meta5 is not None:
+        meta5 = [float(v) for v in meta5]
+    else:
+        raw, status = SM.probe(_meta_source(ct))
+        if status == "error":
+            raise SystemExit(f"rvsm run: could not read metadata.json beside {ct} (transport error); "
+                             f"refusing to freeze defaults on a fresh run -- retry when it is reachable")
+        meta = SM.flatten(raw)
+        meta["absent"] = status == "absent"
+        meta5 = [float(v) for v in SM.scan_planes(meta)]
+        _write_json(mp, meta)
+        _write_json(m5, meta5)
+    if meta.get("missing") or meta.get("absent"):
+        names = [r[0] for r in SM.META_RANGE]
+        log(f"[setup] scan metadata ABSENT for {ct}: the planes {names} are all zero (frozen in {mp})")
     return meta, meta5
 
 

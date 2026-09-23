@@ -110,6 +110,29 @@ def read_json(p, timeout=10.0):
         return None
 
 
+def probe(p, timeout=10.0):
+    """(raw dict or None, status) for a volume's metadata.json, with status
+        "ok"      read and parsed
+        "absent"  DEFINITELY not there: an HTTP 404 (or 403, which S3-style buckets answer for a
+                  missing key) or a local path that does not exist
+        "error"   anything else -- a timeout, a 5xx, a connection error, a file that is not JSON: the
+                  answer is unknown, and a caller that freezes the result must not freeze a guess."""
+    import urllib.error
+    q = path_of(p)
+    try:
+        if q.startswith(("http://", "https://")):
+            with urllib.request.urlopen(q, timeout=timeout) as f:  # noqa: S310
+                return json.loads(f.read().decode("utf-8")), "ok"
+        if not os.path.exists(q):
+            return None, "absent"
+        with open(q, "rb") as f:
+            return json.load(f), "ok"
+    except urllib.error.HTTPError as e:
+        return None, ("absent" if int(getattr(e, "code", 0)) in (403, 404) else "error")
+    except Exception:  # noqa: BLE001
+        return None, "error"
+
+
 def flatten(raw):
     """The conditioning-relevant fields of a raw metadata.json, flat, in microns / keV / mm.
 
