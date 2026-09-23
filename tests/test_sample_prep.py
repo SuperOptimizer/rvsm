@@ -612,3 +612,66 @@ def test_training_coarse_targets_carry_no_weight_over_held_out_regions(monkeypat
     odd = np.ones((8, 8, 8), np.float32)                      # outward rounding of a partial voxel
     sample.zero_footprints(odd, 7, (0, 0, 0), [(24, 24, 24)], 16)   # rung-2 24..40 straddles 0 | 1
     assert odd[0, 0, 0] == 0 and odd[1, 1, 1] == 0 and odd[2, 2, 2] == 1 and float(odd.sum()) == 512 - 8
+
+
+def test_rung_3_and_4_distances_read_their_own_rung_stores_never_a_pool(synth_run, monkeypatch):
+    """D02: the producer writes `midline_r3` / `thickness_r4` ... at their own rungs, and a rung-3/4
+    distance target must come from THAT store, read at its own rung and origin -- not the rung-2 field
+    pooled (its codes are rung-2 voxels, and a pooled offset code is no code at all). Each rung's
+    stores hold a different constant sentinel and the padding past `shape_true` another one; a window
+    straddling every region must see exactly its own rung's constant, and code 0 stays weight 0."""
+    from rvsm import stores, targets as TG
+    monkeypatch.setattr(sample, "AXIS_R_UM", 0.0)
+    R = int(synth_run.cfg.region)
+    SENT = {2: 160, 3: 170, 4: 180}
+    THICK = {3: 150, 4: 140}
+    PAD = 99
+    every = [np.array([z, y, x], np.int64) * R for z in (0, 1) for y in (0, 1) for x in (0, 1)]
+    for r in every:                                         # all eight, not just the occupied ones
+        stores.write(stores.store_path(synth_run.root, "midline", r),
+                     np.full((R,) * 3, SENT[2], np.uint8), r, rung=2, channels=("midline",), q=0)
+        for k in (3, 4):
+            n = R >> (k - 2)
+            for kind, val in (("midline", SENT[k]), ("thickness", THICK[k])):
+                blk = np.full((128,) * 3, PAD, np.uint8)    # padded up to a store's 128 multiple
+                blk[:n, :n, :n] = val
+                if k == 3 and kind == "midline":
+                    blk[:4] = 0                             # a no-data slab at the region's top
+                stores.write(stores.store_path(synth_run.root, TG.channel(kind, k), r), blk,
+                             r >> (k - 2), rung=k, channels=(TG.channel(kind, k),), q=0,
+                             attrs={"shape_true": [n] * 3})
+    ds = _patches(synth_run)
+    ds._open()
+    p = ds.patch
+    mid, thk = ds.channels.index("midline"), ds.channels.index("thickness")
+    for k in (2, 3, 4):
+        # rungs 3-4: centred on the corner all eight regions share; rung 2 is never stitched
+        lo = np.full(3, R >> (k - 2), np.int64) - p // 2 if k > 2 else np.full(3, 16, np.int64)
+        v, ins = ds._source("midline", k, lo, p)
+        assert ins.all(), f"rung {k}: every voxel lies in some region's own store"
+        assert set(np.unique(v).tolist()) <= {0, SENT[k]}, (k, np.unique(v))
+        assert (v == SENT[k]).any()
+        if k > 2:
+            tv, tins = ds._source("thickness", k, lo, p)
+            assert tins.all() and set(np.unique(tv).tolist()) == {THICK[k]}
+    # rung 3: the no-data slab of each region reads as code 0 and carries weight 0
+    k = 3
+    lo = np.full(3, R >> 1, np.int64) - p // 2
+    ct = ladder.read_rung(ds.pyr, k, lo, p, dtype=np.uint8)
+    v, _ = ds._source("midline", k, lo, p)
+    zero = np.zeros(tuple(p), bool)
+    zero[16:20] = True                                      # the lower regions' top 4 slices
+    assert (v[zero] == 0).all() and (v[~zero] == SENT[3]).all()
+    tg, w = ds._rung_target(k, lo, ct)
+    assert (ct[~zero] > 0).any()
+    assert not w[mid][zero].any()
+    assert (w[mid][~zero & (ct > 0)] == 255).all()
+    assert (tg[mid][~zero & (ct > 0)] == SENT[3]).all()
+    assert (w[thk][ct > 0] == 255).all()
+    # past a store's shape_true is its padding: a window reaching there reads inside = 0, never PAD
+    last = every[-1] >> 2
+    lo4 = last + (R >> 2) - p // 2                          # half past the last region's rung-4 extent
+    v4, ins4 = ds._source("midline", 4, lo4, p)
+    assert PAD not in np.unique(v4).tolist()
+    h = int(p[0]) // 2
+    assert ins4[:h, :h, :h].all() and not ins4[h:, h:, h:].any()

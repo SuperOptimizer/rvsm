@@ -12,6 +12,7 @@ Where a target comes from is the one thing that changes with the rung:
     rung 2      the region store, read directly              (`stores.read_store`)
     rung 3      the same store as its 2x mean pool            (`stores.read_store`, k = rung + 1)
     rungs 4-6   the same store pooled 2^(k-2) on the fly      (`regions.pooled`)
+    rungs 3-4   a DISTANCE channel: its own rung-k store      (`targets.channel(kind, k)`, never pooled)
     rungs 7-11  the whole-scroll coarse array x its coverage  (`regions.read_coarse`)
 
 A rung-2 window is drawn inside its region, so it reads exactly one store (and a rung-2 window that
@@ -252,6 +253,8 @@ class Patches(torch.utils.data.IterableDataset):
                 cov = cov.copy()
                 zero_footprints(cov, k, lo, held, int(self.cfg.region))
             return v, cov
+        if chan in DIST_CHANNELS and 3 <= k <= DIST_MAX_RUNG:
+            return self._dist_stitched(chan, k, lo, shape)
         if k >= 3:
             return self._stitched(chan, k, lo, shape)
         r = self._region_of(k, lo, shape)
@@ -306,6 +309,44 @@ class Patches(torch.utils.data.IterableDataset):
                 v, i_ = RG.pooled_window(self.root, chan, r, k, plo, pn, self.round)
             o = plo - lo
             sl = tuple(slice(int(o[j]), int(o[j] + pn[j])) for j in range(3))
+            out[sl] = v
+            ins[sl] = i_
+        return out, ins
+
+    def _dist_stitched(self, kind, k, lo, shape):
+        """Rungs 3-4 of a DISTANCE channel: (cube, inside) with every voxel read from its region's OWN
+        rung-k field store (`targets.channel(kind, k)`: `midline_r3`, `thickness_r4`, ...), at that
+        store's own rung and origin.
+
+        A distance is in the voxels of the rung it was computed at, and its code is an offset encoding
+        (code 0 = no data): the 2x mean pool `_stitched` takes of a probability store would read the
+        RUNG-2 field, halve nothing, and average a valid code with a no-data 0 into a new "valid" code.
+        So nothing here is ever pooled: a store at another rung, a missing store, a held-out region
+        and the padding past the store's `shape_true` all leave their voxels at inside = 0."""
+        from rvsm import targets as TG
+        k, d, R = int(k), int(k) - 2, int(self.cfg.region)
+        shape = ladder.shape3(shape)
+        lo = np.asarray(lo, np.int64)
+        out = np.zeros(tuple(shape), np.uint8)
+        ins = np.zeros(tuple(shape), np.float32)
+        chan = TG.channel(kind, k)
+        for r in self._regions_over(k, lo, shape):
+            if tuple(int(v) for v in r) in getattr(self, "_held", ()):
+                continue
+            a = self.cat.open(chan, r)
+            if a is None or int(a.attrs.get("rung", -1)) != k:
+                continue
+            o = np.asarray(a.attrs["origin_zyx"], np.int64)
+            st = a.attrs.get("shape_true")
+            top = o + (np.asarray(st, np.int64) if st else np.asarray(a.shape[-3:], np.int64))
+            plo = np.maximum(lo, r >> d)
+            phi = np.minimum(np.minimum(lo + shape, (r + R) >> d), top)
+            if (phi <= plo).any():
+                continue
+            pn = phi - plo
+            v, i_ = stores.read_store(a, k, plo, pn)
+            q = plo - lo
+            sl = tuple(slice(int(q[j]), int(q[j] + pn[j])) for j in range(3))
             out[sl] = v
             ins[sl] = i_
         return out, ins
