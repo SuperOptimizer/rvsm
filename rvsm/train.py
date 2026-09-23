@@ -272,6 +272,7 @@ def ect_seed(step, micro=0):
     return 1_000_003 * int(step) + 7_919 * int(micro) + 17
 
 
+STOP_SAVE_MIN = 200      # a stop_now() exit checkpoints only this many steps past the last checkpoint
 NONFINITE_MAX = 20       # consecutive skipped steps (non-finite gradient) that abort a run
 
 
@@ -781,7 +782,7 @@ class _Phases:
 
 
 def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=None, val_items=None,
-          steps=None, accum=1, hook=None, ckpt=None):
+          steps=None, accum=1, hook=None, ckpt=None, stop_now=None):
     """Train the student. Returns the checkpoint path.
 
     `patches_factory()` returns a fresh iterable of samples: either collated batches (what
@@ -844,6 +845,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         for _ in range(step):
             sched.step()
         print(f"[train] resumed {ck} at step {step}", flush=True)
+    step0 = step                      # the checkpoint this process started from (a resume's step)
 
     # CASCADE: one `Cascade` builds the TRAINING channel (stochastic: mix / dropout / noise), another
     # the validation one (deterministic: self, no noise, no dropout). The self source runs its own copy
@@ -875,12 +877,16 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
 
     bad_run, bad_total = 0, 0
 
+    saved = {"step": None}
+
     def save():
         tmp = ck.with_suffix(".tmp")
         torch.save({"model": net.state_dict(), "ema": ema, "opt": opt.state_dict(), "step": step,
                     "cfg": cfg.to_json(), "layout": layout.to_json(), "temps": temps}, tmp)
-        keep_prev(ck)
+        if saved["step"] != step:        # a second save at the same step must not overwrite _prev
+            keep_prev(ck)
         tmp.replace(ck)
+        saved["step"] = step
 
     def do_eval():
         nonlocal temps
@@ -1080,6 +1086,20 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                                           "quiesce": src.close}):
                 break
             t0, tw = time.time(), time.time()
+        # `stop_now()` -> a reason: the supervisor's RAM guard asks the trainer to leave NOW (a leak
+        # was about to take the host down). Checkpoint only when it is worth it (>= 200 steps since the
+        # last one: a save is ~1.4 GB of host copies at the worst moment), then exit cleanly.
+        why = stop_now() if stop_now is not None else None
+        if why:
+            last = saved["step"] if saved["step"] is not None else step0
+            do_save = step - int(last) >= STOP_SAVE_MIN
+            _log(str(out / "logs" / "train.jsonl"),
+                 {"kind": "stop_now", "step": step, "reason": str(why), "checkpoint": bool(do_save),
+                  "last_checkpoint": int(last)})
+            src.close()
+            if do_save:
+                save()
+            return str(ck)
     src.close()
     save()
     return str(ck)

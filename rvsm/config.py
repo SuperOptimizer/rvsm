@@ -159,7 +159,8 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        # loss weights a running experiment may retune on resume (pass-3 P3-01)
                        "loss_prob_dice", "loss_pair",
                        # scheduling of the verso passes and of the round gate (pass-3 item 11, P3-03)
-                       "verso_regen_gain", "round_min_steps_after_verso", "verso_min_regions")
+                       "verso_regen_gain", "round_min_steps_after_verso", "verso_min_regions",
+                       "ram_trainer_gb", "ram_host_exit")
 
 
 @dataclass
@@ -256,6 +257,8 @@ class Config:
                                        # stores from older checkpoints are regenerated once (new generation)
     round_min_steps_after_verso: int = 8000   # round 0 is promoted only this long after verso_on
     verso_min_regions: int = 200       # ... and with at least this many finished verso stores
+    ram_trainer_gb: float = 40.0       # the trainer's own RSS past this: checkpoint and exit cleanly
+    ram_host_exit: float = 0.90        # ... or the host's memory in use past this share of MemTotal
     verso_gate_dice: float = 0.6       # ... or earlier, once the held-out recto reaches this dice
     eval_every: int = 2000             # held-out evaluation cadence, in steps
     calibrate: bool = True             # refit the temperatures after every eval

@@ -1912,14 +1912,55 @@ class ProducerWatch:
         return "restart"
 
 
-def heartbeat(out, place, stop_ev, procs, respawn):
+def trainer_ram_verdict(trainer_gb, host_frac, limit_gb, host_max):
+    """Why the TRAINER must stop now, or None: its own RSS past `limit_gb`, or the host's memory in use
+    past `host_max` of MemTotal. The producer pause cannot help against a trainer that leaks (paris4
+    step 24000: +280 MB a step, 6 -> 47.7 GB in 180 steps, the kernel killed everything)."""
+    if limit_gb and float(trainer_gb) >= float(limit_gb):
+        return f"trainer RSS {float(trainer_gb):.1f} GB >= ram_trainer_gb {float(limit_gb):.1f}"
+    if host_max and float(host_frac) >= float(host_max):
+        return f"host memory {float(host_frac):.0%} >= ram_host_exit {float(host_max):.0%}"
+    return None
+
+
+def own_rss_gb():
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2 ** 30
+    except (OSError, ValueError):
+        return 0.0
+
+
+RAM_EXIT = {}     # {out: reason} set by the supervisor's heartbeat, read by the trainer every step
+
+
+def trainer_guard(out, limit_gb, host_max, mem=None, rss_gb=None, log=print):
+    """One look for the TRAINER's sake: past `trainer_ram_verdict`, record the reason in `RAM_EXIT`
+    (the training loop reads it every step, checkpoints if worthwhile and exits cleanly), log a
+    `ram_exit` record and a loud line. Returns the reason (None when all is well)."""
+    total, avail = mem if mem is not None else host_mem()
+    frac = (total - avail) / total if total else 0.0
+    r = own_rss_gb() if rss_gb is None else float(rss_gb)
+    why = trainer_ram_verdict(r, frac, limit_gb, host_max)
+    if why and str(out) not in RAM_EXIT:
+        RAM_EXIT[str(out)] = why
+        jlog(out, "sched", {"kind": "ram_exit", "reason": why, "trainer_gb": round(r, 2),
+                            "host_frac": round(frac, 3)}, echo=False)
+        log(f"!!!! [ram_guard] {why}: the TRAINER checkpoints (if >= 200 steps since the last) and "
+            f"exits cleanly before the kernel kills the host !!!!")
+    return why
+
+
+def heartbeat(out, place, stop_ev, procs, respawn, limits=(0.0, 0.0)):
     """The supervisor's own thread: stamp `workers.json` and `logs/sched.jsonl` (with the run's
     process-tree RSS and the host's memory), supervise the producer (`ProducerWatch`: a dead one is
     restarted at the next tick, a silent one after `SILENT_MAX_S`) and run the host-RAM guard, both
     every `RAM_CHECK_S`."""
     watch = ProducerWatch(out, procs, respawn, log=lambda m: print(m, flush=True))
+    say = lambda m: print(m, flush=True)   # noqa: E731
     while not stop_ev.is_set():
-        mem = ram_guard(out, log=lambda m: print(m, flush=True))
+        mem = ram_guard(out, log=say)
+        trainer_guard(out, *limits, log=say)
         w = {"mode": place["mode"], "phases": bool(place["phases"]), "t": time.time(),
              "train": {"pid": os.getpid(), "phase": "train", "last_ts": time.time(),
                        **{k: read_state(out).get(k) for k in ("step", "round", "cursor", "verso_on")}}}
@@ -1940,7 +1981,8 @@ def heartbeat(out, place, stop_ev, procs, respawn):
         while not stop_ev.is_set() and time.time() < t_next:
             stop_ev.wait(min(RAM_CHECK_S, max(t_next - time.time(), 0.0)))
             if not stop_ev.is_set() and time.time() < t_next:
-                ram_guard(out, log=lambda m: print(m, flush=True))
+                ram_guard(out, log=say)
+                trainer_guard(out, *limits, log=say)
                 watch.check()
 
 
@@ -1999,7 +2041,9 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     _write_json(os.path.join(out, "workers", "produce.json"),
                 {"pid": None, "phase": "spawning", "last_ts": time.time()})
     procs["produce"] = spawn_producer()
+    RAM_EXIT.pop(str(out), None)
     hb = threading.Thread(target=heartbeat, args=(out, place, stop_ev, procs, spawn_producer),
+                          kwargs={"limits": (float(cfg.ram_trainer_gb), float(cfg.ram_host_exit))},
                           daemon=True)
     hb.start()
 
@@ -2110,8 +2154,13 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
     try:
         for _ in range(max(int(cfg.rounds), 1)):
             ck = TR.train(cfg, out=out, init=init, resume=resume, patches_factory=patches_factory,
-                          device=dev, val_items=val, hook=hook, ckpt=ckpt, accum=cfg.accum)
+                          device=dev, val_items=val, hook=hook, ckpt=ckpt, accum=cfg.accum,
+                          stop_now=lambda: RAM_EXIT.get(str(out)))
             init, resume = None, True
+            if RAM_EXIT.get(str(out)):
+                jlog(out, "sched", {"kind": "exit_ram", "reason": RAM_EXIT[str(out)],
+                                    "step": int(read_state(out).get("step", 0))})
+                break
             if state["stop"]:
                 break
             if int(read_state(out).get("step", 0)) >= int(cfg.steps):

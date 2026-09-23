@@ -1303,3 +1303,24 @@ def test_gc_takes_every_field_channel_and_generation_of_an_old_round(tmp_path):
         assert not os.path.exists(ST.store_path(out, ch, lo, 0)), ch
     assert not os.path.exists(ST.gen_path(ST.store_path(out, "verso", lo, 0), 1))
     assert len(gone) == len(chans) + 1
+
+
+def test_the_trainer_ram_guard_decides_and_fires_once(tmp_path):
+    """The TRAINER's own RSS past ram_trainer_gb, or the host past ram_host_exit, asks the trainer to
+    checkpoint and leave (paris4 step 24000: +280 MB a step until the kernel killed the host)."""
+    assert RUN.trainer_ram_verdict(12.0, 0.5, 40.0, 0.9) is None
+    assert "trainer RSS" in RUN.trainer_ram_verdict(41.0, 0.5, 40.0, 0.9)
+    assert "host memory" in RUN.trainer_ram_verdict(12.0, 0.93, 40.0, 0.9)
+    assert RUN.trainer_ram_verdict(99.0, 0.99, 0.0, 0.0) is None           # 0 switches a limit off
+    out = str(tmp_path / "tg")
+    os.makedirs(os.path.join(out, "logs"))
+    G = 2 ** 30
+    RUN.RAM_EXIT.pop(out, None)
+    said = []
+    assert RUN.trainer_guard(out, 40.0, 0.9, mem=(64 * G, 40 * G), rss_gb=10.0, log=said.append) is None
+    why = RUN.trainer_guard(out, 40.0, 0.9, mem=(64 * G, 30 * G), rss_gb=45.0, log=said.append)
+    assert why and RUN.RAM_EXIT[out] == why and "TRAINER" in said[-1]
+    RUN.trainer_guard(out, 40.0, 0.9, mem=(64 * G, 30 * G), rss_gb=46.0, log=said.append)
+    recs = [r for r in RUN.tail_jsonl(os.path.join(out, "logs", "sched.jsonl")) if r["kind"] == "ram_exit"]
+    assert len(recs) == 1 and len(said) == 1                               # fires once
+    RUN.RAM_EXIT.pop(out, None)

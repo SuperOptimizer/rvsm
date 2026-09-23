@@ -540,11 +540,15 @@ def test_a_nonfinite_gradient_skips_the_step_and_a_run_of_them_aborts(tiny_cfg, 
     net.weight.grad[0, 0] = float("nan")
     assert TR.grad_gate(net) is False
 
-    cfg = replace(tiny_cfg, out=str(__import__("pathlib").Path(tiny_cfg.out).parent / "nanrun"))
+    cfg = replace(tiny_cfg, out=str(__import__("pathlib").Path(tiny_cfg.out).parent / "nanrun"),
+                  steps=4, eval_every=2)                           # saves at steps 2 and 4
     val = [_item(cfg, k=2, seed=7)]
     ck = TR.train(cfg, patches_factory=_factory(cfg), val_items=val, device="cpu")
     from pathlib import Path
-    assert Path(ck).exists() and Path(ck).with_name(Path(ck).stem + "_prev" + Path(ck).suffix).exists()
+    prev = Path(ck).with_name(Path(ck).stem + "_prev" + Path(ck).suffix)
+    assert Path(ck).exists() and prev.exists()
+    # the final save at step 4 repeats the eval save of step 4: _prev must still be step 2's
+    assert torch.load(prev, map_location="cpu", weights_only=False)["step"] == 2
 
     monkeypatch.setattr(TR, "grad_gate", lambda net, max_norm=1.0: False)
     monkeypatch.setattr(TR, "NONFINITE_MAX", 3)
@@ -637,3 +641,24 @@ def test_the_pair_trains_only_where_paired_support_exists():
     y0 = torch.randn(1, lay.cout, S, S, S)
     band = TR.ect_band(y0, d.detach(), th.detach(), none, lay, cfg)
     assert torch.allclose(band, torch.sigmoid(y0[:, :1]))           # no support: the learned recto
+
+
+def test_stop_now_exits_cleanly_and_checkpoints_only_when_worth_it(tiny_cfg, monkeypatch):
+    """`stop_now()` returning a reason ends train() at once with a logged stop_now record; a checkpoint
+    is written only when >= STOP_SAVE_MIN steps have passed since the last one."""
+    from pathlib import Path
+    val = [_item(tiny_cfg, k=2, seed=7)]
+    for smin, want_ckpt in ((100, False), (2, True)):
+        monkeypatch.setattr(TR, "STOP_SAVE_MIN", smin)
+        cfg = replace(tiny_cfg, out=str(Path(tiny_cfg.out).parent / f"stop{smin}"), steps=50,
+                      eval_every=10 ** 6)
+        n = {"k": 0}
+
+        def stop():
+            n["k"] += 1
+            return "RAM" if n["k"] >= 3 else None
+        ck = TR.train(cfg, patches_factory=_factory(cfg), val_items=val, device="cpu", stop_now=stop)
+        rows = [json.loads(q) for q in (Path(cfg.out) / "logs" / "train.jsonl").read_text().splitlines()]
+        rec = [r for r in rows if r.get("kind") == "stop_now"]
+        assert len(rec) == 1 and rec[0]["step"] == 3 and rec[0]["reason"] == "RAM"
+        assert Path(ck).exists() is want_ckpt and rec[0]["checkpoint"] is want_ckpt
