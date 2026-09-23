@@ -251,7 +251,9 @@ class Catalog:
         self._c = {}
 
     def path(self, channel, lo):
-        return stores.store_path(self.root, channel, lo, self.round)
+        """The newest finished generation of the store (`stores.current_path`): a regenerated verso
+        replaces the old one for every reader, the stitched rung 3-6 targets included."""
+        return stores.current_path(self.root, channel, lo, self.round)
 
     def done(self, channel, lo):
         p = self.path(channel, lo)
@@ -335,7 +337,7 @@ def pooled(root, channel, lo, k, round_=0, cache=_POOL, limit=64, max_bytes=None
     `limit` entries and `max_bytes` -- `POOL_BYTES` -- bytes, least recently used out first). Returns
     None when the store is not finished."""
     k = int(k)
-    p = stores.store_path(root, channel, lo, round_)
+    p = stores.current_path(root, channel, lo, round_)
     key = (p, k)
     if key in cache:
         v = cache.pop(key)

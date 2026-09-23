@@ -566,8 +566,16 @@ def source_digest(path):
 def _want(root, lo, round_, rung, reach, tmin, tmax, thr):
     rk, tn, tx = rung_params(rung, reach, tmin, tmax)
     return {"target_def": TARGET_DEF, "reach_vox": rk, "tmin_vox": tn, "tmax_vox": tx, "thr": float(thr),
-            "recto_digest": source_digest(stores.store_path(root, "recto", lo, round_)),
-            "verso_digest": source_digest(stores.store_path(root, "verso", lo, round_))}
+            "recto_digest": source_digest(stores.current_path(root, "recto", lo, round_)),
+            "verso_digest": source_digest(stores.current_path(root, "verso", lo, round_))}
+
+
+def field_path(root, kind, k, lo, round_=0):
+    """Where a field store of the region lives: at the GENERATION of its verso source, so a verso
+    regenerated once (round 0, `run.verso_needs_regen`) gets its fields in a new directory beside the
+    old ones, never over them."""
+    g = max(stores.store_gen(root, "verso", lo, round_), 0)
+    return stores.gen_path(stores.store_path(root, channel(kind, k), lo, round_), g)
 
 
 def _current(path, want):
@@ -588,7 +596,7 @@ def fields_current(root, lo, round_=0, rungs=(2, 3, 4), reach=REACH, tmin=TMIN, 
     """True iff every field store of the region at `rungs` is `_current`: exactly the test
     `region_fields` skips a rung on. The scheduler must ask this, not `stores.is_done`, or a store from an
     older definition or older source stores is never rebuilt."""
-    return all(_current(stores.store_path(root, channel(kind, k), lo, round_),
+    return all(_current(field_path(root, kind, k, lo, round_),
                         _want(root, lo, round_, k, reach, tmin, tmax, thr))
                for k in rungs for kind in KINDS)
 
@@ -616,8 +624,8 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     512 and 256 and nothing is padded."""
     assert 0 < float(reach) < int(halo), f"reach {reach} must be positive and below the halo {halo}"
     assert 0 <= float(tmin) <= float(tmax), (tmin, tmax)
-    rp = stores.store_path(root, "recto", lo, round_)
-    vp = stores.store_path(root, "verso", lo, round_)
+    rp = stores.current_path(root, "recto", lo, round_)
+    vp = stores.current_path(root, "verso", lo, round_)     # the newest generation of each source
     rec = stores.open_store(rp)                       # raises unless the recto pass has finished
     if not stores.is_done(vp):
         vp = ""
@@ -627,7 +635,7 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     todo = []
     for k in sorted(int(q) for q in rungs):
         assert 2 <= k <= MAX_RUNG, f"no distance target at rung {k} (2..{MAX_RUNG} only)"
-        paths = {kind: stores.store_path(root, channel(kind, k), lo, round_) for kind in KINDS}
+        paths = {kind: field_path(root, kind, k, lo, round_) for kind in KINDS}
         want = _want(root, lo, round_, k, reach, tmin, tmax, thr)
         if not force and all(_current(p, want) for p in paths.values()):
             rep["rungs"][k] = {"skipped": "done"}

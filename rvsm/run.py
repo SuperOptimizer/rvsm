@@ -573,10 +573,12 @@ def student_rows_t(planes, layout, heads):
             ("conf", infer.u8_t(planes["conf"]).cpu().numpy(), 0, "conf_u8")]
 
 
-def write_rows(out, lo, rows, cfg, round_, attrs):
+def write_rows(out, lo, rows, cfg, round_, attrs, gen=0):
+    """Write a unit's stores; `gen` > 0 writes a NEW generation beside the finished one (a regenerated
+    verso), never over it."""
     from rvsm import infer, stores
     for ch, block, q, enc in rows:
-        p = stores.store_path(out, ch, lo, round_)
+        p = stores.gen_path(stores.store_path(out, ch, lo, round_), gen)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         stores.write(p, block, tuple(int(v) for v in lo), rung=infer.RUNG, channels=(ch,), q=q,
                      volume=str(cfg.ct), umbilicus=os.path.join(str(out), "umbilicus.json"),
@@ -765,7 +767,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     def finish(kind, lo, round_, t0, rows, attrs, pooled=None, extra=None):
         chained = False
         try:
-            write_rows(out, lo, rows, cfg, round_, attrs)
+            write_rows(out, lo, rows, cfg, round_, attrs, gen=int(attrs.get("gen", 0)))
             if pooled is not None or (kind == "self" and rows):
                 feed_coarse_once(out, lo, round_, rows[0][1], shape2, pooled=pooled)
             jlog(out, "produce", {"kind": kind, "region": list(lo), "round": round_,
@@ -834,7 +836,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         continue
                 if region_size(pyr, lo, cfg.region) is None:
                     continue
-                job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs)
+                job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs,
+                                regen=st.get("verso_regen"))
                 if job is not None:
                     units.append((lo, job))
             gpu_units = [u for u in units if u[1] != "fields"]
@@ -892,6 +895,10 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         planes = _student_planes(stu, ct_local, ax, lo, size, sign, want, meta5, pyr)
                         attrs = {"producer": "student", "ckpt": stu.ckpt, "step": int(stu.step),
                                  "ckpt_sha256": slot.sha, "frozen_teacher": bool(round_ >= 1),
+                                 # a round-0 verso that already has a finished generation is the ONE
+                                 # regeneration: it goes to the next generation, beside the old one
+                                 "gen": (stores.store_gen(out, "verso", lo, 0) + 1
+                                         if job == "verso" and cat.done("verso", lo) else 0),
                                  "radial_sign": int(sign), "window": int(stu.cfg.infer_window),
                                  "halo": int(stu.cfg.infer_halo),
                                  "cascade_depth": int(stu.cfg.cascade_depth),
@@ -986,16 +993,30 @@ def field_rungs(cfg):
     return ks or (2,)
 
 
-def _next_job(cat, lo, round_, verso_on, out, rungs=(2, 3, 4)):
+def verso_needs_regen(out, lo, regen):
+    """Is this region's round-0 verso a generation-0 store made by a checkpoint older than the
+    regeneration trigger (`state["verso_regen"]`)? Only generation 0 is ever regenerated (once)."""
+    from rvsm import stores
+    if not regen or stores.store_gen(out, "verso", lo, 0) != 0:
+        return False
+    made = stores.read_attrs(stores.store_path(out, "verso", lo, 0)).get("step")
+    return made is None or int(made) < int(regen.get("step", 0))
+
+
+def _next_job(cat, lo, round_, verso_on, out, rungs=(2, 3, 4), regen=None):
     """Which pass this region lacks, in the order the state machine allows -- or None when it is done.
 
     Round 0: the teacher pass, then (once the gate has fired) the flipped-sign verso, then the distance
-    fields. Round r >= 1: one multi-head student pass, then the fields at the pooled rungs."""
+    fields -- at the verso's GENERATION: a verso regenerated once (`regen`, see `verso_needs_regen`) is
+    written as generation 1 and gets its own fields. Round r >= 1: one multi-head student pass, then the
+    fields at the pooled rungs."""
     from rvsm import targets as TG
     if round_ == 0:
         if not cat.done("recto", lo):
             return "teacher"
         if verso_on and not cat.done("verso", lo):
+            return "verso"
+        if verso_on and verso_needs_regen(out, lo, regen):
             return "verso"
         if cat.done("verso", lo) and not TG.fields_current(out, lo, round_, rungs):   # the writer's own test
             return "fields"
@@ -1017,7 +1038,8 @@ def _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, rungs=
         n = pos.get(lo)
         if n is None or n >= int(cursor) or lo in leased:
             continue
-        if _next_job(cat, lo, round_, verso_on, out, rungs=rungs) is None:
+        if _next_job(cat, lo, round_, verso_on, out, rungs=rungs,
+                     regen=read_state(out).get("verso_regen")) is None:
             cache.release(keys.pop(lo))
 
 
@@ -1099,6 +1121,15 @@ def _boot(vals, n=200, seed=0, lo=2.5, hi=97.5):
     return float(v.mean()), float(np.percentile(b, lo)), float(np.percentile(b, hi))
 
 
+def eval_r2(out, step, n=2):
+    """The rung-2 self-cascade `dice_r2` of the last `n` evaluations up to and including `step`, oldest
+    first (the rung verso is written at). Fewer when the log has fewer."""
+    rs = [r for r in tail_jsonl(os.path.join(str(out), "logs", "eval.jsonl"), 50)
+          if int(r.get("step", -1)) <= int(step) and isinstance(r.get("dice_r2"), (int, float))]
+    rs.sort(key=lambda r: int(r["step"]))
+    return [float(r["dice_r2"]) for r in rs[-int(n):]]
+
+
 def eval_dice(out, step):
     """The headline (fine-rung, voxel-weighted) `dice` of the evaluation at `step` from
     `logs/eval.jsonl`, or None when there is none."""
@@ -1108,7 +1139,7 @@ def eval_dice(out, step):
     return None
 
 
-def verso_gate(cfg, out, step, rows_fn=None, screen=None):
+def verso_gate(cfg, out, step, rows_fn=None, screen=None, r2=None):
     """Has round 0's recto earned the flipped-sign verso passes?
 
     Pass when the pooled dice over the held-out regions is at least `verso_gate_dice` AND the betti0
@@ -1126,11 +1157,17 @@ def verso_gate(cfg, out, step, rows_fn=None, screen=None):
     (paris4 step 2000: dice 0.10 against a 0.6 gate)."""
     floor = float(getattr(cfg, "verso_min_dice", 0.0))
     if int(step) >= int(cfg.verso_after_steps):
-        if screen is None or not np.isfinite(screen) or float(screen) < floor:
-            return False, {"why": "verso_after_steps reached, but the eval's fine-rung dice is below "
-                                  "verso_min_dice: waiting", "eval_dice": screen, "verso_min_dice": floor,
-                           "step": int(step)}
-        return True, {"why": "verso_after_steps", "step": int(step), "eval_dice": float(screen)}
+        # the fallback reads the RUNG-2 self-cascade dice (`r2`: the last two evaluations, oldest
+        # first) -- verso is written at rung 2 -- and needs it at verso_min_dice on TWO consecutive
+        # evaluations, so one lucky evaluation cannot start the verso passes
+        vals = [float(v) for v in (r2 if r2 is not None else ([] if screen is None else [screen]))]
+        ok = len(vals) >= 2 and all(np.isfinite(v) and v >= floor for v in vals[-2:])
+        rec = {"step": int(step), "dice_r2_prev": vals[-2] if len(vals) >= 2 else None,
+               "dice_r2": vals[-1] if vals else None, "verso_min_dice": floor, "eval_dice": screen}
+        if not ok:
+            return False, {"why": "verso_after_steps reached, but rung-2 dice is not at verso_min_dice "
+                                  "on two consecutive evaluations: waiting", **rec}
+        return True, {"why": "verso_after_steps", **rec}
     need = float(getattr(cfg, "verso_gate_dice", 0.6))
     if screen is not None and np.isfinite(screen) and float(screen) < need - GATE_SCREEN:
         return False, {"why": "eval dice below the gate", "eval_dice": float(screen),
@@ -1174,15 +1211,50 @@ def plateau(out, key="dice", min_points=6, gain=ROUND_GAIN, since=None):
                                      "remaining": rem, "model": fit.get("model"), "n": len(recs)}
 
 
-def round_gate(cfg, out, step, round_, rows_fn=None, ref=None, round_start=0, verso_on=True):
+def maybe_regen_verso(cfg, out, step):
+    """ONE regeneration of round 0's verso: the first time (verso on, round 0) the rung-2 dice clears
+    `verso_min_dice + verso_regen_gain`, `state["verso_regen"]` records the step, and the producer
+    rewrites every verso store made by an earlier checkpoint as a NEW generation (never in place;
+    `verso_needs_regen`). Returns True when it fires; never fires twice."""
+    st = read_state(out)
+    if int(st.get("round", 0)) != 0 or not st.get("verso_on") or st.get("verso_regen"):
+        return False
+    r2 = eval_r2(out, step, 1)
+    need = float(cfg.verso_min_dice) + float(getattr(cfg, "verso_regen_gain", 0.15))
+    if not (r2 and np.isfinite(r2[-1]) and r2[-1] >= need):
+        return False
+    write_state(out, verso_regen={"step": int(step), "dice_r2": float(r2[-1])})
+    jlog(out, "sched", {"kind": "verso_regen", "step": int(step), "dice_r2": float(r2[-1]),
+                        "need": need})
+    return True
+
+
+def _complete_rows(rows, keys=("precision", "betti0_err")):
+    """Only the rows that carry every metric, finite: a row missing one is dropped WHOLE, never
+    metric by metric (that would pool different region sets per metric)."""
+    out = []
+    for r in rows:
+        try:
+            if all(np.isfinite(float(r[k])) for k in keys):
+                out.append(r)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def round_gate(cfg, out, step, round_, rows_fn=None, ref=None, round_start=0, verso_on=True,
+               verso_on_step=None, verso_regions=None):
     """Should round `round_` end and round `round_ + 1` open? Every doubt answers NO (fail closed).
 
     In order, each one a refusal with its reason logged:
-      - round 0 without `verso_on`: self-distillation needs round 0's verso stores to exist;
+      - round 0 without `verso_on`: self-distillation needs round 0's verso stores to exist; nor
+        before verso has been on for `round_min_steps_after_verso` steps (state `verso_on_step`) and
+        `verso_min_regions` verso stores are finished;
       - fewer than `round_steps` steps IN THIS ROUND (`step - round_start`, not the absolute step:
         the absolute one made round 1 due the moment round 0 was over);
       - less than `round_steps` of the global `steps` budget left: a promoted round must get to train;
-      - no held-out comparison rows, or a non-finite precision / betti0 error;
+      - no COMPLETE held-out comparison rows (a row missing a metric is dropped whole), or a
+        non-finite pooled precision / betti0 error;
       - round >= 1 with no round-0-anchored reference `ref` (it is persisted in state.json, so a
         restart keeps the veto), or a merge side (`precision`) / `betti0_err` worse than `ref` beyond
         the bootstrap CI.
@@ -1201,11 +1273,21 @@ def round_gate(cfg, out, step, round_, rows_fn=None, ref=None, round_start=0, ve
     if int(cfg.steps) - int(step) < int(cfg.round_steps):
         return False, {"why": "less than round_steps of the global steps budget left for the next "
                               "round", "steps": int(cfg.steps), **base}
+    if int(round_) == 0:
+        after = None if verso_on_step is None else int(step) - int(verso_on_step)
+        need = int(getattr(cfg, "round_min_steps_after_verso", 0))
+        if after is None or after < need:
+            return False, {"why": "verso has not been on for round_min_steps_after_verso",
+                           "steps_since_verso_on": after, "need": need, **base}
+        nreg = int(getattr(cfg, "verso_min_regions", 0))
+        if verso_regions is None or int(verso_regions) < nreg:
+            return False, {"why": "fewer than verso_min_regions finished verso stores",
+                           "verso_regions": verso_regions, "need": nreg, **base}
     flat, pwhy = plateau(out, "dice", since=round_start)
     base.update({"plateau": bool(flat), "plateau_why": pwhy.get("why")})
-    rows = list((rows_fn() if rows_fn is not None else None) or [])
+    rows = _complete_rows(list((rows_fn() if rows_fn is not None else None) or []))
     if not rows:
-        return False, {"why": "no held-out comparison rows (fail closed)", **base}
+        return False, {"why": "no complete held-out comparison rows (fail closed)", **base}
     prec, plo, phi = _boot([r.get("precision", float("nan")) for r in rows])
     b, blo, bhi = _boot([r.get("betti0_err", float("nan")) for r in rows])
     got = {"precision": prec, "betti0_err": b}
@@ -1973,15 +2055,25 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
 
         if state["round"] == 0 and not st.get("verso_on"):
             t_g = time.time()
-            ok, why = verso_gate(cfg, out, step, rows_fn, screen=eval_dice(out, step))
+            ok, why = verso_gate(cfg, out, step, rows_fn, screen=eval_dice(out, step),
+                                 r2=eval_r2(out, step, 2))
             why = {**why, "gate_s": round(time.time() - t_g, 1)}
             jlog(out, "sched", {"kind": "verso_gate", "step": step, "pass": bool(ok), **why})
             if ok:
-                write_state(out, verso_on=True, verso_gate_step=step)
+                write_state(out, verso_on=True, verso_gate_step=step, verso_on_step=step)
+        elif state["round"] == 0:
+            maybe_regen_verso(cfg, out, step)
         if state["round"] + 1 < int(cfg.rounds):
+            st2 = read_state(out)
+            nver = None
+            if state["round"] == 0 and st2.get("verso_on"):
+                from rvsm import regions as _RG
+                nver = len(_RG.Catalog(out, 0).list_done("verso"))
             ok, why = round_gate(cfg, out, step, state["round"], rows_fn, state["ref"],
                                  round_start=int(st.get("round_step", 0) or 0),
-                                 verso_on=bool(read_state(out).get("verso_on", False)))
+                                 verso_on=bool(st2.get("verso_on", False)),
+                                 verso_on_step=st2.get("verso_on_step", st2.get("verso_gate_step")),
+                                 verso_regions=nver)
             if why.get("why") != "not a plateau":
                 jlog(out, "sched", {"kind": "round_gate", "step": step, "round": state["round"],
                                     "pass": bool(ok), **why})

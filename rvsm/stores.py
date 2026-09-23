@@ -44,6 +44,44 @@ def store_path(root, channel, lo, round_=0):
     return os.path.join(root, "stores", f"round_{int(round_)}", str(channel), region_name(lo))
 
 
+def gen_path(path, gen=0):
+    """A store's GENERATION `gen` path: generation 0 is the store itself, generation g > 0 sits beside
+    it as `region_<z>_<y>_<x>.g<g>.zarr`. A regenerated store (round 0's verso, rewritten once from a
+    better student) is a NEW directory; a finished store is never rewritten in place."""
+    g = int(gen)
+    if g <= 0:
+        return path
+    assert path.endswith(".zarr"), path
+    return path[:-len(".zarr")] + f".g{g}.zarr"
+
+
+def store_gen(root, channel, lo, round_=0):
+    """The highest FINISHED generation of a region store, or -1 when none is."""
+    base = store_path(root, channel, lo, round_)
+    best = 0 if is_done(base) else -1
+    g = 1
+    while os.path.isdir(gen_path(base, g)):
+        if is_done(gen_path(base, g)):
+            best = g
+        g += 1
+    return best
+
+
+def current_path(root, channel, lo, round_=0):
+    """The path a READER uses: the newest finished generation (generation 0's path when none is)."""
+    return gen_path(store_path(root, channel, lo, round_), max(store_gen(root, channel, lo, round_), 0))
+
+
+def read_attrs(path):
+    """A store's attributes from its zarr.json, without opening the array ({} when unreadable)."""
+    try:
+        import json
+        with open(os.path.join(path, "zarr.json")) as f:
+            return dict(json.load(f).get("attributes", {}))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def out_array(path, shape, origin, rung=2, channels=("recto",), q=8, volume="", umbilicus="", attrs=None):
     """Create the store (overwriting); returns the zarr array. Shape must be multiples of 128."""
     import zarr

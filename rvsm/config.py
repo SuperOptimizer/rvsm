@@ -157,7 +157,9 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        # a user decision; a resume may change it, and the switch is recorded in the run log
                        "cascade", "cascade_drop", "self_p_lo", "self_p_hi",
                        # loss weights a running experiment may retune on resume (pass-3 P3-01)
-                       "loss_prob_dice", "loss_pair")
+                       "loss_prob_dice", "loss_pair",
+                       # scheduling of the verso passes and of the round gate (pass-3 item 11, P3-03)
+                       "verso_regen_gain", "round_min_steps_after_verso", "verso_min_regions")
 
 
 @dataclass
@@ -248,7 +250,12 @@ class Config:
     # ------------------------------------------------------------------ fixed recipe: rounds + inference
     verso_source: str = "flip"         # verso stores come from the student run with the radial sign flipped
     verso_after_steps: int = 10000     # round-0 verso starts here if the gate has not already fired
-    verso_min_dice: float = 0.3        # ... and even then only once the eval's fine-rung dice reaches this
+    verso_min_dice: float = 0.3        # ... and even then only once the eval's RUNG-2 dice reaches this
+                                       # on two consecutive evaluations
+    verso_regen_gain: float = 0.15     # rung-2 dice >= verso_min_dice + this, first time: round 0's verso
+                                       # stores from older checkpoints are regenerated once (new generation)
+    round_min_steps_after_verso: int = 8000   # round 0 is promoted only this long after verso_on
+    verso_min_regions: int = 200       # ... and with at least this many finished verso stores
     verso_gate_dice: float = 0.6       # ... or earlier, once the held-out recto reaches this dice
     eval_every: int = 2000             # held-out evaluation cadence, in steps
     calibrate: bool = True             # refit the temperatures after every eval

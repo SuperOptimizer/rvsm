@@ -63,7 +63,8 @@ def run_cfg(region_cfg, fake_teacher, tmp_path, has_volcomp):
     return replace(region_cfg,
                    out=str(tmp_path / "e2e"), teacher_ckpts={"fake": fake_teacher.ckpt},
                    mode="cpu", gpus=(), rounds=2, steps=20, eval_every=5,
-                   verso_after_steps=5, verso_min_dice=0.0, round_steps=10, heldout=1, workers=0,
+                   verso_after_steps=5, verso_min_dice=0.0, round_min_steps_after_verso=0, verso_min_regions=1,
+                   verso_regen_gain=10.0, round_steps=5, heldout=1, workers=0,
                    min_regions_before_train=2, lookahead_extra=2, reserve_gb=0.001,
                    infer_window=64, infer_halo=8, cascade_depth=1, calibrate=True,
                    aff_offsets=(4, 8, 16))
@@ -97,6 +98,12 @@ def test_rvsm_run_two_rounds_end_to_end(run_cfg, tmp_path, capsys):
     # restart keeps the veto; the round's own start is recorded for the per-round step count
     assert st.get("round_ref") and all(k in st["round_ref"] for k in ("precision", "betti0_err"))
     assert st.get("verso_on") and int(st.get("round_step", 0)) >= cfg.round_steps
+    assert st.get("verso_on_step") is not None
+    # every round-0 verso store records the checkpoint step that made it (and its generation)
+    from rvsm import regions as _RG, stores as _ST
+    vs = _RG.Catalog(out, 0).list_done("verso")
+    assert vs and all("step" in _ST.read_attrs(_ST.store_path(out, "verso", v, 0)) and
+                      "gen" in _ST.read_attrs(_ST.store_path(out, "verso", v, 0)) for v in vs)
     assert st["step"] >= 20
 
     # ---- round 0: the teacher stores, and the verso the gate opened
@@ -341,11 +348,14 @@ def test_the_verso_gate_needs_the_dice_and_the_betti_baseline(small_cfg):
     assert RUN.verso_gate(cfg, "", 10, lambda: called.append(1) or good, screen=0.55)[0] is True
     assert called == [1]                       # near the gate: the held-out pass decides
     called = []
-    ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [], screen=0.35)  # the fallback
-    assert ok and why["why"] == "verso_after_steps"
-    # ... which still needs the eval's fine-rung dice at verso_min_dice: a garbage recto never flips
-    ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [], screen=0.07)
-    assert not ok and "verso_min_dice" in why["why"] and why["verso_min_dice"] == 0.3
+    ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [], screen=0.2,
+                             r2=[0.32, 0.35])                        # the fallback
+    assert ok and why["why"] == "verso_after_steps" and why["dice_r2"] == 0.35
+    assert why["dice_r2_prev"] == 0.32                               # both values are logged
+    # ... which needs the RUNG-2 dice at verso_min_dice on TWO consecutive evaluations
+    ok, why = RUN.verso_gate(cfg, "", 1000, lambda: called.append(1) or [], screen=0.2, r2=[0.1, 0.35])
+    assert not ok and "two consecutive" in why["why"] and why["verso_min_dice"] == 0.3
+    assert not RUN.verso_gate(cfg, "", 1000, lambda: [], r2=[0.4])[0], "one evaluation is not two"
     assert not RUN.verso_gate(cfg, "", 1000, lambda: [], screen=None)[0]
     assert not called, "the fallback must not pay for a student pass it does not need"
 
@@ -369,10 +379,20 @@ def test_the_round_gate_fails_closed(tmp_path, small_cfg):
     no, why = RUN.round_gate(cfg, out, 59500, 0, rf)                              # (d) no budget left
     assert not no and "budget" in why["why"]
     assert not seen, "the rows are paid for only once the cheap conditions pass"
-    assert RUN.round_gate(cfg, out, 5000, 0, lambda: [])[1]["why"].startswith("no held-out")
+    vv = dict(verso_on_step=-5000, verso_regions=500)
+    assert RUN.round_gate(cfg, out, 5000, 0, lambda: [], **vv)[1]["why"].startswith("no complete")
     bad = [{"precision": float("nan"), "betti0_err": 1.0}]
-    assert RUN.round_gate(cfg, out, 5000, 0, lambda: bad)[1]["why"].startswith("non-finite")
-    fire, why = RUN.round_gate(cfg, out, 5000, 0, rf)                            # round 0: rows = ref
+    assert RUN.round_gate(cfg, out, 5000, 0, lambda: bad, **vv)[1]["why"].startswith("no complete")
+    v = dict(verso_on_step=1000, verso_regions=500)                              # verso long enough on
+    assert RUN.round_gate(cfg, out, 5000, 0, rf, verso_on_step=4000, verso_regions=500)[1]["why"] \
+        .startswith("verso has not been on"), "P3-03: 1000 steps of verso < 8000"
+    assert RUN.round_gate(cfg, out, 5000, 0, rf, verso_on_step=-5000, verso_regions=50)[1]["why"] \
+        .startswith("fewer than verso_min_regions")
+    v = dict(verso_on_step=-5000, verso_regions=500)
+    partial = [{"precision": 0.8, "betti0_err": 1.0}, {"precision": 0.9}]   # a row missing a metric
+    fire, why = RUN.round_gate(cfg, out, 5000, 0, lambda: partial, **v)
+    assert fire and why["n"] == 1, "a row missing a metric is dropped whole"
+    fire, why = RUN.round_gate(cfg, out, 5000, 0, rf, **v)                      # round 0: rows = ref
     assert fire and why["rows"]["precision"] == pytest.approx(0.81)
     ref = why["rows"]
     no, why = RUN.round_gate(cfg, out, 6500, 1, rf, None, round_start=5000)      # (c) no reference
@@ -1219,3 +1239,49 @@ def test_a_live_heartbeat_with_stale_progress_is_a_stall(tmp_path):
     watch = RUN.ProducerWatch(out2, {"produce": Alive()}, lambda: None, clock=lambda: now,
                               log=lambda m: None)
     assert watch.check() is not None
+
+
+def _fake_store(path, **attrs):
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "zarr.json"), "w") as f:
+        json.dump({"attributes": {"done": True, **attrs}}, f)
+
+
+def test_the_verso_is_regenerated_once_as_a_new_generation(tmp_path, small_cfg):
+    """The first evaluation with rung-2 dice >= verso_min_dice + verso_regen_gain marks the verso
+    stores made by older checkpoints; the producer rewrites each as generation 1 BESIDE the old one
+    (never in place), its fields follow at generation 1, every reader moves to it, and the trigger
+    never fires twice (pass-3 item 11)."""
+    from rvsm import regions as RG, stores, targets as TG
+    out = str(tmp_path / "rg")
+    cfg = replace(small_cfg, verso_min_dice=0.3, verso_regen_gain=0.15)
+    lo = (0, 1024, 2048)
+    _fake_store(stores.store_path(out, "recto", lo, 0), step=0)
+    _fake_store(stores.store_path(out, "verso", lo, 0), step=10000)      # the producing ckpt step
+    fields = [stores.store_path(out, TG.channel(kind, k), lo, 0) for kind in TG.KINDS for k in (2, 3, 4)]
+    for f in fields:
+        _fake_store(f)
+    RUN.write_state(out, round=0, verso_on=True, verso_on_step=10000)
+    cat = RG.Catalog(out, 0, ttl=0.0)
+    assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4)) is None
+    RUN.jlog(out, "eval", {"step": 20000, "dice_r2": 0.40}, echo=False)
+    assert not RUN.maybe_regen_verso(cfg, out, 20000)                    # 0.40 < 0.45
+    RUN.jlog(out, "eval", {"step": 22000, "dice_r2": 0.47}, echo=False)
+    assert RUN.maybe_regen_verso(cfg, out, 22000)
+    regen = RUN.read_state(out)["verso_regen"]
+    assert regen == {"step": 22000, "dice_r2": 0.47}
+    RUN.jlog(out, "eval", {"step": 24000, "dice_r2": 0.6}, echo=False)
+    assert not RUN.maybe_regen_verso(cfg, out, 24000), "the regeneration fires once"
+    assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4), regen=regen) == "verso"
+    g1 = stores.gen_path(stores.store_path(out, "verso", lo, 0), 1)
+    assert g1.endswith(".g1.zarr") and not os.path.exists(g1)
+    _fake_store(g1, step=22000, gen=1)                                    # the producer's new store
+    assert stores.is_done(stores.store_path(out, "verso", lo, 0)), "generation 0 is left as it was"
+    assert stores.store_gen(out, "verso", lo, 0) == 1
+    assert RG.Catalog(out, 0).path("verso", lo) == g1                   # every reader moves to it
+    assert TG.field_path(out, "midline", 4, lo, 0).endswith(".g1.zarr")   # and its fields follow
+    assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4), regen=regen) == "fields"
+    for f in fields:
+        _fake_store(stores.gen_path(f, 1))                               # the fields at generation 1
+    assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4), regen=regen) is None
+    assert stores.read_attrs(g1)["step"] == 22000
