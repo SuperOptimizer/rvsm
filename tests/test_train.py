@@ -528,3 +528,29 @@ def test_the_eval_cascade_follows_the_training_mode(full_cfg):
     assert float(x_def[:, lay.i_cas].abs().max()) == 0.0
     x_mask, _, _ = prep.prepare(b, torch.device("cpu"), cascade=prep.Cascade("mask", drop=0.0, noise=False))
     assert float(x_mask[:, lay.i_cas].max()) > 0                # the oracle only when asked for by name
+
+
+def test_a_nonfinite_gradient_skips_the_step_and_a_run_of_them_aborts(tiny_cfg, monkeypatch):
+    """The finite-gradient gate: NaN gradients never reach AdamW, the schedule or the EMA; the step is
+    skipped and logged, and NONFINITE_MAX in a row abort the run (after saving the last good weights).
+    Every save keeps the checkpoint it replaces as <ckpt>_prev."""
+    net = torch.nn.Linear(2, 1)
+    net(torch.ones(1, 2)).sum().backward()
+    assert TR.grad_gate(net) is True
+    net.weight.grad[0, 0] = float("nan")
+    assert TR.grad_gate(net) is False
+
+    cfg = replace(tiny_cfg, out=str(__import__("pathlib").Path(tiny_cfg.out).parent / "nanrun"))
+    val = [_item(cfg, k=2, seed=7)]
+    ck = TR.train(cfg, patches_factory=_factory(cfg), val_items=val, device="cpu")
+    from pathlib import Path
+    assert Path(ck).exists() and Path(ck).with_name(Path(ck).stem + "_prev" + Path(ck).suffix).exists()
+
+    monkeypatch.setattr(TR, "grad_gate", lambda net, max_norm=1.0: False)
+    monkeypatch.setattr(TR, "NONFINITE_MAX", 3)
+    cfg2 = replace(cfg, out=str(Path(cfg.out).parent / "nanrun2"))
+    with pytest.raises(RuntimeError, match="non-finite"):
+        TR.train(cfg2, patches_factory=_factory(cfg2), val_items=val, device="cpu")
+    rows = [json.loads(q) for q in (Path(cfg2.out) / "logs" / "train.jsonl").read_text().splitlines()]
+    bad = [r for r in rows if r.get("kind") == "nonfinite_grad"]
+    assert [r["consecutive"] for r in bad] == [1, 2, 3] and all(r["step"] == 0 for r in bad)

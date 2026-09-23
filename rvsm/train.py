@@ -246,6 +246,39 @@ def self_p_at(cfg, step, nsteps=None):
     return hi + (end - hi) * (s - m) / (e - m)
 
 
+NONFINITE_MAX = 20       # consecutive skipped steps (non-finite gradient) that abort a run
+
+
+def grad_gate(net, max_norm=1.0):
+    """Clip the gradients to `max_norm` and say whether they were FINITE. `clip_grad_norm_` returns
+    the total norm before clipping, which is non-finite exactly when some gradient is; the caller then
+    skips the optimiser step, the schedule and the EMA rather than write NaN into the weights."""
+    n = torch.nn.utils.clip_grad_norm_(net.parameters(), float(max_norm))
+    return bool(torch.isfinite(n))
+
+
+def keep_prev(ck):
+    """Before a checkpoint is replaced, keep the one it replaces as `<name>_prev<suffix>` (a hard
+    link, so `ck` itself never disappears for a reader): a bad save or a poisoned step leaves the last
+    good weights one file away."""
+    import os
+    from pathlib import Path
+    ck = Path(ck)
+    if not ck.exists():
+        return None
+    prev = ck.with_name(f"{ck.stem}_prev{ck.suffix}")
+    tmp = prev.with_suffix(prev.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    try:
+        os.link(ck, tmp)
+    except OSError:
+        import shutil
+        shutil.copy2(ck, tmp)
+    os.replace(tmp, prev)
+    return prev
+
+
 def eval_cascade_mode(mode):
     """The cascade source the evaluation feeds, following the TRAINING mode: self / mix -> self (what
     inference feeds), off -> off, mask -> mask (a mask-trained run is evaluated as it was trained).
@@ -719,10 +752,13 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     aux_on = bool(cfg.loss_excl or cfg.loss_selfcons or cfg.loss_skel or cfg.loss_affinity)
     aux_dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
 
+    bad_run, bad_total = 0, 0
+
     def save():
         tmp = ck.with_suffix(".tmp")
         torch.save({"model": net.state_dict(), "ema": ema, "opt": opt.state_dict(), "step": step,
                     "cfg": cfg.to_json(), "layout": layout.to_json(), "temps": temps}, tmp)
+        keep_prev(ck)
         tmp.replace(ck)
 
     def do_eval():
@@ -869,7 +905,19 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         if micro < int(accum):
             continue
         micro = 0
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        if not grad_gate(net, 1.0):
+            # a non-finite gradient never reaches the optimiser, the schedule or the EMA: the step is
+            # skipped (its batch is spent), counted and logged; a run of them is a diverged run
+            opt.zero_grad(set_to_none=True)
+            bad_run, bad_total = bad_run + 1, bad_total + 1
+            _log(str(out / "logs" / "train.jsonl"),
+                 {"kind": "nonfinite_grad", "step": step, "consecutive": bad_run, "total": bad_total})
+            if bad_run >= NONFINITE_MAX:
+                save()
+                raise RuntimeError(f"train: {bad_run} consecutive non-finite gradients at step {step} "
+                                   f"({bad_total} in all); the last good weights are in {ck}")
+            continue
+        bad_run = 0
         opt.step()
         opt.zero_grad(set_to_none=True)
         sched.step()
