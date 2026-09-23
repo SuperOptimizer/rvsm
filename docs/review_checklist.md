@@ -29,7 +29,7 @@ the reasons behind each rule are in [`rationale.md`](rationale.md) and [`recipe.
 
 | check | rule | where | test |
 |---|---|---|---|
-| Probability stores are **q8**; distance stores (`midline`, `thickness`) are **q0, lossless** | q8 rounding turned a stored `0` into a `6`, i.e. a −30.5-voxel distance indistinguishable from a real one, and it compounds under partial-chunk writes (§29.1) | `rvsm/stores.py:out_array(q=)`; plan §2 | `tests/test_targets.py::test_encoding_round_trips_and_reserves_code_zero`, `::test_signed_distance_sign_units_and_clamp_on_a_slab` |
+| Probability stores are **q8**; distance stores (`midline`, `thickness`) are **q0, lossless** | q8 rounding turned a stored `0` into a `6`, i.e. a −30.5-voxel distance indistinguishable from a real one, and it compounds under partial-chunk writes (§29.1) | `rvsm/stores.py:out_array(q=)`; plan §2 | `tests/test_targets.py::test_encoding_round_trips_and_reserves_code_zero`, `::test_signed_distance_sign_units_and_reach_on_a_slab` |
 | The codec chain is **exactly `[volcomp]`** — `compressors=None` | zarr-python silently appends zstd; measured saving 0.2 % for a decode step on every read (§24) | `rvsm/stores.py:55` | `tests/test_stores.py::test_store_round_trip_and_pool` |
 | **One write per shard**, one shard per 1024³ region, 128³ inner chunks | 514 files → 2 files, ~590 sftp ops → 7 (§18.1b) | `rvsm/stores.py:shard_shape`, `CHUNK`, `SHARD` | `tests/test_stores.py::test_store_round_trip_and_pool` |
 | **Never rewrite a finished store in place.** Write to `.zarr.tmp/`, rename, set `done` **last** | an in-place repack under a live reader killed the u2 trainer at 18:01 UTC 2026-09-21 (§24) | `rvsm/stores.py:write`; plan §1, §10 | `tests/test_stores.py::test_tmp_never_left_behind`; `tests/test_infer_export.py::test_produce_writes_a_done_store` |
@@ -46,7 +46,7 @@ written on the A100 records that build's hash.
 
 | check | rule | where | test |
 |---|---|---|---|
-| Voxels within **400 µm of the umbilicus axis get weight 0** | near the axis the sheet geometry degenerates and a distance target is meaningless (§29.1) | `rvsm/targets.py:57 AXIS_R_UM = 400.0` | `tests/test_targets.py::test_near_axis_voxels_get_weight_zero`; `tests/test_sample_prep.py::test_weight_is_zero_near_the_umbilicus_for_verso` |
+| Voxels within **400 µm of the umbilicus axis get weight 0** | near the axis the sheet geometry degenerates and a distance target is meaningless (§29.1) | `rvsm/targets.py:100 AXIS_R_UM = 400.0` | `tests/test_targets.py::test_near_axis_voxels_get_weight_zero`; `tests/test_sample_prep.py::test_weight_is_zero_near_the_umbilicus_for_verso` |
 | **`code 0` means weight 0**, everywhere a distance channel is read | code 0 is the contract's no-data marker and decodes to −32 voxels, not to "nothing" | `rvsm/losses.py:dist_weight`; `rvsm/sample.py` | `tests/test_sample_prep.py::test_code_zero_means_weight_zero_for_a_distance_channel`; `tests/test_losses.py::test_sdist_and_thickness_decode_the_store_encoding` |
 | A distance voxel whose resampled weight is **< 0.95 is dropped**, not down-weighted | interpolating *across* code 0 gives a number that is simply wrong (§29.2) | `rvsm/losses.py:dist_weight` | `tests/test_losses.py::test_dist_weight_drops_partially_resampled_voxels` |
 | Distance channels are **rungs 2-4 only** and are **never pooled** | a pooled distance is not a distance (plan §3) | `rvsm/targets.py` | `tests/test_targets.py::test_coarse_rungs_are_recomputed_and_never_pooled`, `::test_a_rung_above_four_is_refused` |
@@ -120,7 +120,7 @@ used for exact 2× upsampling, not `F.interpolate` (backward 1762 → 651 ms, §
 | Region state is **derived**: `rvsm ledger --rebuild` is a directory scan and must reproduce the ledger exactly | plan §1 | — (gap) |
 | A resume compares `fingerprint()` and refuses a different config | `rvsm/config.py` | `tests/test_train.py::test_resume_continues_and_refuses_a_different_config` |
 | A warm start copies by name, zero-inits the rest, and **reports** the new tensors; probability rows come out bit-identical | §26.1, §29.2 | `tests/test_train.py::test_warm_start_reproduces_the_source_and_reports_the_new_tensors`, `::test_warm_start_from_a_usrm2_checkpoint_maps_by_name` |
-| `targets.region_fields` is resumable and **deterministic across job counts** | §29.8 (`--resume`, `--jobs`) | `tests/test_targets.py::test_done_is_resume_and_force_recomputes`, `::test_jobs_four_is_byte_identical_to_jobs_one` |
+| `targets.region_fields` is resumable and **deterministic across job counts** | §29.8 (`--resume`, `--jobs`) | `tests/test_targets.py::test_done_is_resume_and_force_or_new_parameters_recompute`, `::test_jobs_are_byte_identical` |
 | The shard cache releases and evicts only released regions, and never evicts pinned coarse levels; a 404 leaves an `.absent` marker so nothing refetches it | plan §2 | `tests/test_stream.py::test_release_and_evict_keep_pinned_levels_and_live_regions`, `::test_404_leaves_an_absent_marker` |
 | A local CT path is **symlinked, not copied** | plan §2 | `tests/test_stream.py::test_a_local_volume_is_symlinked_not_copied` |
 | A run with no verso and no distance stores still trains (the cold-start case) | plan §1 | `tests/test_train.py::test_a_run_with_no_verso_and_no_distance_stores_still_trains` |

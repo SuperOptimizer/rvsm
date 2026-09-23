@@ -147,7 +147,7 @@ the easiest to switch off (`loss_ect = 0.0`).
 
 Two rules that are not weights but change what the losses see, and which the review checklist calls out:
 
-- **Weight 0 within 400 µm of the umbilicus axis** (`rvsm/targets.py:57 AXIS_R_UM = 400.0`) and above
+- **Weight 0 within 400 µm of the umbilicus axis** (`rvsm/targets.py:100 AXIS_R_UM = 400.0`) and above
   rung 4 for distance channels: near the axis the sheet geometry degenerates and the distance target is
   meaningless (§29.1, "weight 0 within 400 um of the axis / above rung 4").
 - **A distance voxel counts only at full weight.** Spatial augmentations resample the target and the
@@ -162,6 +162,68 @@ Two rules that are not weights but change what the losses see, and which the rev
   **Not implemented in rvsm as of this writing**: `aug.PRESETS["full2"]` includes `SPATIAL` (`rot`,
   `scale`, `shear`, `elastic`) and `SHEETCOMP` (`rvsm/aug.py:618-624`), and nothing removes them although
   `loss_sdist = 1.0` is a default. See [`review_checklist.md`](review_checklist.md) §10.
+
+### Distance-field targets (`paired-v2`)
+
+The `midline` / `thickness` field stores (`rvsm/targets.py`, q0, code 0 = no data) are built per block
+from the region's recto and verso probability stores at each rung 2-4 (rungs 3-4 recomputed from the
+pooled bands, never pooled), with the existing 48-voxel halo. This definition was approved by the user
+on 2026-09-23 to fix review findings T01-T04 (`docs/production_readiness_review.md`):
+
+**Orientation.** Signs are pinned to `axis.radial`, the unit vector pointing away from the umbilicus.
+The recto face is the **outward** face of a sheet (larger radius) and the verso face is the inward one.
+Three places already use this convention: `losses.pair_bands` (recto band at `m = +t/2`),
+`export.SIGN_CONVENTION` (normal from verso to recto = radially outward) and `infer`'s verso trick
+(`sign = -1` negates only the radial inputs). Take a sheet with its recto face at radial coordinate `a`
+and its verso face at `a - t`. Then `d_r = x - a` and `d_v = x - (a - t)`, so `t = d_v - d_r > 0` on
+either side of the sheet and inside it.
+
+1. **Raw distances.** `d_r` and `d_v` are unclipped signed EDTs to the medial surfaces of the two bands,
+   over core + halo. The ±31.75 cap is applied **only by the encoders**, after all geometry.
+2. **Reach.** `d_r` is valid only where the nearest recto face is within `REACH = 24` voxels at the
+   store's rung, and likewise `d_v` for the nearest verso face. The code asserts `REACH < halo`, so the
+   nearest face found in the box is the nearest face anywhere. A block with no recto face in core +
+   halo is code 0 everywhere. A region with no verso store, or with an empty verso band, is code 0 for
+   **both** fields: there is no `midline = d_r` fallback.
+3. **Same-sheet pairing.** A voxel is valid only if both of these hold:
+   - `TMIN ≤ t ≤ TMAX`, where TMIN and TMAX are 2 and 24 rung-2 voxels, halved for each rung above 2.
+   - The straight segment from its nearest recto point to its nearest verso point crosses no other
+     recto face. The segment is sampled at ≤ 1-voxel steps. Any sample more than 1.5 voxels on the
+     outward side of a recto face counts as a crossing.
+
+   Negative or implausible thickness is **rejected**, never clamped up to `TMIN`.
+4. Over valid paired voxels only: `midline = (d_r + d_v)/2` and `thickness = d_v - d_r`. Everything else
+   is code 0, and so is everything inside the 400 µm axis exclusion.
+
+Each store records `target_def`, `reach_vox`, `tmin_vox`, `tmax_vox` and `verso`. It also records a
+`support` count of why core voxels were rejected (`no_recto`, `no_verso`, `thickness`, `crossing`).
+Code changes alone do not repair cached labels. So a done store is **recomputed**, not reused, if it was
+written under an older definition, with other parameters or before the verso existed. The next producer
+pass rebuilds stale stores.
+
+**Why.** These are the review's CPU reproductions:
+
+- **T01:** an all-air recto block was written as code 128 over the whole block, i.e. as a *valid* zero
+  distance.
+- **T02:** for parallel recto/verso planes at x = 80/70, the true thickness is 10 everywhere. The old
+  code clipped each distance to ±31.75 before combining them and gave thickness `[3, 10, 3]` at
+  x = `[0, 75, 120]`. Far from the sheet both distances saturated to the same value, so their difference
+  was 0, and the old `TMIN = 3` replaced it.
+- **T03:** with recto at x = 50 and 80 and verso at x = 40 and 70 (two sheets), x = 65 got `midline 5,
+  thickness 3`. The inputs were `d_r = 15` to the first sheet and `d_v = -5` to the second, and the
+  negative difference was silently clamped to `TMIN`. The nearest real paired midline is x = 75, at
+  signed distance -10. Under `paired-v2`, that voxel is either code 0 or `-10 / 10`.
+- **T04:** without verso, the stored "midline" was the recto-face distance, so m = 0 lay **on** the
+  recto face. The pair construction instead places the recto face at `m = +t/2`. The two objectives are
+  incompatible, so midline supervision now requires paired geometry.
+
+**Known limits.**
+- At a region's outermost voxel layer, the air outside the store cuts the medial surface. Distances
+  there can be off by up to ~1.5 voxels or fall beyond reach.
+- The pairing test does not check for a second **verso** face between the pair.
+- On strongly curved sheets, the nearest-point segment is not exactly radial.
+- The target `TMIN = 2` is below `losses.TMIN = 3`, the floor of the constructed thickness. The head
+  therefore cannot exactly match a target thickness of 2-3 voxels.
 
 ---
 
