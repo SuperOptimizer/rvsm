@@ -1285,3 +1285,21 @@ def test_the_verso_is_regenerated_once_as_a_new_generation(tmp_path, small_cfg):
         _fake_store(stores.gen_path(f, 1))                               # the fields at generation 1
     assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4), regen=regen) is None
     assert stores.read_attrs(g1)["step"] == 22000
+
+
+def test_gc_takes_every_field_channel_and_generation_of_an_old_round(tmp_path):
+    """The per-rung field stores (midline_r3, thickness_r4, ...) and a regenerated store's other
+    generations of a superseded region go with the rest of the old round."""
+    from rvsm import stores as ST, targets as TG
+    out = str(tmp_path / "gc2")
+    lo = (0, 0, 0)
+    chans = ["recto", "verso"] + [TG.channel(kind, k) for kind in TG.KINDS for k in (2, 3, 4)]
+    for ch in chans:
+        _fake_store(ST.store_path(out, ch, lo, 0))
+    _fake_store(ST.gen_path(ST.store_path(out, "verso", lo, 0), 1))
+    _fake_store(ST.store_path(out, "recto", lo, 2))                       # round 2 has superseded it
+    gone = RUN._clean_old_rounds(out, 2, keep=2)
+    for ch in chans:
+        assert not os.path.exists(ST.store_path(out, ch, lo, 0)), ch
+    assert not os.path.exists(ST.gen_path(ST.store_path(out, "verso", lo, 0), 1))
+    assert len(gone) == len(chans) + 1

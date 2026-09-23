@@ -2191,18 +2191,23 @@ def _clean_old_rounds(out, round_, keep=2):
     old = int(round_) - int(keep)
     if old < 0:
         return []
+    import glob
     new = RG.Catalog(out, int(round_), ttl=1.0)
     gone = []
-    for ch in ("recto", "rw", "verso", "midline", "thickness", "conf"):
-        d = os.path.join(out, "stores", f"round_{old}", ch)
-        if not os.path.isdir(d):
-            continue
+    root = os.path.join(out, "stores", f"round_{old}")
+    # EVERY channel directory of the old round -- the per-rung fields (midline_r3, thickness_r4, ...)
+    # included, which a fixed list of channel names left behind -- and every generation of a store
+    chans = sorted(n for n in (os.listdir(root) if os.path.isdir(root) else [])
+                   if os.path.isdir(os.path.join(root, n)) and n != "coarse.zarr")
+    for ch in chans:
+        d = os.path.join(root, ch)
         for lo in RG.Catalog(out, old, ttl=1.0).list_done(ch):
             if not new.done("recto", lo):
                 continue
-            p = os.path.join(d, "region_%d_%d_%d.zarr" % lo)
-            shutil.rmtree(p, ignore_errors=True)
-            gone.append(p)
+            base = os.path.join(d, "region_%d_%d_%d.zarr" % lo)
+            for p in [base] + sorted(glob.glob(base[:-len(".zarr")] + ".g*.zarr")):
+                shutil.rmtree(p, ignore_errors=True)
+                gone.append(p)
     if gone:
         jlog(out, "sched", {"kind": "gc", "round": old, "removed": len(gone)})
     return gone
