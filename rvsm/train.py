@@ -233,7 +233,9 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
     Every entry is a compact rung sample (`sample.rung_item`), whose input is built on the device by
     `prep.prepare`; its per-voxel weights scale every metric, and each rung is also scored on its own
     (`dice_r2`, `dice_r3`, ...) with `dice` the mean over the rungs present -- every rung counts the
-    same, whatever share of the grid it holds.
+    same, whatever share of the grid it holds. bce / dice / mae are PROBABILITY-head metrics only. A
+    window with no probability weight at all is skipped (it has nothing to score), `n_scored` counts the
+    windows that were scored, and a rung made only of such windows has no `dice_r{k}`.
 
     Per probability channel there is a `dice_<name>` (`dice_recto`, `dice_verso`), computed only over
     the patches whose WEIGHT says anything about that channel, so the verso channel is silently absent
@@ -246,8 +248,7 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
     was = net.training
     net.eval()
     m = torch.zeros(4)
-    per, pch = {}, {}
-    ct_t = layout.cout_t
+    per, pch, scored = {}, {}, 0
     for item in grid:
         b = _batch(item)
         x, tg, ww = prep.prepare(b, dev, cascade=cascade)
@@ -262,13 +263,22 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
                 pv = L.soft_thickness(y[:, j:j + 1]) if nm == "thickness" else y[:, j:j + 1]
                 pch.setdefault(f"mae_{nm}", []).append(
                     float((pv - dec(tg[:, j:j + 1])).abs().mul(wc).sum() / wc.sum()))
-        logit, tgt, w = y[:, :ct_t], tg[:, :ct_t], ww[:, :ct_t]
+        # the PROBABILITY heads only: rows nprob..cout_t are distance regressions (voxels, not logits,
+        # against a code/255 target), scored above as mae_midline / mae_thickness. Pooling them in here
+        # put a sigmoid of a distance into bce/dice/mae wherever a distance store has weight.
+        np_ = layout.nprob
+        logit, tgt, w = y[:, :np_], tg[:, :np_], ww[:, :np_]
         if calib_keep is not None:     # the calibration's logits, off THIS forward (see calib.keep)
             from rvsm import calib as _cal
             _cal.keep(calib_keep, logit, tgt, w, rung)
+        if float(w.sum()) <= 0:
+            # no probability weight anywhere in the window (a held-out box with no store at this rung):
+            # it says nothing, so it is not scored -- counted, it was a dice of 0 and a bce of 0 that
+            # dragged every mean, and a rung made only of such windows reported dice_r{k} = 0
+            continue
+        scored += 1
         p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tgt >= 0.5).float()
-        np_ = layout.nprob
         ov = float((p[:, :1] + p[:, 1:2] - 1).clamp_min(0).mean()) if np_ >= 2 else 0.0
         n = w.sum().clamp_min(1e-6)
         dice = float(2 * (h * t * w).sum() / ((h * w).sum() + (t * w).sum() + 1))
@@ -282,8 +292,8 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None):
             dice, float(((p - tgt).abs() * w).sum() / n), ov])
         per.setdefault(int(rung), []).append(dice)
     net.train(was)
-    m /= max(len(grid), 1)
-    out = {"bce": m[0].item(), "dice": m[1].item(), "mae": m[2].item()}
+    m /= max(scored, 1)
+    out = {"bce": m[0].item(), "dice": m[1].item(), "mae": m[2].item(), "n_scored": scored}
     for k in sorted(per):
         out[f"dice_r{k}"] = float(np.mean(per[k]))
     if per:

@@ -262,6 +262,49 @@ def test_resume_continues_and_refuses_a_different_config(tiny_cfg):
         TR.train(other, resume=True, patches_factory=_factory(other), val_items=val, device="cpu")
 
 
+class _Oracle(torch.nn.Module):
+    """A 'net' whose probability rows are the target itself (+-12 logits) and whose distance rows are
+    an arbitrary regression value -- what a real distance head emits: voxels, not a logit."""
+
+    def __init__(self, tgt, cout, nprob):
+        super().__init__()
+        self.tgt, self.cout, self.nprob = tgt, cout, nprob
+
+    def forward(self, x):
+        y = torch.full((x.shape[0], self.cout) + tuple(x.shape[2:]), -3.0)
+        y[:, :self.nprob] = (self.tgt[:, :self.nprob] >= 0.5).float() * 24 - 12
+        return y
+
+
+def test_evaluate_scores_only_the_probability_heads(full_cfg):
+    """bce / dice / mae are PROBABILITY metrics: a distance channel's weight must not pull a distance
+    regression through a sigmoid into them. A perfect probability prediction scores dice 1 and bce ~0
+    whatever the distance heads say (the distances have their own mae_midline / mae_thickness)."""
+    lay = full_cfg.layout()
+    it = _item(full_cfg, dist_w=255)
+    _, tg, _ = prep.prepare(prep.batch1(it), torch.device("cpu"))
+    out = TR.evaluate(_Oracle(tg, lay.cout, lay.nprob), [it], torch.device("cpu"), lay)
+    assert out["dice_recto"] > 0.99 and out["dice_verso"] > 0.99
+    assert out["dice"] > 0.99, out
+    assert out["bce"] < 1e-3 and out["mae"] < 1e-3, out
+    assert "mae_midline" in out and "mae_thickness" in out
+
+
+def test_evaluate_skips_windows_with_no_weight(full_cfg):
+    """A held-out window with no store behind it (weight 0 everywhere) has nothing to score: it must
+    not enter bce / dice as a 0, and a rung made only of such windows has no dice_r{k} to drag the
+    headline mean down."""
+    lay = full_cfg.layout()
+    good = _item(full_cfg, k=2, dist_w=0)
+    empty = _item(full_cfg, k=3, dist_w=0)
+    empty["w"] = torch.zeros_like(empty["w"])
+    _, tg, _ = prep.prepare(prep.batch1(good), torch.device("cpu"))
+    out = TR.evaluate(_Oracle(tg, lay.cout, lay.nprob), [good, empty], torch.device("cpu"), lay)
+    assert out["n_scored"] == 1
+    assert "dice_r3" not in out and out["dice_r2"] > 0.99
+    assert out["dice"] > 0.99 and out["bce"] < 1e-3, out
+
+
 def test_a_run_with_no_verso_and_no_distance_stores_still_trains(tiny_cfg):
     """Round 0 before the verso gate: those channels arrive with weight 0, and nothing special-cases
     them -- the losses stay finite and the head rows they own get no gradient."""
