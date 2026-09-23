@@ -380,3 +380,31 @@ def test_the_lease_keeper_refetches_and_acknowledges_a_lease(ct_origin, tmp_path
     assert RUN.acknowledge_leases(out, c, keys, lk, st, fk) == [(0, "p.2")]
     assert RUN.read_lease_ack(out, 0)["ready"] == [list(B)]
     c.close()
+
+
+def test_a_lease_whose_fetch_fails_is_acknowledged_unready_and_retried(tmp_path, monkeypatch):
+    """`fetch_region` raises `FetchFailed` when a shard does not arrive. The lease keeper acknowledges
+    that lease with the home NOT ready (the worker keeps waiting, then times out loudly) instead of
+    dying, and retries it only after LEASE_RETRY_S."""
+    import threading
+
+    from rvsm import run as RUN
+    out = str(tmp_path / "run")
+    c = stream.ShardCache("https://example.invalid/volume", out, budget_gb=1)
+    calls = []
+
+    def boom(lo, **kw):
+        calls.append(tuple(int(v) for v in lo))
+        raise stream.FetchFailed("k", ["p"])
+    monkeypatch.setattr(c, "fetch_region", boom)
+    monkeypatch.setattr(c, "missing", lambda key: True)
+    RUN.write_state(out, round=0)
+    RUN._write_json(os.path.join(RUN.cursor_dir(out), "w0.json"),
+                    {"pos": 1, "stride": 1, "worker": 0, "round": 0, "lease": [list(A)],
+                     "lease_id": "p.1"})
+    st, lk = {}, threading.Lock()
+    assert RUN.acknowledge_leases(out, c, {}, lk, st, {}) == [(0, "p.1")]
+    assert RUN.read_lease_ack(out, 0)["ready"] == [] and calls == [A]
+    assert RUN.acknowledge_leases(out, c, {}, lk, st, {}) == []          # not before the retry delay
+    st[0] = (st[0][0], st[0][1], st[0][2] - RUN.LEASE_RETRY_S - 1)
+    assert RUN.acknowledge_leases(out, c, {}, lk, st, {}) == [(0, "p.1")] and calls == [A, A]

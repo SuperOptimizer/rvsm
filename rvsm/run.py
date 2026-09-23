@@ -689,8 +689,11 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     # BEFORE the first eviction, which then honours the budget at once
     held0 = cursor_leases(out)
     for lo in held0:
-        keys[lo] = cache.fetch_region(np.array(lo, np.int64), ctx=cfg.ctx, patch=cfg.patch,
-                                      region=cfg.region, evict=False)
+        try:
+            keys[lo] = cache.fetch_region(np.array(lo, np.int64), ctx=cfg.ctx, patch=cfg.patch,
+                                          region=cfg.region, evict=False)
+        except stream.FetchFailed:              # the lease keeper retries it
+            pass
     cache.lease(cache.region_key(lo) for lo in held0)
     n_ev = cache.evict()
     jlog(out, "produce", {"kind": "cache_start", "leased": len(held0), "evicted": n_ev,
@@ -1259,6 +1262,8 @@ def acknowledge_leases(out, cache, keys, clock, state, fetch_kw):
     union: a home stays protected while ANY worker's current lease names it, and a lease is released
     by that worker's next publish. `state` is the keeper's memory: worker -> (lease_id, complete, t)."""
     import numpy as np
+
+    from rvsm import stream
     recs = cursor_records(out)
     leased = sorted({tuple(int(v) for v in lo) for r in recs for lo in r.get("lease") or ()})
     with clock:
@@ -1277,7 +1282,10 @@ def acknowledge_leases(out, cache, keys, clock, state, fetch_kw):
             for lo in homes:
                 k = cache.region_key(lo)
                 if lo not in keys or cache.missing(k):
-                    keys[lo] = cache.fetch_region(np.array(lo, np.int64), evict=False, **fetch_kw)
+                    try:
+                        keys[lo] = cache.fetch_region(np.array(lo, np.int64), evict=False, **fetch_kw)
+                    except stream.FetchFailed:      # not ready; retried after LEASE_RETRY_S
+                        continue
                 if not cache.missing(k):
                     ready.append(list(lo))
             cache.evict()
