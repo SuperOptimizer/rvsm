@@ -75,6 +75,96 @@ def test_prepare_norad_zeroes_only_the_radial_channels():
     assert x[:, L.i_radius].any()
 
 
+# --------------------------------------------------------------------- compact target rows
+
+def _recto_only(compact=True, seed=0, p=8, k=2, sym=0):
+    """A round-0 item: recto has target and weight, verso / midline / thickness are all zero."""
+    rng = np.random.default_rng(seed)
+    ax = np.array([[0.0, 64.0], [16.0, 16.0], [20.0, 20.0]])
+    ct = rng.integers(0, 255, (10, p, p, p), dtype=np.uint8)
+    tg = np.zeros((4, p, p, p), np.uint8)
+    w = np.zeros_like(tg)
+    tg[0] = rng.integers(0, 255, (p, p, p), dtype=np.uint8)
+    w[0] = rng.integers(0, 2, (p, p, p), dtype=np.uint8) * 255
+    return sample.rung_item(ct, tg, w, k, (0, 4, 4), ax, sym=sym, compact=compact,
+                            cm=rng.integers(0, 255, (p // 2,) * 3, dtype=np.uint8),
+                            cx=rng.integers(0, 255, (1, p, p, p), dtype=np.uint8),
+                            lo1=(0, 2, 2), rmax=37.5, meta=np.linspace(0, 1, 5, dtype=np.float32))
+
+
+def _prep_all(item, mode="mask"):
+    L = Config().layout()
+    net = None
+    if mode in ("self", "mix"):
+        torch.manual_seed(0)
+        net = M.build("1m", cin=L.cin, cout=L.cout, verbose=False)
+    cas = prep.Cascade(mode, drop=0.0, noise=True, seed=3, net=net)
+    return prep.prepare(prep.batch1(item), torch.device("cpu"), cascade=cas, layout=L)
+
+
+def test_a_recto_only_item_carries_one_target_row():
+    it = _recto_only()
+    assert tuple(sorted(it)) == tuple(sorted(RUNG_ITEM_KEYS))
+    assert it["tgt"].shape == (1, 8, 8, 8) and it["w"].shape == (1, 8, 8, 8)
+    assert torch.nonzero(it["tch"]).reshape(-1).tolist() == [0] and it["tch"].shape == (4,)
+    assert prep.shapes(it) == prep.shapes(_recto_only(compact=False))
+    t, w = prep.full_tw(it)
+    full = _recto_only(compact=False)
+    assert torch.equal(t, full["tgt"]) and torch.equal(w, full["w"])
+
+
+@pytest.mark.parametrize("sym,mode", [(0, "mask"), (13, "mask"), (47, "off"), (5, "self")])
+def test_prepare_on_a_compact_item_is_prepare_on_the_full_one(sym, mode):
+    a = _prep_all(_recto_only(compact=True, sym=sym), mode)
+    b = _prep_all(_recto_only(compact=False, sym=sym), mode)
+    for u, v in zip(a, b):
+        assert u.shape == v.shape and u.dtype == v.dtype and torch.equal(u, v)
+
+
+def test_a_full_support_item_is_unchanged_by_compact():
+    a, b = _fake_item(), _fake_item()
+    c = sample.rung_item(a["ct"].numpy(), a["tgt"].numpy(), a["w"].numpy(), 2, (0, 4, 4),
+                         np.array([[0.0, 64.0], [16.0, 16.0], [20.0, 20.0]]), compact=True,
+                         cm=a["cm"].numpy(), cx=a["cx"].numpy(), lo1=(0, 2, 2), rmax=37.5,
+                         meta=np.linspace(0, 1, 5, dtype=np.float32))
+    assert set(c) == set(b)
+    for key in b:
+        assert torch.equal(c[key], b[key]), key
+    assert c["tch"].tolist() == [1, 1, 1, 1]
+
+
+def test_a_row_with_target_but_no_weight_is_kept():
+    """The rule is weight OR target: a dropped row must be zero in both, or the expansion is not exact."""
+    tg = np.zeros((4, 4, 4, 4), np.uint8)
+    w = np.zeros_like(tg)
+    tg[2, 1, 1, 1] = 9
+    w[0, 0, 0, 0] = 255
+    tch, t, ww = sample.compact_rows(tg, w)
+    assert tch.tolist() == [1, 0, 1, 0] and t.shape[0] == 2 and ww.shape[0] == 2
+    empty = sample.compact_rows(np.zeros_like(tg), np.zeros_like(w))
+    assert empty[0].tolist() == [0, 0, 0, 0] and empty[1].shape == (0, 4, 4, 4)
+
+
+def test_expand_tw_scatters_each_sample_by_its_own_rows():
+    rng = np.random.default_rng(4)
+    fulls, items = [], []
+    for rows in ([0, 2], [1, 3]):          # same count, different rows: these DO collate
+        tg = np.zeros((4, 4, 4, 4), np.uint8)
+        w = np.zeros_like(tg)
+        for r in rows:
+            tg[r] = rng.integers(1, 255, (4, 4, 4))
+            w[r] = 255
+        tch, t, ww = sample.compact_rows(tg, w)
+        items.append({"tgt": torch.from_numpy(t), "w": torch.from_numpy(ww), "tch": torch.from_numpy(tch)})
+        fulls.append((torch.from_numpy(tg), torch.from_numpy(w)))
+    b = torch.utils.data.default_collate(items)
+    t, w = prep.expand_tw(b["tgt"], b["w"], b["tch"])
+    assert torch.equal(t, torch.stack([f[0] for f in fulls]))
+    assert torch.equal(w, torch.stack([f[1] for f in fulls]))
+    # no `tch` (a grid item written before it existed) means every row is there
+    assert prep.expand_tw(t, w, None)[0] is t
+
+
 def test_sym_apply_t_matches_numpy_for_all_48_symmetries():
     rng = np.random.default_rng(0)
     x = rng.standard_normal((7, 6, 6, 6)).astype(np.float32)
@@ -250,6 +340,26 @@ def test_loader_collates_the_contract(synth_run):
     b = next(iter(dl))
     assert tuple(sorted(b)) == tuple(sorted(RUNG_ITEM_KEYS))
     assert b["ct"].shape[0] == 2 and b["lo"].shape == (2, 3)
+    assert not ds.compact and b["tgt"].shape[1] == 4 and b["tch"].all()   # a batch of 2: full rows
+
+
+def test_loader_at_batch_one_sends_compact_items_that_prepare_to_the_full_ones(synth_run):
+    full = _patches(synth_run, seed=5)
+    comp = _patches(synth_run, seed=5)
+    dl = sample.loader(comp, workers=0, batch=1)
+    assert comp.compact
+    L = synth_run.cfg.layout()
+    fewer = 0
+    for i, (a, b) in enumerate(zip(iter(full), iter(dl))):
+        if i == 12:
+            break
+        fewer += int(b["tgt"].shape[1] < 4)
+        assert b["tch"].shape == (1, 4)
+        pa = prep.prepare(prep.batch1(a), torch.device("cpu"), layout=L)
+        pb = prep.prepare(b, torch.device("cpu"), layout=L)
+        for u, v in zip(pa, pb):
+            assert torch.equal(u, v)
+    assert fewer, "no item of the fixture dropped a row: the test says nothing"
 
 
 def test_a_spilled_val_grid_is_the_grid_and_is_reused(synth_run, tmp_path):

@@ -156,7 +156,7 @@ def _slab(p, shift=0, seed=0):
     return (d < max(p / 8, 2)).astype(np.uint8) * np.uint8(255)
 
 
-def _item(cfg, k=2, seed=0, verso_w=255, dist_w=255):
+def _item(cfg, k=2, seed=0, verso_w=255, dist_w=255, recto_only=False, compact=False):
     """One compact sample with EVERY channel present: CT + context cubes, recto/verso bands, a midline
     code and a thickness code, and a per-channel weight the test can zero."""
     lay = cfg.layout()
@@ -172,8 +172,10 @@ def _item(cfg, k=2, seed=0, verso_w=255, dist_w=255):
                   np.full((p,) * 3, verso_w, np.uint8),
                   np.full((p,) * 3, dist_w, np.uint8),
                   np.full((p,) * 3, dist_w, np.uint8)])
+    if recto_only:                        # round 0: nothing but recto has a target or a weight
+        tg[1:], w[1:] = 0, 0
     ax = np.array([[0.0, 4096.0], [p / 2, p / 2], [-1000.0, -1000.0]])
-    return sample.rung_item(ct, tg, w, k, (0, 0, 0), ax, sym=0,
+    return sample.rung_item(ct, tg, w, k, (0, 0, 0), ax, sym=0, compact=compact,
                             cm=(recto[::2, ::2, ::2]).copy(),
                             cx=rng.integers(0, 255, (1, p, p, p), dtype=np.uint8),
                             lo1=(0, 0, 0), rmax=float(4 * p),
@@ -381,6 +383,34 @@ def test_evaluate_reports_a_threshold_free_dice(full_cfg):
     assert 0.0 < out["dice_soft"] < out["dice_best"]
     only3 = TR.evaluate(_Shrunk(tg, lay.cout, lay.nprob), [it], torch.device("cpu"), lay, rungs=(3,))
     assert only3["n_scored"] == 0                                    # the rung filter
+
+
+LOSS_KEYS = ("loss", "bce", "dice", "sdist", "eikonal", "thick", "pair_bce", "pair_dice", "ect", "excl",
+             "selfcons", "skel", "affinity", "pair_support")
+
+
+def test_compact_items_train_exactly_like_full_ones(tiny_cfg):
+    """The step loop on round-0 items sent with one target row (`compact`) logs the same losses as on the
+    same items sent with all four, and ends on bit-identical weights: the rows are rebuilt before any
+    loss sees them."""
+    import random
+    logs, states = [], []
+    for compact in (False, True):
+        cfg = replace(tiny_cfg, steps=20, eval_every=20,
+                      out=str(__import__("pathlib").Path(tiny_cfg.out).parent / f"c{compact:d}"))
+        torch.manual_seed(0)
+        np.random.seed(0)
+        random.seed(0)
+        ck = TR.train(cfg, patches_factory=_factory(cfg, recto_only=True, compact=compact), device="cpu")
+        states.append(torch.load(ck, map_location="cpu", weights_only=False)["model"])
+        rows = [json.loads(q) for q in
+                (__import__("pathlib").Path(cfg.out) / "logs" / "train.jsonl").read_text().splitlines()]
+        logs.append([{k: v for k, v in r.items() if k in ("step", "rung") or k in LOSS_KEYS}
+                     for r in rows if "loss" in r])
+    assert logs[0] and logs[0] == logs[1]
+    assert states[0].keys() == states[1].keys()
+    for k in states[0]:
+        assert torch.equal(states[0][k], states[1][k]), k
 
 
 def test_a_run_with_no_verso_and_no_distance_stores_still_trains(tiny_cfg):

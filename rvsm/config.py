@@ -146,7 +146,7 @@ class Layout:
 
 # The keys of one sampled training item. `sample.rung_item` builds exactly these and the collate walks
 # them, so a key added here without a producer fails loudly instead of silently vanishing.
-RUNG_ITEM_KEYS = ("ct", "tgt", "w", "lo", "cyx", "sym", "rung", "norm", "cm", "cx", "lo1", "cyx1",
+RUNG_ITEM_KEYS = ("ct", "tgt", "w", "tch", "lo", "cyx", "sym", "rung", "norm", "cm", "cx", "lo1", "cyx1",
                   "rmax", "meta")
 
 # Fields a resume is allowed to differ in: a longer run, a different eval cadence, different hardware.

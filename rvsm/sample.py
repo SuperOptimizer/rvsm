@@ -95,13 +95,32 @@ def sym_apply(sym, x, tg):
 
 # --------------------------------------------------------------------------- one compact sample
 
-def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None, rmax=0.0, meta=None):
+def compact_rows(tg, w):
+    """(tch, tg, w) with only the target rows that carry anything: `tch` (T,) uint8 is 1 for a row whose
+    weight OR target is non-zero anywhere, and `tg` / `w` keep just those rows, in channel order. Every
+    row present: `tg` / `w` come back as they were. A row that is dropped is all zeros in BOTH, so
+    `prep.expand_tw` (zeros elsewhere) rebuilds the full pair bit for bit."""
+    T = int(tg.shape[0])
+    tch = (tg.reshape(T, -1).any(1) | w.reshape(T, -1).any(1)).astype(np.uint8)
+    if tch.all():
+        return tch, tg, w
+    keep = np.flatnonzero(tch)
+    return tch, np.ascontiguousarray(tg[keep]), np.ascontiguousarray(w[keep])
+
+
+def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None, rmax=0.0, meta=None,
+              compact=False):
     """The compact sample the loader yields: everything uint8, so a 256^3 sample is ~200 MB instead of
     the ~1 GB of float32 a built model input would be. It carries EXACTLY `config.RUNG_ITEM_KEYS`:
 
     ct   (1 + nctx, Z, Y, X) uint8: the CT cube and the context cubes as read, not z-scored
     tgt  (T, Z, Y, X) uint8: the target fields (recto, verso, midline, thickness), CT-air zeroed
     w    (T, Z, Y, X) uint8: the per-voxel weight, 255 = 1.0
+    tch  (T,) uint8: which of the T target rows `tgt` / `w` carry, in order. All ones unless `compact`:
+         then only the rows with any weight or target (`compact_rows`) are sent -- round 0 has no verso
+         and no distance stores, so a 256^3 item drops 3 of 4 rows (~96 MB of ~320 MB of pageable
+         host-to-device copy). `prep.prepare` scatters them back into the full (T, ...) pair, zeros
+         elsewhere, before anything reads them; `prep.full_tw` does the same for a CPU consumer.
     lo   (3,) int64: the corner, in rung-k voxels
     cyx  (2, Z) float64: the scroll axis (y, x) at each z of the cube -- what `radial_t` interpolates
     sym  (): the cube symmetry index drawn by the worker (0 = identity), applied on the GPU
@@ -133,9 +152,15 @@ def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None
     z1 = np.arange(int(p[0])) + lo1[0]
     cyx1 = np.stack([np.interp(z1, a1[0], a1[1]), np.interp(z1, a1[0], a1[2])])
     meta = np.zeros(len(SM.META_RANGE), np.float32) if meta is None else np.asarray(meta, np.float32)
+    tg, w = np.asarray(tg), np.asarray(w)
+    if compact:
+        tch, tg, w = compact_rows(tg, w)
+    else:
+        tch = np.ones(int(tg.shape[0]), np.uint8)
     return {"ct": torch.from_numpy(ct),
             "tgt": torch.from_numpy(np.ascontiguousarray(tg)),
             "w": torch.from_numpy(np.ascontiguousarray(w)),
+            "tch": torch.from_numpy(tch),
             "lo": torch.from_numpy(np.ascontiguousarray(lo)),
             "cyx": torch.from_numpy(np.ascontiguousarray(cyx)),
             "sym": torch.tensor(int(sym)), "rung": torch.tensor(int(k)),
@@ -193,6 +218,9 @@ class Patches(torch.utils.data.IterableDataset):
         self.heldout = list(heldout)
         self._ax_in, self._meta_in, self._records = ax, meta, region_records
         self.pyr = self.cat = self.ax = self.order = None
+        # send only the target rows with support (`rung_item(compact=True)`); `loader` turns it on for
+        # batch 1 -- items with different row sets would not collate
+        self.compact = False
 
     # ---- opening (in the worker, never in the parent) --------------------
 
@@ -549,7 +577,7 @@ class Patches(torch.utils.data.IterableDataset):
         tg, w = self._rung_target(k, lo, ct)
         sym = int(draw_sym(rng, tuple(p))) if self.sym else 0
         cx = [self._ctx_cube(rec, k, d, lo, ct.shape) for d in self.ctx] if self.ctx else ()
-        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, self.ax, sym,
+        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, self.ax, sym, compact=self.compact,
                          **self._plane_extras(k), **self._cascade_extras(k, lo, ct.shape, rec=rec))
 
     def _dead(self, rec):
@@ -680,7 +708,9 @@ def grid_key(cfg, corners, round_, heads, sources=None):
     return hashlib.sha256(json.dumps({
         "corners": [[k, [int(v) for v in lo]] for k, lo in corners], "round": int(round_),
         "heads": list(heads), "schema": GRID_SCHEMA, "target_def": TG.TARGET_DEF,
-        "keys": list(RUNG_ITEM_KEYS), "patch": int(cfg.patch), "ctx": [int(v) for v in cfg.ctx],
+        # `tch` is how the rows travel, not what they hold: a grid item is always full, so it stays out of
+        # the key and a grid built before it existed is reused (`prep.expand_tw` reads its absence as full)
+        "keys": [q for q in RUNG_ITEM_KEYS if q != "tch"], "patch": int(cfg.patch), "ctx": [int(v) for v in cfg.ctx],
         "channels": [str(c) for c in cfg.channels], "planes": str(cfg.planes),
         "rungs": [int(v) for v in cfg.rungs], "sources": sources or []},
         sort_keys=True).encode()).hexdigest()[:16]
@@ -828,7 +858,13 @@ class DiskGrid:
 def loader(patches, workers=0, batch=1, pin_memory=True):
     """Workers start as fresh processes (forkserver), never forks: the parent has usually opened zarr
     already, and its asyncio loop thread does not survive a fork -- which breaks streamed reads in a way
-    that only shows up minutes later."""
+    that only shows up minutes later.
+
+    At batch 1 a `Patches` sends compact items (only the target rows with support, `rung_item`'s `tch`);
+    at a larger batch every item carries all T rows, because two items with different row sets do not
+    collate."""
+    if isinstance(patches, Patches):
+        patches.compact = int(batch) == 1
     return torch.utils.data.DataLoader(patches, batch_size=batch, num_workers=int(workers),
                                        pin_memory=bool(pin_memory), persistent_workers=workers > 0,
                                        prefetch_factor=2 if workers else None,

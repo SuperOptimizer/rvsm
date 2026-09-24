@@ -15,7 +15,7 @@ def test_default_layout_is_21_in_14_out():
 
 
 def test_rung_item_keys_are_frozen():
-    assert RUNG_ITEM_KEYS == ("ct", "tgt", "w", "lo", "cyx", "sym", "rung", "norm", "cm", "cx",
+    assert RUNG_ITEM_KEYS == ("ct", "tgt", "w", "tch", "lo", "cyx", "sym", "rung", "norm", "cm", "cx",
                               "lo1", "cyx1", "rmax", "meta")
 
 

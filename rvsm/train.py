@@ -514,7 +514,7 @@ def region_panels(grid, region=1024, n=4):
         if r not in per:
             per[r] = []
             order.append(r)
-        t, w = torch.as_tensor(it["tgt"])[0], torch.as_tensor(it["w"])[0]
+        t, w = (q[0] for q in prep.full_tw(it))
         per[r].append((float(((t >= 128) & (w > 0)).float().mean()), i, _radius_frac(it)))
     out = []
     for r in order:

@@ -130,8 +130,40 @@ def zscore_cubes_(img, norm, dtype):
 
 def shapes(item):
     """(stem channels, head-target channels) of one compact sample."""
+    tch = item.get("tch")
     return (int(item["ct"].shape[0]) + 4 + (1 if item.get("cm") is not None else 0) + n_planes_b(item),
-            int(item["tgt"].shape[0]))
+            int(tch.shape[-1]) if tch is not None else int(item["tgt"].shape[0]))
+
+
+def expand_tw(tgt, w, tch):
+    """The full (B, T, Z, Y, X) target and weight from a batch whose `tgt` / `w` carry only the rows
+    `tch` (B, T) marks (`sample.compact_rows`): each carried row back at its channel index, zeros
+    elsewhere -- which is exactly what the dropped rows held. `tch` None (a grid item written before it
+    existed) or every row carried: returned as they are. On whatever device the tensors are on, with no
+    host sync: the row indices come from a stable sort of `tch`, not from `nonzero`."""
+    if tch is None:
+        return tgt, w
+    B, T, n = int(tgt.shape[0]), int(tch.shape[-1]), int(tgt.shape[1])
+    if n == T:
+        return tgt, w
+    idx = torch.argsort(tch.reshape(B, T).to(tgt.device, torch.int32), dim=1, descending=True,
+                        stable=True)[:, :n]
+    idx = idx.view(B, n, 1, 1, 1).expand_as(tgt)
+    out = []
+    for v in (tgt, w):
+        full = v.new_zeros((B, T) + tuple(v.shape[2:]))
+        out.append(full.scatter_(1, idx, v))
+    return tuple(out)
+
+
+def full_tw(item):
+    """(tgt, w) of one item or one collated batch with all T rows, on the CPU: `expand_tw` for a
+    consumer that reads the uint8 rows directly instead of going through `prepare`."""
+    tgt, w, tch = item["tgt"], item["w"], item.get("tch")
+    if tgt.dim() == 5:
+        return expand_tw(tgt, w, tch)
+    t, ww = expand_tw(tgt[None], w[None], tch[None] if tch is not None else None)
+    return t[0], ww[0]
 
 
 def batch1(item):
@@ -154,6 +186,8 @@ def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade
     against the result."""
     to = lambda t: t.to(dev, non_blocking=non_blocking)  # noqa: E731
     ct, tgt, w = to(b["ct"]), to(b["tgt"]), to(b["w"])
+    # a compact item carries only its supported target rows: the full (B, T) pair, before anything reads it
+    tgt, w = expand_tw(tgt, w, to(b["tch"]) if b.get("tch") is not None else None)
     lo, cyx, norm, rung = to(b["lo"]), to(b["cyx"]), to(b["norm"]), to(b["rung"])
     B, C, S = ct.shape[0], ct.shape[1], ct.shape[2:]
     casc = 1 if b.get("cm") is not None else 0
