@@ -458,6 +458,8 @@ class TeacherBank:
         from rvsm import teachers as T
         self.cfg, self.out, self.device, self.backend = cfg, str(out), device, str(backend)
         self.fast = {}
+        self.on_device = True               # False while the weights are parked in host memory (`offload`)
+        self._host = {}                     # teacher -> pinned host copies of its parameters and buffers
         names = [n for n in (cfg.teacher_ckpts or {})] or ["recto", "m7"]
         self.items = []
         for n in names:
@@ -481,9 +483,73 @@ class TeacherBank:
                                  if self.cfg.teacher_bf16 else None)
         return row[3]
 
+    def load(self):
+        """Load every teacher now (instead of lazily in the first pass); returns the seconds it took."""
+        t0 = time.time()
+        self.onload()
+        for row in self.items:
+            self._net(row)
+        return time.time() - t0
+
+    def movable(self):
+        """Can the weights be parked in host memory? The torch backend on CUDA only (a TensorRT engine
+        holds its own copy, and a CPU bank has nowhere to move from)."""
+        return self.backend == "torch" and str(self.device or "").startswith("cuda") and \
+            bool(TEACHER_OFFLOAD)
+
+    @staticmethod
+    def _tensors(net):
+        return list(net.parameters()) + list(net.buffers())
+
+    def offload(self):
+        """Park the loaded teachers' weights in PINNED host memory and give their VRAM back; returns the
+        seconds it took (None: nothing to do). The modules, and the graphs `torch.compile` built for
+        them, stay: each parameter keeps its identity and only its `.data` moves, and back on the card
+        the compiled forward's guards (device, dtype, shape, stride) pass again -- no recompile
+        (measured, laptop 5080: recto + m7, 0.91 GB: 1.4 s out the first time, 0.07 s back, 0 new
+        graphs). The teachers are frozen, so the host copy made on the first offload is kept and every
+        later offload is only a pointer swap."""
+        if not self.on_device or not self.movable():
+            return None
+        import torch
+        t0 = time.time()
+        for row in self.items:
+            if row[3] is None:
+                continue
+            ts = self._tensors(row[3])
+            hs = self._host.get(row[0])
+            if hs is None:
+                hs = [torch.empty(t.shape, dtype=t.dtype, pin_memory=True) for t in ts]
+                for t, h in zip(ts, hs):
+                    h.copy_(t.data, non_blocking=True)
+                torch.cuda.synchronize()
+                self._host[row[0]] = hs
+            for t, h in zip(ts, hs):
+                t.data = h
+        self.on_device = False
+        torch.cuda.empty_cache()
+        return time.time() - t0
+
+    def onload(self):
+        """The weights back on the card (`offload`'s inverse); returns the seconds (None: already there)."""
+        if self.on_device:
+            return None
+        import torch
+        t0 = time.time()
+        dev = torch.device(self.device)
+        for row in self.items:
+            if row[3] is None:
+                continue
+            for t, h in zip(self._tensors(row[3]), self._host[row[0]]):
+                t.data = h.to(dev, non_blocking=True)
+        torch.cuda.synchronize()
+        self.on_device = True
+        return time.time() - t0
+
     def footprint(self):
-        """Bytes of the loaded teachers' parameters and buffers (0 before the first pass loads them)."""
-        return sum(module_bytes(row[3]) for row in self.items)
+        """Bytes of the loaded teachers' parameters and buffers ON THE CARD (0 before the first pass loads
+        them, and while they are parked in host memory)."""
+        return sum(module_bytes(row[3]) for row in self.items) if getattr(self, "on_device", True) else 0
 
     def read(self, ct, lo, size, pyr=None):
         """Every teacher's CT for a region, read ahead of its pass (`infer.teacher_read`): the producer's
@@ -497,6 +563,7 @@ class TeacherBank:
         as uint8 TENSORS on the device: the teachers' float planes never leave the card (the host-side
         fuse of two 1024^3 float32 volumes was ~40 s a region)."""
         from rvsm import infer
+        self.onload()                       # never a pass on parked weights
         ps, names = [], []
         for i, row in enumerate(self.items):
             net = self._net(row)
@@ -528,6 +595,9 @@ def torch_full_like_u8(t, v):
 
 
 STUDENT_COMPILE_MODE = "default"   # the producer's student: torch.compile without autotuning
+# park the teacher bank's weights in host memory while no teacher pass is left in the window
+# (`TeacherBank.offload`); RVSM_TEACHER_OFFLOAD=0 keeps them on the card
+TEACHER_OFFLOAD = os.environ.get("RVSM_TEACHER_OFFLOAD", "1") not in ("0", "false", "no")
 
 
 class StudentSlot:
@@ -999,6 +1069,12 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if job == "teacher" and bank is None:
                     bank = TeacherBank(cfg, out, device=device, backend=backend)
                     pre.pop((lo, job), None)        # read before the bank existed: no CT in it
+                    gate.pass_acquire(job)
+                    try:
+                        jlog(out, "produce", {"kind": "bank_build", "s": round(bank.load(), 2),
+                                              "gb": round(bank.footprint() / (1 << 30), 3)})
+                    finally:
+                        gate.release()
                 _rg = st.get("verso_regen") or {}
                 _frozen = _rg.get("ckpt") if (job == "verso" and round_ == 0 and cat.done("verso", lo)) else None
                 if job in ("verso", "self") and (rslot.get(path=_frozen) if _frozen else
@@ -1045,6 +1121,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     busy.add(lo)
                 gate.pass_acquire(job)              # no GPU fields beside the pass (and none cached)
                 try:
+                    if bank is not None:
+                        _bank_park(out, bank, job, gpu_units[i:])
                     _vram_check(out, job, lo, vram_cap)
                     _cuda_peak(reset=vram_cap is not None)   # this pass's own peak, below
                     t1 = time.time()
@@ -1123,6 +1201,14 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                     leased=leased)
                     release_backlog()
             gate.set_pending(())                    # recomputed on the next pass over the window
+            if bank is not None and round_ >= 1:
+                # the round-0 teachers have no further use: drop them (VRAM and pinned host copies)
+                gb = bank.footprint()
+                bank = None
+                _empty_cuda()
+                jlog(out, "produce", {"kind": "bank_release", "round": round_,
+                                      "gb": round(gb / (1 << 30), 3),
+                                      "allocated_gb": round(_cuda_alloc() / (1 << 30), 3)})
             for k in [k for k in pre if k not in gpu_units]:
                 pre.pop(k)                          # a read for a unit this pass no longer wants
             if not did:
@@ -1159,6 +1245,45 @@ def _vram():
     except Exception:  # noqa: BLE001
         pass
     return {}
+
+
+def _bank_park(out, bank, job, rest):
+    """Before a unit's pass (under the gpu lock): the teacher bank's weights go to host memory when no
+    teacher pass is left in this pass over the window (`rest`: this unit and the ones after it), and
+    back to the card before a teacher pass -- so a verso / self pass has the VRAM the bank held.
+    Logs `bank_offload` / `bank_onload` with the seconds each took."""
+    if job == "teacher":
+        s = bank.onload()
+        kind = "bank_onload"
+    elif not any(j == "teacher" for _, j in rest):
+        s = bank.offload()
+        kind = "bank_offload"
+    else:
+        return None
+    if s is not None:
+        jlog(out, "produce", {"kind": kind, "s": round(s, 3), "for": job,
+                              "allocated_gb": round(_cuda_alloc() / (1 << 30), 3)}, echo=False)
+    return s
+
+
+def _cuda_alloc():
+    try:
+        import torch
+        return int(torch.cuda.memory_allocated()) if torch.cuda.is_available() else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _empty_cuda():
+    try:
+        import gc
+
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def module_bytes(mod):

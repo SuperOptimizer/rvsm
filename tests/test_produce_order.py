@@ -152,3 +152,86 @@ def test_vram_report_splits_the_card_between_bank_student_and_passes(tmp_path):
     assert got[-1]["kind"] == "vram_report" and got[-1]["why"] == "periodic"
     assert RUN.module_bytes(None) == 0
 
+
+# --------------------------------------------------------------------------- the teacher bank off the card
+
+def _fake_bank(dev, backend="torch"):
+    import torch
+    bank = RUN.TeacherBank.__new__(RUN.TeacherBank)
+    bank.cfg, bank.out, bank.device, bank.backend = None, "", dev, backend
+    bank.fast, bank.on_device, bank._host = {}, True, {}
+    torch.manual_seed(0)
+    net = torch.nn.Sequential(torch.nn.Conv3d(1, 64, 3, padding=1), torch.nn.BatchNorm3d(64),
+                              torch.nn.Conv3d(64, 64, 3, padding=1)).eval()
+    bank.items = [["recto", None, "x", net.to(dev)], ["m7", None, "y", None]]
+    return bank
+
+
+def test_the_teacher_bank_parks_its_weights_in_host_memory_and_back():
+    """`offload` gives the weights' VRAM back (the parameters are the same objects, now pinned host
+    tensors) and a compiled forward runs again after `onload` WITHOUT a recompile and with the same
+    output; a second cycle reuses the host copy. `probs_u8` onloads by itself."""
+    import pytest
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    from torch._dynamo.utils import counters
+    bank = _fake_bank("cuda")
+    net = bank.items[0][3]
+    fn = torch.compile(net, dynamic=False)
+    x = torch.rand(1, 1, 16, 16, 16, device="cuda")
+    with torch.no_grad():
+        y0 = fn(x)
+    g0 = int(counters["stats"]["unique_graphs"])
+    params = list(net.parameters())
+    fp = bank.footprint()
+    assert fp == RUN.module_bytes(net) > 0
+    for _ in range(2):
+        before = torch.cuda.memory_allocated()
+        s = bank.offload()
+        assert s is not None and not bank.on_device and bank.footprint() == 0
+        assert all(p.device.type == "cpu" and p.is_pinned() for p in net.parameters())
+        assert before - torch.cuda.memory_allocated() >= fp        # the weights' VRAM is given back
+        assert bank.offload() is None                    # already parked
+        assert bank.onload() is not None and bank.on_device
+        assert bank.onload() is None
+        assert [id(p) for p in net.parameters()] == [id(p) for p in params]
+        with torch.no_grad():
+            y1 = fn(x)
+        assert torch.equal(y0, y1)
+    assert int(counters["stats"]["unique_graphs"]) == g0, "the compiled teacher recompiled"
+    assert len(bank._host["recto"]) == len(list(net.parameters())) + len(list(net.buffers()))
+
+
+def test_the_bank_is_parked_only_when_no_teacher_pass_is_left(tmp_path, monkeypatch):
+    """`_bank_park`: back on the card before a teacher pass, off it before a verso / self pass once no
+    teacher unit is left in the window's pass, and left alone while one is; a TensorRT or CPU bank never
+    moves."""
+    calls = []
+
+    class B:
+        def onload(self):
+            calls.append("on")
+            return 0.1
+
+        def offload(self):
+            calls.append("off")
+            return 0.2
+    out = str(tmp_path)
+    b = B()
+    assert RUN._bank_park(out, b, "verso", [((0, 0, 0), "verso"), ((0, 0, 1), "teacher")]) is None
+    assert calls == []
+    assert RUN._bank_park(out, b, "teacher", [((0, 0, 1), "teacher")]) == 0.1
+    assert RUN._bank_park(out, b, "verso", [((0, 0, 2), "verso")]) == 0.2
+    assert calls == ["on", "off"]
+    import json
+    with open(os.path.join(out, "logs", "produce.jsonl")) as f:
+        kinds = [json.loads(line)["kind"] for line in f]
+    assert kinds == ["bank_onload", "bank_offload"]
+    assert not _fake_bank("cpu").movable()
+    assert _fake_bank("cpu").offload() is None
+    import torch
+    if torch.cuda.is_available():
+        assert not _fake_bank("cuda", backend="trt").movable()
+        monkeypatch.setattr(RUN, "TEACHER_OFFLOAD", False)
+        assert not _fake_bank("cuda").movable()
