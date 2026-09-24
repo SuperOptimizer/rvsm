@@ -295,8 +295,9 @@ A100 with portable flags, copy the two teacher `.pth` files from the desk (`/ves
   existing recto teacher store for the same region (expect dice > 0.99 within one volcomp build); one
   student region in `--sign -1` compared to the pod's v2 output for the same checkpoint (bit-identical
   expected on the same GPU build, dice > 0.99 across builds).
-- First real run: watch `logs/produce.jsonl` (s/region per pass), `logs/train.jsonl` (Mvox/s, train_wait_s
-  must stay ~0 after warm-up), VRAM per process vs the budget table; `rvsm eval --tifxyz` on the held-out
+- First real run: watch `logs/produce.jsonl` (s/region per pass), `logs/train.jsonl` (Mvox/s, step_s; train_wait_s --
+  seconds per 20-step row blocked on the prefetch, fetch_s = loader+H2D mean per batch -- must stay ~0
+  after warm-up), VRAM per process vs the budget table; `rvsm eval --tifxyz` on the held-out
   regions against the meshes at 10k and 20k steps; compare to u3/u4 numbers (recall 0.82, continuity
   0.70, merge 0.33, ERL 409 um at 21k).
 

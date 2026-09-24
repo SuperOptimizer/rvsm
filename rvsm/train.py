@@ -746,15 +746,36 @@ class DevicePrefetch:
     `close()` is the SHUTDOWN PROTOCOL (review T19): it stops handing out batches, waits (at most
     `timeout` seconds) for the fetch in flight, and shuts the loader's workers down. The round
     transition calls it before it resets the cursor directory; relying on the generator's GC left a
-    pending fetch and the persistent workers free to publish old-round positions into the new round."""
+    pending fetch and the persistent workers free to publish old-round positions into the new round.
 
-    def __init__(self, src, dev, side=True, stop=None):
+    TIMING (host clocks only, never a CUDA sync): `take_wait_s()` is the seconds the CALLER spent
+    blocked waiting for a batch since the last take (0 when the helper is ahead); `take_fetch_s()` is
+    the helper's own mean seconds per batch (loader `next` + the host side of the H2D copy) since the
+    last take. `ahead=True` runs the helper thread on a CPU device too (tests); on CPU it is otherwise
+    off and both clocks time the caller's own `next`."""
+
+    def __init__(self, src, dev, side=True, stop=None, ahead=None):
         self.src, self.dev, self.side, self.stop = src, dev, bool(side), stop
+        self.ahead = dev.type == "cuda" if ahead is None else bool(ahead)
         self._it = self._fut = self._worker = None
         self._closed = False
         self.clean = None           # after close(): True when nothing was still running
+        self._wait_s, self._fetch_s, self._fetch_n = 0.0, 0.0, 0
+
+    def take_wait_s(self):
+        """Seconds the caller blocked on the next batch since the last call."""
+        w, self._wait_s = self._wait_s, 0.0
+        return w
+
+    def take_fetch_s(self):
+        """The helper's mean seconds per batch (loader next + H2D copy) since the last call; None if
+        no batch arrived."""
+        s, n = self._fetch_s, self._fetch_n
+        self._fetch_s, self._fetch_n = 0.0, 0
+        return s / n if n else None
 
     def _fetch(self, stream):
+        t = time.perf_counter()
         try:
             item = next(self._it)
         except StopIteration:
@@ -762,24 +783,29 @@ class DevicePrefetch:
         b = _batch(item)
         if stream is None:
             return {k: (v.to(self.dev, non_blocking=True) if torch.is_tensor(v) else v)
-                    for k, v in b.items()}, None
+                    for k, v in b.items()}, None, time.perf_counter() - t
         with torch.cuda.stream(stream):
             d = {k: (v.to(self.dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
             ev = torch.cuda.Event()
             ev.record(stream)
-        return d, ev
+        return d, ev, time.perf_counter() - t
 
     def __iter__(self):
         self._it = iter(self.src)
-        if self.dev.type != "cuda":
+        if not self.ahead:
             while not self._closed:
+                t = time.perf_counter()
                 try:
                     item = next(self._it)
                 except StopIteration:
                     return
+                dt = time.perf_counter() - t
+                self._wait_s += dt
+                self._fetch_s += dt
+                self._fetch_n += 1
                 yield item
             return
-        stream = torch.cuda.Stream(self.dev) if self.side else None
+        stream = torch.cuda.Stream(self.dev) if self.side and self.dev.type == "cuda" else None
         self._worker = _Fetcher()
         fetch = self._fetch
         self._fut = self._worker.submit(lambda: fetch(stream))
@@ -789,8 +815,10 @@ class DevicePrefetch:
                 self._fut = None
                 return
             self._fut = self._worker.submit(lambda: fetch(stream))
-            cur, ev = got
+            cur, ev, dt = got
             got = None
+            self._fetch_s += dt
+            self._fetch_n += 1
             if ev is not None:
                 torch.cuda.current_stream(self.dev).wait_event(ev)
                 for v in cur.values():
@@ -802,12 +830,16 @@ class DevicePrefetch:
         """The fetch in flight, polled every second so a `stop()` request (the RAM guard) ends the
         iteration even while a loader is stuck: the pending fetch is then abandoned, not joined."""
         import concurrent.futures as cf
-        while True:
-            try:
-                return self._fut.result(timeout=1.0)
-            except cf.TimeoutError:
-                if self.stop is not None and self.stop():
-                    return None
+        t = time.perf_counter()
+        try:
+            while True:
+                try:
+                    return self._fut.result(timeout=1.0)
+                except cf.TimeoutError:
+                    if self.stop is not None and self.stop():
+                        return None
+        finally:
+            self._wait_s += time.perf_counter() - t
 
     def close(self, timeout=QUIESCE_S):
         """Quiesce: no further batch, the fetch in flight finished (or given up on after `timeout`
@@ -832,6 +864,10 @@ class DevicePrefetch:
         _shutdown_loader(self.src, self._it)
         self.clean = clean
         return clean
+
+
+def _r3(x):
+    return None if x is None else round(float(x), 3)
 
 
 def to_device_iter(src, dev, side=True, stop=None):
@@ -1037,7 +1073,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
           "fingerprint": cfg.fingerprint()})
 
     ph = _Phases(dev, os.environ.get("RVSM_PROFILE", "") not in ("", "0"))
-    t0, micro, rung_n, wait_s = time.time(), 0, {}, 0.0
+    t0, s0, micro, rung_n = time.time(), step, 0, {}
     src = patches_factory() if patches_factory is not None else iter(())
     def stopping():
         return stop_now() if stop_now is not None else None
@@ -1047,7 +1083,6 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     loss = bce = dice = None
     reg_log, aux_log = {}, {}
     nvox = 0
-    tw = time.time()
     for item in src:
         if step >= nsteps:
             break
@@ -1056,7 +1091,6 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         why_stop = stopping()
         if why_stop:
             break
-        wait_s += time.time() - tw
         ph.start()
         b = _batch(item)
         ph.mark("h2d_wait")
@@ -1161,7 +1195,6 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         (loss / max(int(accum), 1)).backward()
         ph.mark("backward")
         micro += 1
-        tw = time.time()
         if micro < int(accum):
             continue
         micro = 0
@@ -1196,8 +1229,12 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                   "rung": {str(k): rung_n[k] for k in sorted(rung_n)},
                   "self_p": round(float(cas.self_p), 4) if cas.on else None,
                   "w_prob_dice": float(cfg.loss_prob_dice), "w_pair": float(cfg.loss_pair),
-                  "train_wait_s": round(wait_s, 3), **ph.take()})
-            rung_n, wait_s, nvox, t0 = {}, 0.0, 0, time.time()
+                  # train_wait_s: seconds the step loop BLOCKED on the prefetch over this row (true
+                  # loader starvation); fetch_s: the helper's mean seconds per batch (loader + H2D);
+                  # step_s: wall seconds per optimizer step over the row
+                  "train_wait_s": round(src.take_wait_s(), 3), "fetch_s": _r3(src.take_fetch_s()),
+                  "step_s": round(dt / max(step - s0, 1), 3), **ph.take()})
+            rung_n, nvox, t0, s0 = {}, 0, time.time(), step
         if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:
             why_stop = stopping()
             if why_stop:
@@ -1210,7 +1247,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                                           "temps": temps, "out": str(out), "ckpt": str(ck),
                                           "quiesce": src.close}):
                 break
-            t0, tw = time.time(), time.time()
+            t0, s0 = time.time(), step
     why_stop = why_stop or stopping()      # the prefetch ends its iteration when stop() is set
     if why_stop:
         # `stop_now()` -> a reason: the supervisor's RAM guard asks the trainer to leave NOW (a leak was

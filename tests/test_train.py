@@ -880,3 +880,42 @@ def test_one_panel_per_held_out_region_with_the_most_sheet(full_cfg, tmp_path):
         [f"val_026000_r{k}.png" for k in range(3)]
     idx = (tmp_path / "eval" / "val_026000_regions.txt").read_text().splitlines()
     assert idx[0].startswith("k") and idx[2].split("\t")[1] == "2048,0,0"
+
+
+def _slow_items(n, sleep):
+    import time as _t
+    for _ in range(n):
+        _t.sleep(sleep)
+        yield {"x": torch.zeros(1, 2), "rung": torch.tensor([2])}
+
+
+@pytest.mark.parametrize("ahead", [True, False])
+def test_prefetch_wait_is_the_loader_starvation_when_the_loader_is_slow(ahead):
+    """A 50 ms loader and an instant consumer: the caller blocks ~50 ms per batch (train_wait_s), and
+    the helper's own time per batch (fetch_s) is ~50 ms."""
+    pf = TR.DevicePrefetch(_slow_items(8, 0.05), torch.device("cpu"), ahead=ahead)
+    got = list(pf)
+    assert len(got) == 8
+    w, f = pf.take_wait_s(), pf.take_fetch_s()
+    assert 0.8 * 8 * 0.05 < w < 8 * 0.05 + 0.3
+    assert 0.045 < f < 0.1
+    assert pf.take_wait_s() == 0.0 and pf.take_fetch_s() is None        # take resets
+
+
+def test_prefetch_wait_is_zero_when_the_consumer_is_the_bottleneck():
+    """A 50 ms loader and a 150 ms consumer: the helper is always ahead, so after the first batch the
+    caller never waits (train_wait_s ~0) while fetch_s still reads the loader's ~50 ms."""
+    import time as _t
+    pf = TR.DevicePrefetch(_slow_items(8, 0.05), torch.device("cpu"), ahead=True)
+    it = iter(pf)
+    next(it)
+    pf.take_wait_s()                                     # the cold first fetch is a real wait
+    n = 0
+    while True:
+        _t.sleep(0.15)                                   # the step on the batch just handed out
+        if next(it, None) is None:
+            break
+        n += 1
+    assert n == 7
+    assert pf.take_wait_s() < 0.05
+    assert 0.045 < pf.take_fetch_s() < 0.1

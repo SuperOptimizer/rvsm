@@ -153,8 +153,12 @@ Before the production run, the plan requires:
    bit-identical expected on the same GPU build, **dice > 0.99 across builds**. Note the floor: two eager
    bf16+cuDNN runs of the same region agree only to dice 0.994 / max 0.11, so tolerances must be looser
    than that (`runpod-5090-verso.md`).
-4. During the first run: watch `logs/produce.jsonl` (s/region per pass), `logs/train.jsonl` (Mvox/s, and
-   **`train_wait_s` must stay ~0 after warm-up**), VRAM per process against the §6 table; then
+4. During the first run: watch `logs/produce.jsonl` (s/region per pass), `logs/train.jsonl` (Mvox/s, `step_s`, and
+   **`train_wait_s` must stay ~0 after warm-up**; per 20-step row: `train_wait_s` = seconds the step loop
+   actually blocked on `DevicePrefetch` for its next batch, `fetch_s` = the prefetch helper's mean seconds
+   per batch (loader `next` + host side of the H2D copy), `step_s` = wall seconds per optimizer step;
+   host clocks only, no CUDA sync. Before 2026-09-24 `train_wait_s` also counted the grad gate, optimizer,
+   EMA and logging and read a constant ~5.6 s on paris4), VRAM per process against the §6 table; then
    `rvsm eval --tifxyz` on the held-out regions at 10k and 20k steps, compared to u3/u4:
    **recall@4 0.822, continuity 0.705, merge_frac 0.331, ERL 409 µm at 21k** (rationale §2.1).
 
