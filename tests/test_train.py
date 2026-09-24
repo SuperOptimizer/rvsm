@@ -837,14 +837,15 @@ def test_one_panel_per_held_out_region_with_the_most_sheet(full_cfg, tmp_path):
             items.append(it)
     pan = TR.region_panels(items, region=1024)
     assert [p[0] for p in pan] == [(0, 0, 0), (2048, 0, 0), (4096, 0, 0)]
-    assert [[int(i["lo"][0]) % 2048 for i in p[2]] for p in pan] == [[8, 32, 16, 0]] * 3
+    assert [[int(items[i]["lo"][0]) % 2048 for i in p[2]] for p in pan] == [[8, 32, 16, 0]] * 3
+    assert all(isinstance(i, int) for p in pan for i in p[2]), "indices, never ~300 MB items"
     lay = full_cfg.layout()
     (tmp_path / "eval").mkdir()
 
     class Z(torch.nn.Module):
         def forward(self, x):
             return torch.zeros((x.shape[0], lay.cout) + tuple(x.shape[2:]))
-    TR.write_region_panels(tmp_path, 26000, Z(), pan, torch.device("cpu"), lay)
+    TR.write_region_panels(tmp_path, 26000, Z(), pan, torch.device("cpu"), lay, grid=items)
     assert sorted(p.name for p in (tmp_path / "eval").glob("val_026000_r*.png")) == \
         [f"val_026000_r{k}.png" for k in range(3)]
     idx = (tmp_path / "eval" / "val_026000_regions.txt").read_text().splitlines()

@@ -502,10 +502,11 @@ def _radius_frac(item):
 
 
 def region_panels(grid, region=1024, n=4):
-    """[(region origin, radius fraction, items)] -- one validation panel per held-out region, in the
-    grid's order (the held-out order): the `n` windows of that region with the highest target
-    foreground fraction (recto >= 0.5 where weighted). One pass over the grid, once per run; the
-    first panel of the old layout showed four windows of one region only."""
+    """[(region origin, radius fraction, grid INDICES)] -- one validation panel per held-out region, in
+    the grid's order (the held-out order): the `n` windows of that region with the highest target
+    foreground fraction (recto >= 0.5 where weighted). One pass over the grid, once per run. Indices,
+    not items: a grid item is ~300 MB in memory, and holding 32 of them for the run was ~9 GB of
+    trainer RSS (paris4 step 30000); they are re-read from the DiskGrid at each evaluation."""
     per = {}
     order = []
     for i, it in enumerate(grid):
@@ -519,18 +520,21 @@ def region_panels(grid, region=1024, n=4):
     for r in order:
         best = sorted(per[r], key=lambda q: -q[0])[:int(n)]
         fr = [q[2] for q in best if np.isfinite(q[2])]
-        out.append((r, float(np.mean(fr)) if fr else float("nan"), [grid[q[1]] for q in best]))
+        out.append((r, float(np.mean(fr)) if fr else float("nan"), [q[1] for q in best]))
     return out
 
 
-def write_region_panels(out, step, net, panels, dev, layout, cascade=None):
+def write_region_panels(out, step, net, panels, dev, layout, cascade=None, grid=None):
     """val_<step>_r<k>.png for every held-out region k, and val_<step>_regions.txt: k, the region's
-    rung-2 origin (z, y, x) and its radius fraction from the umbilicus."""
+    rung-2 origin (z, y, x) and its radius fraction from the umbilicus. `panels` holds grid indices
+    (`region_panels`); each panel's four items are read from `grid` only while it is drawn."""
     import os
     lines = ["k\tregion_origin_zyx\tradius_frac\tpanel"]
-    for k, (r, frac, items) in enumerate(panels):
+    for k, (r, frac, idx) in enumerate(panels):
         name = f"val_{int(step):06d}_r{k}.png"
+        items = [grid[i] for i in idx]
         val_png(os.path.join(str(out), "eval", name), net, items, dev, layout, cascade=cascade)
+        del items
         lines.append(f"{k}\t{r[0]},{r[1]},{r[2]}\t{frac:.3f}\t{name}")
     with open(os.path.join(str(out), "eval", f"val_{int(step):06d}_regions.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -1014,7 +1018,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             val_png(out / "eval" / f"val_{step:06d}.png", evfwd, grid, dev, layout, cascade=casval)
             if "p" not in panels:
                 panels["p"] = region_panels(grid, int(cfg.region))
-            write_region_panels(out, step, evfwd, panels["p"], dev, layout, cascade=casval)
+            write_region_panels(out, step, evfwd, panels["p"], dev, layout, cascade=casval, grid=grid)
         except Exception as e:   # noqa: BLE001  -- a missing PIL must never stop a run
             print("[train] val_png:", repr(e), flush=True)
         t_png = time.time() - te - t_ev
