@@ -1397,3 +1397,21 @@ def test_gc_never_takes_the_held_out_round_0_reference(tmp_path):
     for ch in ("recto", "rw"):
         assert os.path.exists(ST.store_path(out, ch, held, 0)), ch
         assert not os.path.exists(ST.store_path(out, ch, other, 0)), ch
+
+
+def test_the_manual_verso_hold(tmp_path):
+    """`rvsm verso hold` places VERSO_HOLD: the verso gate's decision is still computed and logged
+    (verso_hold, would_pass) but verso_on stays false; `release` removes it (the next evaluation
+    decides normally)."""
+    out = str(tmp_path / "vh")
+    os.makedirs(os.path.join(out, "logs"))
+    assert cli.main(["verso", "hold", "--out", out, "--why", "recto", "only"]) == 0
+    assert RUN.verso_held(out)
+    assert json.load(open(os.path.join(out, RUN.VERSO_HOLD_FILE)))["why"] == "recto only"
+    why = {"why": "verso_after_steps", RUN.GATE_METRIC: 0.4, RUN.GATE_METRIC + "_prev": 0.35}
+    assert RUN.apply_verso_hold(out, 30000, True, why) is False          # held: never turned on ...
+    rec = [r for r in RUN.tail_jsonl(os.path.join(out, "logs", "sched.jsonl")) if r["kind"] == "verso_hold"]
+    assert rec[-1]["would_pass"] is True and rec[-1][RUN.GATE_METRIC] == 0.4   # ... but logged
+    assert cli.main(["verso", "release", "--out", out]) == 0 and not RUN.verso_held(out)
+    assert RUN.apply_verso_hold(out, 32000, True, why) is True           # released: decides normally
+    assert cli.main(["verso", "bogus", "--out", out]) == 2

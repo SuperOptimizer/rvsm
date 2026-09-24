@@ -20,7 +20,7 @@ USAGE = """rvsm <command> [options]
 """
 
 COMMANDS = ("run", "produce", "train", "eval", "export", "calibrate", "pretrain", "ladder",
-            "status", "stop", "ledger", "umbilicus", "teachers")
+            "status", "stop", "ledger", "umbilicus", "teachers", "verso")
 
 
 def _stack_dumps():
@@ -1126,6 +1126,30 @@ def stop(argv):
         raise SystemExit(f"rvsm stop: no run directory at {out}")
     RUN.stop(out)
     return 0
+
+VERSO_USAGE = """rvsm verso hold|release --out DIR [--why TEXT]
+
+`hold` places `<out>/VERSO_HOLD`: the round-0 verso gate still evaluates and logs its streak every
+evaluation (sched.jsonl `verso_hold`, with what it would have decided), but `verso_on` stays false.
+`release` removes it; the next evaluation decides normally. Takes effect at the next evaluation,
+without a restart.
+"""
+
+
+def verso(argv):
+    """The `verso` subcommand. Returns a process exit code."""
+    from rvsm import run as RUN
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("hold", "release"):
+        print(VERSO_USAGE, end="")
+        return 0 if argv and argv[0] in ("-h", "--help") else 2
+    f = _flags(argv[1:], VERSO_USAGE)
+    out = str(f["out"][0]) if f.get("out") else "out"
+    if not os.path.isdir(out):
+        raise SystemExit(f"rvsm verso: no run directory at {out}")
+    held = RUN.verso_hold(out, argv[0] == "hold", why=" ".join(f.get("why") or ["manual"]))
+    print(f"rvsm verso: {'HELD' if held else 'released'} ({os.path.join(out, RUN.VERSO_HOLD_FILE)})")
+    return 0
+
 
 if __name__ == "__main__":       # kept LAST: `main` dispatches on the functions defined above it
     raise SystemExit(main())

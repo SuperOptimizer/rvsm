@@ -80,6 +80,7 @@ import numpy as np
 from rvsm import config as CFG
 
 STOP_FILE = "STOP"
+VERSO_HOLD_FILE = "VERSO_HOLD"   # while it exists the verso gate never turns verso on (a manual hold)
 PHASE_FILE = "PHASE"
 PAUSE_FILE = "PAUSE_RAM"    # while it exists the producer starts no new unit (the host-RAM guard's)
 RAM_PAUSE_FRAC = 0.85       # host memory in use (or the run's process-tree RSS) above this share of
@@ -181,6 +182,33 @@ def write_state(out, **upd):
     st["ts"] = round(time.time(), 3)
     _write_json(os.path.join(str(out), "state.json"), st)
     return st
+
+
+def verso_held(out):
+    return os.path.exists(os.path.join(str(out), VERSO_HOLD_FILE))
+
+
+def verso_hold(out, on=True, why="manual"):
+    """Place (`on`) or lift the manual verso hold. The gate still computes and logs its streak every
+    evaluation, so the log shows when it WOULD have fired; `verso_on` stays false while held."""
+    p = os.path.join(str(out), VERSO_HOLD_FILE)
+    if on:
+        with open(p, "w") as f:
+            f.write(json.dumps({"t": time.time(), "why": str(why)}))
+    elif os.path.exists(p):
+        os.remove(p)
+    return verso_held(out)
+
+
+def apply_verso_hold(out, step, ok, why):
+    """The gate's decision after the manual hold: while VERSO_HOLD exists it is logged as what it WOULD
+    have been (`verso_hold`, `would_pass`, the streak values) and False is returned."""
+    if not verso_held(out):
+        return bool(ok)
+    jlog(out, "sched", {"kind": "verso_hold", "step": int(step), "would_pass": bool(ok),
+                        "gate_why": (why or {}).get("why"),
+                        **{k: v for k, v in (why or {}).items() if k != "why"}})
+    return False
 
 
 def stop_requested(out):
@@ -2253,6 +2281,7 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                 why = {**why, "streak": why_r2}
             why = {**why, "gate_s": round(time.time() - t_g, 1)}
             jlog(out, "sched", {"kind": "verso_gate", "step": step, "pass": bool(ok), **why})
+            ok = apply_verso_hold(out, step, ok, why)
             if ok:
                 write_state(out, verso_on=True, verso_gate_step=step, verso_on_step=step)
         elif state["round"] == 0:
