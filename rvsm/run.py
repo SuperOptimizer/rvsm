@@ -710,10 +710,15 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     route, pos = region_route(cfg, visits, order, held)
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
     frungs = field_rungs(cfg)
-    jobs = max(int(os.cpu_count() or 1), 1)   # the fields pool: every core, at low priority
+    # the distance fields: on the producer's own GPU when it has one (`targets.block_fields_torch`,
+    # ~1 GB of extra VRAM at peak, inside the memory fraction), else a CPU pool of
+    # every core at low priority
+    fdev = str(device) if device is not None and str(device).startswith("cuda") else None
+    jobs = 1 if fdev is not None else max(int(os.cpu_count() or 1), 1)
     jlog(out, "produce", {"kind": "start", "pid": os.getpid(), "device": str(device),
                           "regions": len(route), "heldout": len(held), "pinned": pinned,
-                          "backend": str(backend), "field_rungs": list(frungs), "jobs": jobs})
+                          "backend": str(backend), "field_rungs": list(frungs), "jobs": jobs,
+                          "fields_device": fdev or "cpu"})
 
     bank, slot = None, StudentSlot(out, device=device, compile=cfg.compile)
     rslot = StudentSlot(out, device=device, compile=cfg.compile)   # the frozen regeneration student
@@ -758,7 +763,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     # THE OVERLAP. The GPU thread (this one) only ever runs network passes. Around it:
     #   reader   fetches the NEXT unit's shards and decodes its CT while the current unit infers
     #   writer   volcomp-encodes and writes the stores, folds the coarse rungs, logs the unit
-    #   fields   the CPU distance fields (`targets.region_fields`, a process pool of `jobs`)
+    #   fields   the distance fields (`targets.region_fields`): on this GPU (`fdev`, a side stream) or,
+    #            without one, a process pool of `jobs`
     # A region with a unit in the writer or the fields queue is BUSY: its stores are not on disk yet,
     # so the disk-derived state machine would hand out the same unit again.
     import concurrent.futures as cf
@@ -767,7 +773,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     fielder = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fields")
     wslots = threading.BoundedSemaphore(2)     # at most two finished units waiting for the writer
     busy, pend, lock = set(), [], threading.Lock()
-    fpool = TG.field_pool(jobs, owner=os.getpid()) if jobs > 1 else None
+    fpool = TG.field_pool(jobs, owner=os.getpid()) if fdev is None and jobs > 1 else None
     pre = {}                                    # (lo, job) -> future of the reader's inputs
 
     clock = threading.Lock()                    # the shard cache is not thread-safe: one caller at a time
@@ -837,13 +843,15 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
 
     def fields(lo, round_, t0, cursor):
         try:
-            TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs, pool=fpool)
+            TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs, pool=fpool,
+                             device=fdev)
             g = TG.source_verso(out, lo, round_)[0]
             if g > stores.bundle_gen(out, lo, round_) and TG.fields_current(out, lo, round_, frungs):
                 # the new verso AND all of its fields are finished: only now do readers move to them
                 stores.commit_bundle(out, lo, round_, g, t=time.time())
             jlog(out, "produce", {"kind": "fields", "region": list(lo), "round": round_,
-                                  "s": round(time.time() - t0, 2), "cursor": cursor, "gen": g})
+                                  "s": round(time.time() - t0, 2), "cursor": cursor, "gen": g,
+                                  "device": fdev or "cpu"})
         finally:
             with lock:
                 busy.discard(lo)

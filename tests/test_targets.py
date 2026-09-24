@@ -486,3 +486,136 @@ def test_a_persistent_field_pool_is_byte_identical(slab_region):
         pool.shutdown(wait=True)
     _same_stores(a, b)
     _same_stores(c, d)
+
+
+# ------------------------------------------------------------------------------- the torch block path
+
+TORCH_DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="no CUDA device"))]
+
+
+def _fixtures():
+    """(name, recto, verso, dy, dx, kwargs) of the synthetic blocks the numpy tests above use, plus a
+    thick-banded curved stack with two wraps and an axis that moves with z."""
+    out = []
+    for sep in (4, 10, 20):
+        out.append((f"planes{sep}", *_bands(160, [100], [100 - sep]), dict(reach=40.0)))
+    out.append(("two_sheets", *_bands(128, [50, 80], [40, 70]), dict(reach=24.0)))
+    out.append(("lost_verso", *_bands(128, [50, 64], [40]), dict(reach=30.0)))
+    rec, ver, dy, dx = _bands(48, [20, 26], [12], zy=16)
+    rec[:, 0:2, 20:27] = 255
+    out.append(("bridge", rec, ver, dy, dx, dict(reach=24.0)))
+    out.append(("touching", *_bands(48, [20, 22], [18], half=0, zy=5), {}))
+    shape = (5, 32, 48)
+    rec = np.zeros(shape, np.uint8)
+    ver = rec.copy()
+    rec[:, :, 20] = 255
+    ver[:, 10, :] = 255
+    out.append(("orthogonal", rec, ver, np.zeros((5, 32, 1), np.float32), np.ones(shape, np.float32), {}))
+    n = 160
+    z, y, x = np.meshgrid(np.arange(4), np.arange(n), np.arange(n), indexing="ij")
+    dy, dx = (y - 80.0).astype(np.float32), (x - 80.0).astype(np.float32)
+    r = np.sqrt(dy * dy + dx * dx)
+    out.append(("annulus", np.where(np.abs(r - 50) <= 1, 255, 0).astype(np.uint8),
+                np.where(np.abs(r - 40) <= 1, 255, 0).astype(np.uint8), dy, dx, {}))
+    n = 96
+    z, y, x = np.meshgrid(np.arange(n), np.arange(n), np.arange(n), indexing="ij")
+    dy, dx = (y - (-60.0 + 0.2 * z)).astype(np.float32), (x - (30.0 + 0.1 * z)).astype(np.float32)
+    ph = np.mod(np.sqrt(dy * dy + dx * dx) + 2 * np.sin(z / 9.0), 21.0)
+    rec = np.clip(255 * (1 - np.abs(ph - 12.0) / 2.0), 0, 255).astype(np.uint8)
+    ver = np.clip(255 * (1 - np.abs(ph - 3.0) / 2.0), 0, 255).astype(np.uint8)
+    core = np.zeros(rec.shape, bool)
+    core[16:-16, 16:-16, 16:-16] = True
+    cov = targets.cover_distance((-16, -16, -16), rec.shape, (256, 256, 256))
+    out.append(("wraps", rec, ver, dy, dx, dict(reach=12.0, core=core, cover=cov)))
+    rec, ver, dy, dx = _bands(64, [40], [30])
+    cover = np.broadcast_to((64 - np.arange(64)).astype(np.float32), rec.shape)
+    out.append(("coverage", rec, ver, dy, dx, dict(reach=20.0, cover=cover)))
+    out.append(("no_recto", *_bands(96, [], [40]), {}))
+    rec, ver, dy, dx = _bands(96, [40], [])
+    out.append(("no_verso", rec, ver, dy, dx, {}))
+    out.append(("verso_none", rec, None, dy, dx, {}))
+    return out
+
+
+@pytest.mark.parametrize("dev", TORCH_DEVICES)
+def test_block_fields_torch_matches_numpy(dev):
+    """The torch port against the numpy reference on every synthetic block: the valid masks may differ
+    on at most 0.1% of the core (nearest-voxel ties, `rvsm.edt`), midline and thickness agree to 1e-3
+    where both are valid, and so do the support counts."""
+    for name, rec, ver, dy, dx, kw in _fixtures():
+        a = targets.block_fields(rec, ver, dy, dx, **kw)
+        b = targets.block_fields_torch(rec, ver, dy, dx, device=dev, **kw)
+        n = a[3]["voxels"]
+        assert b[3]["voxels"] == n and b[0].dtype == b[1].dtype == np.float32 and b[2].dtype == bool
+        assert (a[2] != b[2]).sum() <= 1e-3 * n, name
+        both = a[2] & b[2]
+        assert np.abs(a[0] - b[0])[both].max(initial=0) <= 1e-3, name
+        assert np.abs(a[1] - b[1])[both].max(initial=0) <= 1e-3, name
+        assert not b[0][~b[2]].any() and not b[1][~b[2]].any(), name
+        for key in targets.SUPPORT:
+            assert abs(a[3][key] - b[3][key]) <= 1e-3 * n, (name, key)
+        if name == "wraps":
+            assert a[3]["valid"] > 0.1 * n                 # the parity is over real support
+
+
+def _curved_region(root, n=128, lo=(0, 0, 0)):
+    """A region whose recto / verso stores are a stack of curved wraps around an axis outside it."""
+    z, y, x = np.meshgrid(np.arange(n), np.arange(n), np.arange(n), indexing="ij")
+    r = np.sqrt((y + 90.0) ** 2 + (x - 50.0) ** 2) + 2 * np.sin(z / 11.0)
+    ph = np.mod(r, 20.0)
+    for name, c in (("recto", 11.0), ("verso", 3.0)):
+        v = np.clip(255 * (1 - np.abs(ph - c) / 2.0), 0, 255).astype(np.uint8)
+        stores.write(stores.store_path(root, name, lo), v, lo, rung=2, channels=(name,), q=8)
+    zs = np.arange(0, n + 1, 16, dtype=np.float64)
+    return np.stack([zs, np.full_like(zs, -90.0), np.full_like(zs, 50.0)])
+
+
+def _decoded(root, lo, rung):
+    m = _read(root, "midline", lo, rung)
+    t = _read(root, "thickness", lo, rung)
+    return targets.decode_signed(m), targets.decode_unsigned(t), m > 0, t > 0
+
+
+@pytest.mark.parametrize("dev", TORCH_DEVICES)
+def test_region_fields_on_a_device_matches_the_pool_path(tmp_path, slab_region, dev):
+    """`region_fields(device=...)` (whole-store read, device pooling, torch blocks) against the numpy
+    pool path, on a curved region and on the analytic slab, at rungs 2, 3 and 4."""
+    lo = (0, 0, 0)
+    a, b = str(tmp_path / "np"), str(tmp_path / "dev")
+    ax = _curved_region(a)
+    _curved_region(b)
+    ra = targets.region_fields(a, lo, ax, rungs=(2, 3, 4), jobs=1, **KW)
+    rb = targets.region_fields(b, lo, ax, rungs=(2, 3, 4), device=dev, **KW)
+    for rung in (2, 3, 4):
+        ma, ta, oka, _ = _decoded(a, lo, rung)
+        mb, tb, okb, _ = _decoded(b, lo, rung)
+        assert np.array_equal(oka, _read(a, "thickness", lo, rung) > 0)
+        assert (oka != okb).sum() <= 1e-3 * oka.size, rung
+        both = oka & okb
+        assert np.abs(ma - mb)[both].max(initial=0) <= 1e-3 and np.abs(ta - tb)[both].max(initial=0) <= 1e-3
+        sa, sb = ra["rungs"][rung]["support"], rb["rungs"][rung]["support"]
+        for key in targets.SUPPORT:
+            assert abs(sa[key] - sb[key]) <= 1e-3 * sa["voxels"], (rung, key)
+        pa = stores.open_store(stores.store_path(a, targets.channel("midline", rung), lo)).attrs
+        pb = stores.open_store(stores.store_path(b, targets.channel("midline", rung), lo)).attrs
+        assert len(pa["support_blocks"]["rows"]) == len(pb["support_blocks"]["rows"])
+        assert [r[:3] for r in pa["support_blocks"]["rows"]] == [r[:3] for r in pb["support_blocks"]["rows"]]
+    assert ra["rungs"][2]["support"]["valid"] > 0.1 * 128 ** 3
+    assert targets.fields_current(b, lo, rungs=(2, 3, 4), reach=12)
+    # the analytic slab, where the expected codes are known exactly
+    r = slab_region(name="slab", n=128, recto_x=80, verso_x=70)
+    targets.region_fields(r.root, r.lo, r.ax, rungs=(2,), device=dev, **KW)
+    x = np.arange(128)
+    keep = _stencil((np.abs(x - 80) <= 12) & (np.abs(x - 70) <= 12))
+    want = np.where(keep, np.rint((x - 75.0) / targets.UNIT) + targets.OFF, 0).astype(np.uint8)
+    assert np.array_equal(_read(r.root, "midline", r.lo)[64, 64, :], want)
+
+
+@pytest.mark.parametrize("dev", TORCH_DEVICES)
+def test_region_fields_on_a_device_is_deterministic(slab_region, dev):
+    a = slab_region(name="d1", n=128, recto_x=80, verso_x=70)
+    b = slab_region(name="d2", n=128, recto_x=80, verso_x=70)
+    targets.region_fields(a.root, a.lo, a.ax, rungs=(2, 3), device=dev, **KW)
+    targets.region_fields(b.root, b.lo, b.ax, rungs=(2, 3), device=dev, **KW)
+    _same_stores(a, b)

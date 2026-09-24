@@ -88,10 +88,31 @@ and likewise `thickness`, `thickness_r3`, `thickness_r4`. Each store records its
 `voxel_um` in its attrs, and `region_fields` never pools one into another -- the suffix is there so that
 a reader cannot accidentally take a rung-3 field for a rung-2 one by opening the wrong directory.
 
-COST AND DETERMINISM. Two scipy EDTs per block per rung plus the pairing checks over the candidate
-voxels, CPU only; `jobs > 1` spreads the blocks over worker processes. Every block is computed from the
-stores alone, with a `halo` of context, and the parent assembles the cores, so the bytes written do not
-depend on how the blocks were handed out: `jobs=4` is byte-identical to `jobs=1`.
+COST AND DETERMINISM. Per block and rung: four EDTs (the medial surface of each band, then the distance
+to each face with its nearest-voxel indices), two 26-connected labellings, two Gaussians and the pairing
+checks over the candidate voxels. Two implementations of the same rules:
+
+  * numpy / scipy (`block_fields`), CPU: ~7-9 s per 224^3 block on one core; `jobs > 1` spreads the
+    blocks over worker processes (`field_pool` in the producer). ~1000 s per 1024^3 region at rungs
+    2-4 on the 8-core production host.
+  * torch (`block_fields_torch`, `region_fields(device=...)`), the producer's GPU: `rvsm.edt`'s exact
+    EDT (Triton kernels on CUDA) and ndimage replacements, written op for op in the numpy version's
+    float32 order. ~60-65 ms per block on an RTX 5080 laptop GPU and ~1 GB of VRAM at peak; the whole
+    region (the stores decoded once, pooled on the device, 584 blocks, then the six q=0 writes) ~55 s,
+    of which ~13 s is the volcomp encode of the last stores.
+
+The two agree: EDT distances are exact integers under a sqrt in both, the nearest-voxel TIES are broken
+the same way (each pass takes the first minimum along its line, in scipy's axis order -- see
+`rvsm.edt`, TIES; observed identical on every test mask, not proven for every scipy version), and the
+Gaussian can differ from scipy's only in the last float32 bit (summation order). On every synthetic
+fixture and region in the tests the stores are byte-identical; the tests hold them to 1e-3 and 0.1% of
+the valid mask. A difference would show only at a voxel exactly equidistant from two face voxels or at a
+normal test on its threshold.
+
+Either way every block is computed from the stores alone, with a `halo` of context, and the cores are
+assembled in block order through `_store_block`, so the bytes written do not depend on how the blocks
+were handed out: `jobs=4` is byte-identical to `jobs=1`, and the device path is deterministic on one
+device (no atomics whose order matters, no cudnn, no autotuning).
 """
 import hashlib
 import json
@@ -360,6 +381,207 @@ def block_fields(recto, verso, dy, dx, thr=0.5, reach=REACH, tmin=TMIN, tmax=TMA
     return result(m, t)
 
 
+# ------------------------------------------------------------------------ the same block, in torch
+#
+# `block_fields_torch` is `block_fields` op for op, with scipy.ndimage replaced by `rvsm.edt` so that it
+# runs on the producer's GPU. The float32 arithmetic is written in the same order as the numpy version
+# (no fused expressions), so where the EDT names the same nearest voxel the results are the same bits;
+# what can differ is listed in `rvsm.edt` (TIES) and at `gaussian3`.
+
+def _tt(a, dev, dt=None):
+    import torch
+    t = a if isinstance(a, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(a))
+    t = t.to(dev)
+    return t if dt is None else t.to(dt)
+
+
+def medial_torch(band):
+    """`medial` of a bool tensor. The local-maximum test is made on the SQUARED distances, which are
+    exact integers: for integers a < b, sqrt(b) - sqrt(a) > 1e-6 at any size a block can have, so
+    `d2 >= max(d2)` is exactly scipy's `d >= max(d) - 1e-6`."""
+    import torch
+    from rvsm import edt as E
+    if not bool(band.any()):
+        return torch.zeros_like(band)
+    d2, _ = E.edt2(~band, indices=False)
+    return band & (d2 >= E.max_filter3(d2))
+
+
+def face_distance_torch(surf, dy, dx):
+    """`face_distance` of a bool tensor: (d, u, ix int32) or None when `surf` is empty."""
+    import torch
+    from rvsm import edt as E
+    if not bool(surf.any()):
+        return None
+    d2, ix = E.edt2(surf, index_dtype=torch.int32)
+    u = torch.sqrt(d2)
+    del d2
+    Z, Y, X = surf.shape
+    gy = (torch.arange(Y, device=surf.device)[None, :, None] - ix[1]).to(torch.float32)
+    gx = (torch.arange(X, device=surf.device)[None, None, :] - ix[2]).to(torch.float32)
+    side = gy * dy
+    side = side + gx * dx
+    del gy, gx
+    d = torch.where(side < 0, -u, u)
+    return d, u, ix
+
+
+def _grad_at_torch(d, p):
+    """`_grad_at`: p (3, n) int64."""
+    import torch
+    g = torch.empty(p.shape, dtype=torch.float32, device=d.device)
+    for a in range(3):
+        hi, lo = p.clone(), p.clone()
+        hi[a] = torch.clamp(p[a] + 1, max=d.shape[a] - 1)
+        lo[a] = torch.clamp(p[a] - 1, min=0)
+        g[a] = (d[tuple(hi)] - d[tuple(lo)]) / torch.clamp(hi[a] - lo[a], min=1)
+    return g
+
+
+def _ravel(p, shape):
+    return (p[0] * int(shape[1]) + p[1]) * int(shape[2]) + p[2]
+
+
+def _pair_checks_torch(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx):
+    """`_pair_checks` for the flat int64 voxel indices `sel` (a tensor)."""
+    import torch
+    from rvsm import edt as E
+    lr, lv = E.label(br).reshape(-1), E.label(bv).reshape(-1)
+    ir, iv = ixr.reshape(3, -1), ixv.reshape(3, -1)
+    pr, pv = ir[:, sel].long(), iv[:, sel].long()
+    fr, fv = _ravel(pr, shape), _ravel(pv, shape)
+    back_r, back_v = ir[:, fv].long(), iv[:, fr].long()
+    fbr, fbv = _ravel(back_r, shape), _ravel(back_v, shape)
+
+    def near(b, p):
+        q = (b - p).to(torch.float64)
+        return torch.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]) <= RECIPROCAL + 1e-6
+    ok_rec = ((lr[fbr] == lr[fr]) | near(back_r, pr)) & ((lv[fbv] == lv[fv]) | near(back_v, pv))
+    del lr, lv, back_r, back_v, fbr, fbv, fr, fv
+    Z, Y, X = (int(v) for v in shape)
+    z, y, x = sel // (Y * X), (sel // X) % Y, sel % X
+    ry = dy.expand(Z, Y, X)[z, y, x].to(torch.float32)
+    rx = dx.expand(Z, Y, X)[z, y, x].to(torch.float32)
+    rn = torch.clamp(torch.sqrt(ry * ry + rx * rx), min=1e-6)
+    ry, rx = ry / rn, rx / rn
+    nr = _grad_at_torch(E.gaussian3(dr, NORMAL_SIGMA), pr)
+    nv = _grad_at_torch(E.gaussian3(dv, NORMAL_SIGMA), pv)
+
+    def norm(n):
+        return torch.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+    mr, mv = norm(nr), norm(nv)
+    nr, nv = nr / torch.clamp(mr, min=1e-6), nv / torch.clamp(mv, min=1e-6)
+    agree = nr[0] * nv[0] + nr[1] * nv[1] + nr[2] * nv[2]
+    ok_n = (mr >= NORMAL_MIN) & (mv >= NORMAL_MIN) & \
+           (nr[1] * ry + nr[2] * rx >= NORMAL_RADIAL) & (nv[1] * ry + nv[2] * rx >= NORMAL_RADIAL) & \
+           (agree >= NORMAL_AGREE)
+    code = torch.where(~ok_rec, _REASON["reciprocal"], torch.where(~ok_n, _REASON["normal"], 0)).to(torch.uint8)
+    w = torch.nonzero(code == 0).squeeze(1)
+    if w.numel():
+        a, b = pr[:, w].to(torch.float32), pv[:, w].to(torch.float32)
+        seg = b - a
+        s2 = seg[0] * seg[0] + seg[1] * seg[1] + seg[2] * seg[2]
+        n = max(1, int(np.ceil(2.0 * float(torch.sqrt(s2).max()))))
+        left_r = torch.zeros(w.numel(), dtype=torch.bool, device=sel.device)
+        in_v = torch.zeros_like(left_r)
+        hit = torch.zeros_like(left_r)
+        bf, vf = br.reshape(-1), bv.reshape(-1)
+        for i in range(n + 1):
+            f = float(np.float32(i / n))          # numpy multiplies by the ratio as a float32
+            q = torch.round(a + seg * f).long()
+            qi = _ravel(q, shape)
+            rr, vv = bf[qi], vf[qi]
+            hit |= left_r & rr & ~vv
+            left_r |= ~rr
+            hit |= in_v & ~vv
+            in_v |= vv
+        code[w[hit]] = _REASON["crossing"]
+    return code
+
+
+def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, dev):
+    """The tensor core of `block_fields_torch`: (midline, thickness, valid) tensors and `support`."""
+    import torch
+    from rvsm import edt as E
+    rec = _tt(recto, dev)
+    shape = tuple(int(v) for v in rec.shape)
+    dy, dx = _tt(dy, dev, torch.float32), _tt(dx, dev, torch.float32)
+    core = torch.ones(shape, dtype=torch.bool, device=dev) if core is None else _tt(core, dev, torch.bool)
+    ev = E.binary_dilation(core)
+    reason = torch.zeros(shape, dtype=torch.uint8, device=dev)
+
+    def fail(bad, key):
+        reason.masked_fill_((reason == 0) & ev & bad, _REASON[key])
+
+    def result(m, t):
+        valid = (reason == 0) & core
+        cnt = torch.bincount(reason[core].long(), minlength=len(SUPPORT) - 1).cpu().numpy()
+        sup = {"voxels": int(core.sum()), "valid": int(valid.sum())}
+        sup.update({k: int(cnt[i]) for k, i in _REASON.items()})
+        z = torch.zeros((), dtype=torch.float32, device=dev)
+        return torch.where(valid, m, z), torch.where(valid, t, z), valid, sup
+
+    zero = torch.zeros(shape, dtype=torch.float32, device=dev)
+    allv = torch.ones(shape, dtype=torch.bool, device=dev)
+    lvl = int(round(thr * 255))
+    br = rec >= lvl
+    del rec
+    fr = face_distance_torch(medial_torch(br), dy, dx)
+    if fr is None:
+        fail(allv, "no_recto")
+        return result(zero, zero)
+    dr, ur, ixr = fr
+    del fr
+    fail(ur > reach, "no_recto")
+    bv = None if verso is None else _tt(verso, dev) >= lvl
+    fv = None if bv is None else face_distance_torch(medial_torch(bv), dy, dx)
+    if fv is None:
+        fail(allv, "no_verso")
+        return result(zero, zero)
+    dv, uv, ixv = fv
+    del fv
+    fail(uv > reach, "no_verso")
+    if cover is not None:
+        fail(_tt(cover, dev, torch.float32) <= torch.maximum(ur, uv) + COVER_MARGIN, "coverage")
+    del ur, uv
+    t = dv - dr
+    fail((t < tmin) | (t > tmax), "thickness")
+    sel = torch.nonzero(((reason == 0) & ev).reshape(-1)).squeeze(1)
+    if sel.numel():
+        reason.view(-1)[sel] = _pair_checks_torch(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx)
+    del ixr, ixv, sel, br, bv
+    pair = (reason == 0) & ev
+    m = torch.where(pair, 0.5 * (dr + dv), zero)
+    del dr, dv
+    full = pair.clone()
+    for a in range(3):
+        for s in (1, -1):
+            full &= E._shift(pair, a, s, False)
+    fail(pair & ~full, "stencil")
+    g2 = torch.zeros(shape, dtype=torch.float32, device=dev)
+    for a in range(3):
+        g = torch.zeros(shape, dtype=torch.float32, device=dev)
+        n = shape[a]
+        g.narrow(a, 1, n - 2).copy_(0.5 * (m.narrow(a, 2, n - 2) - m.narrow(a, 0, n - 2)))
+        g2 += g * g
+    gn = torch.sqrt(g2)
+    del g, g2
+    fail(full & ((gn < GRAD[0]) | (gn > GRAD[1])), "gradient")
+    return result(m, t)
+
+
+def block_fields_torch(recto, verso, dy, dx, thr=0.5, reach=REACH, tmin=TMIN, tmax=TMAX, core=None,
+                       cover=None, device=None):
+    """`block_fields` on a torch device (default: CUDA when available, else the CPU): the same inputs
+    (numpy arrays or tensors), the same rules, the same `(midline f32, thickness f32, valid bool,
+    support)` as numpy arrays. Nearest-voxel ties can make a handful of voxels differ (`rvsm.edt`)."""
+    import torch
+    dev = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
+    with torch.no_grad():
+        m, t, ok, sup = _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, dev)
+        return m.cpu().numpy(), t.cpu().numpy(), ok.cpu().numpy(), sup
+
+
 def cover_distance(lo, shape, extent):
     """Each voxel's distance to the nearest voxel OUTSIDE the stores (0 outside them), for a box at
     store-local corner `lo` of `shape`, the stores spanning [0, extent) per axis."""
@@ -529,6 +751,140 @@ def field_pool(jobs, owner=None):
                                   initializer=_nice, initargs=args)
 
 
+# ------------------------------------------------------------------ the whole region, on one device
+
+POOL_SLAB = 64       # fine z-planes per upload when a store is pooled on the device
+
+
+def _pool_device(v, dev):
+    """`ladder.pool2` of a whole host uint8 store (even shape), on `dev` in z-slabs, back on the host."""
+    from rvsm import edt as E
+    import torch
+    out = np.empty(tuple(int(s) // 2 for s in v.shape), np.uint8)
+    for z in range(0, v.shape[0], POOL_SLAB):
+        s = torch.from_numpy(np.ascontiguousarray(v[z:z + POOL_SLAB])).to(dev)
+        out[z // 2:(z + POOL_SLAB) // 2] = E.pool2(s).cpu().numpy()
+    return out
+
+
+def _window(v, lo, shape):
+    """The box at store-local corner `lo` of `shape` out of the whole (pooled) store `v`, air outside
+    it: `read_pooled` of that store, without the per-block chunk decodes."""
+    out = np.zeros(tuple(int(s) for s in shape), np.uint8)
+    lo = np.asarray(lo, np.int64)
+    S = np.asarray(v.shape, np.int64)
+    a, b = np.maximum(lo, 0), np.minimum(lo + np.asarray(shape, np.int64), S)
+    if (b > a).all():
+        st, en = a - lo, b - lo
+        out[st[0]:en[0], st[1]:en[1], st[2]:en[2]] = v[a[0]:b[0], a[1]:b[1], a[2]:b[2]]
+    return out
+
+
+def _block_inputs_torch(axk, lo, rsh, rlo, ext, axis_r_vox, halo, dev):
+    """(dy, dx, core, cover) of one block on `dev`: `axis_offsets` (float64, then float32, as there),
+    the core mask with the axis exclusion, and `cover_distance`, the last three as broadcast views."""
+    import torch
+    Z, Y, X = (int(v) for v in rsh)
+    g0 = np.asarray(lo, np.int64) - int(halo)            # the global corner of the block with its halo
+    z = np.arange(Z, dtype=np.float64) + int(g0[0])
+    cy = torch.from_numpy(np.interp(z, axk[0], axk[1])).to(dev)
+    cx = torch.from_numpy(np.interp(z, axk[0], axk[2])).to(dev)
+    f64 = torch.float64
+    dy = (torch.arange(Y, dtype=f64, device=dev) + int(g0[1]))[None, :, None] - cy[:, None, None]
+    dx = (torch.arange(X, dtype=f64, device=dev) + int(g0[2]))[None, None, :] - cx[:, None, None]
+    r = torch.sqrt(dy * dy + dx * dx).to(torch.float32)
+    sl = tuple(slice(int(halo), int(halo) + int(v) - 2 * int(halo)) for v in rsh)
+    core = torch.zeros((Z, Y, X), dtype=torch.bool, device=dev)
+    core[sl] = r[sl] >= axis_r_vox
+    del r
+    cov = None
+    for a in range(3):
+        c = torch.arange(int(rsh[a]), dtype=torch.float32, device=dev) + float(rlo[a])
+        d = torch.where((c >= 0) & (c < ext[a]), torch.minimum(c + 1, float(ext[a]) - c),
+                        torch.zeros((), dtype=torch.float32, device=dev))
+        d = d.reshape([-1 if i == a else 1 for i in range(3)])
+        cov = d if cov is None else torch.minimum(cov, d)
+    return dy.to(torch.float32), dx.to(torch.float32), core, cov.expand(Z, Y, X)
+
+
+def _encode_torch(m, t, ok, cap):
+    """`encode_signed(m, ok, cap)` and `encode_unsigned(t, ok)` on the device, the same float32 steps
+    (clip, divide, round half to even, offset, clip to 1..255), as host uint8 arrays."""
+    import torch
+    z = torch.zeros((), dtype=torch.uint8, device=m.device)
+    cm = torch.round(torch.clamp(m, -float(cap), float(cap)) / UNIT) + OFF
+    mu = torch.where(ok, torch.clamp(cm, 1, 255).to(torch.uint8), z)
+    ct = torch.round(torch.clamp(t, UNIT, 255 * UNIT) / UNIT)
+    tu = torch.where(ok, torch.clamp(ct, 1, 255).to(torch.uint8), z)
+    return mu.cpu().numpy(), tu.cpu().numpy()
+
+
+def _fields_torch(init, tasks, device, take, rung_done=None):
+    """`region_fields`' blocks on a torch `device`, in task order, each result handed to `take`.
+
+    The region's recto / verso stores are decoded ONCE, whole (a block read with a 48 halo decodes up
+    to 27 of the 128^3 chunks for one 224^3 window; the whole store is each chunk once), pooled to rungs
+    3 / 4 on the device, and every block's window is cut out of that host copy with air outside it --
+    `read_pooled`'s bytes. Everything that `_block` computes on the host (axis offsets, core, coverage,
+    the fields) is computed on the device instead; the encoding is `_block`'s own numpy code on the core.
+    The next block's windows are cut on a helper thread while the device works; `rung_done(k)` is called
+    after the last block of rung k has been handed to `take`."""
+    import contextlib
+
+    import torch
+    rp, vp, ax, thr, cap, tmin, tmax, reach, axis_r_um, halo = init
+    dev = torch.device(device)
+    rec_a = stores.open_store(rp)
+    ver_a = stores.open_store(vp) if vp else None
+    origin2 = np.asarray(rec_a.attrs["origin_zyx"], np.int64)
+    ks = sorted({int(t[0]) for t in tasks})
+    fine = {"recto": np.asarray(rec_a[:], np.uint8),
+            "verso": None if ver_a is None else np.asarray(ver_a[:], np.uint8)}
+    vols = {}
+    for key, v in fine.items():
+        cur = v
+        for k in range(2, max(ks) + 1):
+            if k > 2 and cur is not None:
+                cur = _pool_device(cur, dev)
+            if k in ks:
+                vols[(key, k)] = cur
+    del fine, cur, v
+    last2 = max((i for i, t in enumerate(tasks) if int(t[0]) == 2), default=-1)
+    axk = {k: AX.axis_at(np.asarray(ax, np.float64), k) for k in ks}
+    stream = torch.cuda.Stream(dev) if dev.type == "cuda" else None
+    ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+    def cut(task):
+        k, lo, n = task
+        rlo = np.asarray(lo, np.int64) - (origin2 >> (int(k) - 2)) - int(halo)
+        rsh = tuple(int(v) + 2 * int(halo) for v in n)
+        ver = None if vols[("verso", k)] is None else _window(vols[("verso", k)], rlo, rsh)
+        return rlo, rsh, _window(vols[("recto", k)], rlo, rsh), ver
+
+    import concurrent.futures as cf
+    with torch.no_grad(), ctx, cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fcut") as cutter:
+        nxt = cutter.submit(cut, tasks[0]) if tasks else None
+        for i, (k, lo, n) in enumerate(tasks):
+            rlo, rsh, rec, ver = nxt.result()
+            nxt = cutter.submit(cut, tasks[i + 1]) if i + 1 < len(tasks) else None
+            ext = [int(v) for v in vols[("recto", k)].shape]
+            dy, dx, core, cover = _block_inputs_torch(axk[k], lo, rsh, rlo, ext,
+                                                      float(axis_r_um) / ladder.rung_um(k), halo, dev)
+            rk, tn, tx = rung_params(k, reach, tmin, tmax)
+            m, t, ok, sup = _block_fields_t(rec, ver, dy, dx, thr, rk, tn, tx, core, cover, dev)
+            sl = tuple(slice(int(halo), int(halo) + int(v)) for v in n)
+            mu, tu = _encode_torch(m[sl], t[sl], ok[sl], cap)
+            del dy, dx, core, cover, m, t, ok
+            take((k, tuple(int(v) for v in lo), mu, tu, sup))
+            if i == last2:                          # the rung-2 stores are the big ones: drop them early
+                vols[("recto", 2)] = vols[("verso", 2)] = None
+            if rung_done is not None and (i + 1 == len(tasks) or int(tasks[i + 1][0]) != int(k)):
+                rung_done(int(k))
+    if stream is not None:
+        stream.synchronize()
+        del vols
+        torch.cuda.empty_cache()            # hand the ~1 GB back to the process's other GPU users
+
+
 def _blocks(shape, block):
     for z in range(0, int(shape[0]), block):
         for y in range(0, int(shape[1]), block):
@@ -610,7 +966,7 @@ def fields_current(root, lo, round_=0, rungs=(2, 3, 4), reach=REACH, tmin=TMIN, 
 
 def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXIS_R_UM,
                   thr=0.5, cap=CAP, tmin=TMIN, tmax=TMAX, reach=REACH, block=BLOCK, halo=HALO,
-                  force=False, pool=None):
+                  force=False, pool=None, device=None):
     """Build the `midline` and `thickness` stores of one region, at every rung in `rungs`.
 
     `root` is the run directory, `lo` the region corner in rung-2 voxels, `ax` the umbilicus control
@@ -624,7 +980,9 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     Returns a report dict, with a per-rung `support` histogram of why core voxels were rejected. A rung
     whose two stores are `_current` is skipped (`force` recomputes), which is what makes this resumable
     at region granularity. `pool` is a `field_pool` the caller keeps alive across regions (a producer);
-    without one, `jobs > 1` forks a pool for this call.
+    without one, `jobs > 1` forks a pool for this call. `device` (a torch device or its name) computes
+    every block with `block_fields_torch` on that device, in this process and in block order, instead
+    (`_fields_torch`); `jobs` and `pool` are then unused.
 
     A pooled rung whose shape is not a multiple of 128 is padded up to one, because a store's shape must
     be; the padding is code 0, i.e. no data. For the production region (1024 at rung 2) rungs 3 and 4 are
@@ -667,7 +1025,32 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
             sup[k][key] += int(s[key])
         per_block[k].append([int(v) for v in blo] + [int(s[key]) for key in SUPPORT])
 
-    if pool is not None and len(tasks) >= 2:
+    def write_rung(k, Sk, paths, want):
+        for kind in KINDS:
+            stores.write(paths[kind], out[k][kind], tuple(int(v) for v in (origin2 >> (k - 2))),
+                         rung=k, channels=(channel(kind, k),), q=0,
+                         attrs={"field": kind, "unit_vox": UNIT, "offset": OFF if kind == "midline" else 0,
+                                "cap_vox": float(cap), "axis_r_um": float(axis_r_um),
+                                "shape_true": [int(v) for v in Sk], "source_round": int(round_),
+                                "verso": bool(vp), "support": sup[k],
+                                "support_blocks": {"columns": ["z", "y", "x", *SUPPORT],
+                                                   "rows": per_block[k]}, **want})
+        rep["rungs"][k] = {"shape": [int(v) for v in Sk], "blocks": sum(1 for t in tasks if t[0] == k),
+                           "support": sup[k], "written": [paths[kind] for kind in KINDS]}
+
+    if device is not None:
+        # a rung's two stores are written (volcomp-encoded, on one thread, in rung order) as soon as its
+        # last block is in, while the device computes the next rung's blocks: the same writes, earlier
+        import concurrent.futures as cf
+        byk = {k: (k, Sk, paths, want) for k, Sk, paths, want in todo}
+        with cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fwrite") as wr:
+            futs = []
+            _fields_torch(init, tasks, device, take,
+                          rung_done=lambda k: futs.append(wr.submit(write_rung, *byk[k])))
+            for f in futs:
+                f.result()
+        return rep
+    elif pool is not None and len(tasks) >= 2:
         for res in pool.map(_block_in, [(init, t) for t in tasks], chunksize=1):
             take(res)
     elif int(jobs) <= 1 or len(tasks) < 2:
@@ -682,17 +1065,7 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
             for res in ex.map(_block, tasks, chunksize=1):
                 take(res)
     for k, Sk, paths, want in todo:
-        for kind in KINDS:
-            stores.write(paths[kind], out[k][kind], tuple(int(v) for v in (origin2 >> (k - 2))),
-                         rung=k, channels=(channel(kind, k),), q=0,
-                         attrs={"field": kind, "unit_vox": UNIT, "offset": OFF if kind == "midline" else 0,
-                                "cap_vox": float(cap), "axis_r_um": float(axis_r_um),
-                                "shape_true": [int(v) for v in Sk], "source_round": int(round_),
-                                "verso": bool(vp), "support": sup[k],
-                                "support_blocks": {"columns": ["z", "y", "x", *SUPPORT],
-                                                   "rows": per_block[k]}, **want})
-        rep["rungs"][k] = {"shape": [int(v) for v in Sk], "blocks": sum(1 for t in tasks if t[0] == k),
-                           "support": sup[k], "written": [paths[kind] for kind in KINDS]}
+        write_rung(k, Sk, paths, want)
     return rep
 
 
