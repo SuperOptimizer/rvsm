@@ -107,6 +107,8 @@ GATE_SCREEN = 0.1           # the verso gate's held-out pass is skipped while th
                             # is more than this below `verso_gate_dice` (see `verso_gate`)
 LOOKAHEAD_MAX = 64
 REEST_S = 600.0             # the lookahead L is re-estimated from the logs this often
+VRAM_REPORT_S = 1800.0      # the producer's `vram_report` line: at start, after each job kind's first
+                            # pass, and this often
 
 # The plan's budget table (§1 "GPU modes"), in GB on one 80 GB card: trainer 46-57 (30m6, 256^3, batch
 # 2, ckpt-act 1-2), producer ~30 (a teacher and the student, never concurrently). The low end of the
@@ -479,6 +481,10 @@ class TeacherBank:
                                  if self.cfg.teacher_bf16 else None)
         return row[3]
 
+    def footprint(self):
+        """Bytes of the loaded teachers' parameters and buffers (0 before the first pass loads them)."""
+        return sum(module_bytes(row[3]) for row in self.items)
+
     def read(self, ct, lo, size, pyr=None):
         """Every teacher's CT for a region, read ahead of its pass (`infer.teacher_read`): the producer's
         reader thread calls this for the NEXT region while the GPU runs the current one."""
@@ -754,6 +760,9 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                           "vram_cap_gb": None if vram_cap is None else round(vram_cap / (1 << 30), 2)})
 
     bank, slot = None, StudentSlot(out, device=device, compile=cfg.compile)
+    peaks = {}                                  # job kind -> the last pass's peak allocated bytes
+    vram_report(out, bank, slot, peaks, vram_cap, "start")
+    t_vrep = time.time()
     # the frozen regeneration student is the SAME slot: its checkpoint is loaded into the one compiled
     # module in place (`infer.Student.reload`) and the live one back after it. A second compiled
     # student beside the live one and the teacher bank left no room for a pass's transient memory
@@ -904,6 +913,9 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     try:
         while not stopping():
             settle()
+            if time.time() - t_vrep >= VRAM_REPORT_S:
+                vram_report(out, bank, slot, peaks, vram_cap, "periodic")
+                t_vrep = time.time()
             st = read_state(out)
             round_ = int(st.get("round", 0))
             verso_on = bool(st.get("verso_on", False))
@@ -1034,6 +1046,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 gate.pass_acquire(job)              # no GPU fields beside the pass (and none cached)
                 try:
                     _vram_check(out, job, lo, vram_cap)
+                    _cuda_peak(reset=vram_cap is not None)   # this pass's own peak, below
                     t1 = time.time()
                     # a pass that will COMPILE first (a student slot's first forward in this process)
                     # can take many minutes; say so before it starts, so a stall is visible
@@ -1079,8 +1092,12 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         del planes
                         pooled = None
                     t_gpu = time.time() - t1
+                    first = job not in peaks
+                    peaks[job] = _cuda_peak()
                     gate.set_pending(j for _, j in gpu_units[i + 1:])
                     gate.release()
+                    if first:                       # the first pass of its kind: what it really costs
+                        vram_report(out, bank, slot, peaks, vram_cap, "first_" + job)
                     _unit_done(unit_now)
                     g1 = _compiled_graphs()
                     if g1 > g0:                     # this pass compiled (or recompiled) something
@@ -1142,6 +1159,55 @@ def _vram():
     except Exception:  # noqa: BLE001
         pass
     return {}
+
+
+def module_bytes(mod):
+    """Bytes of a torch module's parameters and buffers (0 for None)."""
+    if mod is None:
+        return 0
+    try:
+        return int(sum(t.numel() * t.element_size() for t in list(mod.parameters()) + list(mod.buffers())))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _cuda_peak(reset=False):
+    """torch.cuda.max_memory_allocated (None without CUDA); `reset` starts a new peak (per pass)."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        if reset:
+            torch.cuda.reset_peak_memory_stats()
+            return None
+        return int(torch.cuda.max_memory_allocated())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def vram_report(out, bank, slot, peaks, cap, why):
+    """One `vram_report` line: what the producer's process has allocated / reserved on its card, what
+    of it the teacher bank and the student are (their parameter and buffer bytes), and the last pass's
+    peak of each job kind -- the numbers the trainer / producer budget split is tuned from. Nothing
+    without CUDA (`cap` None)."""
+    if cap is None:
+        return None
+    try:
+        import torch
+        g = float(1 << 30)
+        stu = getattr(getattr(slot, "st", None), "raw", None)
+        rec = {"kind": "vram_report", "why": str(why),
+               "allocated_gb": round(torch.cuda.memory_allocated() / g, 3),
+               "reserved_gb": round(torch.cuda.memory_reserved() / g, 3),
+               "cap_gb": round(cap / g, 3),
+               "bank_gb": round((bank.footprint() if bank is not None else 0) / g, 3),
+               "bank_loaded": bank is not None and any(r[3] is not None for r in bank.items),
+               "student_gb": round(module_bytes(stu) / g, 3),
+               "peak_gb": {str(k): round(v / g, 3) for k, v in peaks.items() if v is not None}}
+    except Exception as e:  # noqa: BLE001  -- a report must never take the producer down
+        rec = {"kind": "vram_report", "why": str(why), "err": repr(e)}
+    jlog(out, "produce", rec, echo=False)
+    return rec
 
 
 def _vram_cap(device, mem_frac):

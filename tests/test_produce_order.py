@@ -1,4 +1,6 @@
 """The producer's pass order over one window: the passes a sampler worker is blocked on come first."""
+import os
+
 from rvsm.run import _gpu_order
 
 
@@ -112,3 +114,41 @@ def test_a_pass_that_is_not_blocking_does_not_make_the_fields_yield():
     gate.set_pending(())
     gate.release()
     assert not [r for r in logs if r.get("kind") == "fields_yield"]
+
+
+# --------------------------------------------------------------------------- the producer's VRAM report
+
+def test_vram_report_splits_the_card_between_bank_student_and_passes(tmp_path):
+    """`vram_report`: allocated / reserved, the bank's and the student's own parameter + buffer bytes,
+    and each job kind's last pass peak; nothing at all without CUDA (cap None)."""
+    import json
+    import types
+
+    import pytest
+    import torch
+    out = str(tmp_path)
+    assert RUN.vram_report(out, None, None, {}, None, "start") is None
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    t = torch.nn.Conv3d(4, 8, 3).cuda()                     # 8*4*27 + 8 floats
+    t.register_buffer("b", torch.zeros(1000, device="cuda"))
+    s = torch.nn.Linear(256, 256).cuda()
+    bank = RUN.TeacherBank.__new__(RUN.TeacherBank)
+    bank.items = [["recto", None, "x", t], ["m7", None, "y", None]]    # m7 not loaded yet
+    slot = types.SimpleNamespace(st=types.SimpleNamespace(raw=s))
+    RUN._cuda_peak(reset=True)
+    x = torch.zeros(64, 1 << 20, device="cuda")                       # a 256 MB pass
+    del x
+    peak = RUN._cuda_peak()
+    assert peak >= 256 << 20
+    rec = RUN.vram_report(out, bank, slot, {"teacher": peak}, 8 << 30, "periodic")
+    g = float(1 << 30)
+    assert rec["bank_gb"] == round(((8 * 4 * 27 + 8) * 4 + 4000) / g, 3) and rec["bank_loaded"]
+    assert rec["student_gb"] == round((256 * 256 + 256) * 4 / g, 3)
+    assert rec["peak_gb"]["teacher"] >= 0.25 and rec["cap_gb"] == 8.0
+    assert rec["allocated_gb"] <= rec["reserved_gb"]
+    with open(os.path.join(out, "logs", "produce.jsonl")) as f:
+        got = [json.loads(line) for line in f]
+    assert got[-1]["kind"] == "vram_report" and got[-1]["why"] == "periodic"
+    assert RUN.module_bytes(None) == 0
+
