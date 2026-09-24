@@ -243,6 +243,7 @@ def test_twenty_steps_of_the_full_recipe(full_cfg):
     if cfg.calibrate:
         assert "2" in last["temps"], last.get("temps")         # rung 2 is always calibrated now
     assert sorted(p.name for p in (out / "eval").glob("val_*.png"))
+    assert sorted((out / "eval").glob("val_*_r0.png")) and sorted((out / "eval").glob("val_*_regions.txt"))
     from PIL import Image
     im = Image.open(sorted((out / "eval").glob("val_*.png"))[-1])
     assert im.size == (3 * cfg.patch, 2 * cfg.patch)      # three tiles wide, one row per val patch
@@ -822,19 +823,29 @@ def test_the_trainer_holds_no_batch_per_step(tiny_cfg):
     assert late - warm < PAD_MB, f"trainer RSS grew {late - warm:.0f} MB after warm-up: {rss[::5]}"
 
 
-def test_the_second_panel_is_another_region_with_the_most_sheet(full_cfg):
-    """val_<step>_b.png: items from held-out regions other than the first item's, highest target
-    foreground first."""
-    a = _item(full_cfg, k=2, seed=1)
-    others = []
-    for j, frac in enumerate((0.1, 0.9, 0.5, 0.0, 0.7)):
-        it = _item(full_cfg, k=2, seed=10 + j)
-        it["lo"] = torch.tensor([2048 * (j + 1), 0, 0])
-        t = torch.zeros_like(it["tgt"])
-        t[0].view(-1)[: int(frac * t[0].numel())] = 255
-        it["tgt"] = t
-        others.append(it)
-    same = _item(full_cfg, k=2, seed=3)                      # the first item's region: never chosen
-    same["tgt"] = torch.full_like(same["tgt"], 255)
-    got = TR.second_panel([a, same] + others, region=1024)
-    assert [int(g["lo"][0]) for g in got] == [2048 * 2, 2048 * 5, 2048 * 3, 2048 * 1]
+def test_one_panel_per_held_out_region_with_the_most_sheet(full_cfg, tmp_path):
+    """val_<step>_r<k>.png per held-out region (grid order), each the region's windows with the
+    highest target foreground, and an index with the origin and the radius fraction."""
+    items = []
+    for reg in range(3):
+        for j, frac in enumerate((0.1, 0.9, 0.5, 0.0, 0.7)):
+            it = _item(full_cfg, k=2, seed=10 * reg + j)
+            it["lo"] = torch.tensor([2048 * reg + 8 * j, 0, 0])
+            t = torch.zeros_like(it["tgt"])
+            t[0].view(-1)[: int(frac * t[0].numel())] = 255
+            it["tgt"] = t
+            items.append(it)
+    pan = TR.region_panels(items, region=1024)
+    assert [p[0] for p in pan] == [(0, 0, 0), (2048, 0, 0), (4096, 0, 0)]
+    assert [[int(i["lo"][0]) % 2048 for i in p[2]] for p in pan] == [[8, 32, 16, 0]] * 3
+    lay = full_cfg.layout()
+    (tmp_path / "eval").mkdir()
+
+    class Z(torch.nn.Module):
+        def forward(self, x):
+            return torch.zeros((x.shape[0], lay.cout) + tuple(x.shape[2:]))
+    TR.write_region_panels(tmp_path, 26000, Z(), pan, torch.device("cpu"), lay)
+    assert sorted(p.name for p in (tmp_path / "eval").glob("val_026000_r*.png")) == \
+        [f"val_026000_r{k}.png" for k in range(3)]
+    idx = (tmp_path / "eval" / "val_026000_regions.txt").read_text().splitlines()
+    assert idx[0].startswith("k") and idx[2].split("\t")[1] == "2048,0,0"

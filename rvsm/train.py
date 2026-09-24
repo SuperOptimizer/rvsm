@@ -488,23 +488,52 @@ def _region_of_item(item, region):
     return tuple(((v << max(k - 2, 0)) // int(region)) * int(region) for v in lo)
 
 
-def second_panel(grid, region=1024, n=4):
-    """`n` grid items for the SECOND validation panel (`val_<step>_b.png`): from held-out regions other
-    than the first item's (the first panel is always the grid's first four windows, all from one
-    region), the ones with the highest target foreground fraction (recto >= 0.5 where weighted), so
-    the panel shows sheet. One pass over the grid, done once per run."""
-    if not grid:
-        return []
-    first = _region_of_item(grid[0], region)
-    scored = []
+def _radius_frac(item):
+    """Distance of a grid window's centre from the scroll axis, as a fraction of r_max (both in the
+    window's rung voxels: the item carries the axis over its z range and the radius denominator)."""
+    cyx = torch.as_tensor(item["cyx"]).double()
+    lo = [float(v) for v in torch.as_tensor(item["lo"]).reshape(-1)[:3]]
+    n = int(cyx.shape[-1])
+    c = cyx.reshape(2, -1)[:, n // 2]
+    yx = torch.tensor([lo[1] + n / 2.0, lo[2] + n / 2.0], dtype=torch.float64)
+    r = float(torch.linalg.norm(yx - c))
+    rmax = float(torch.as_tensor(item.get("rmax", 0.0)).reshape(-1)[0]) if "rmax" in item else 0.0
+    return r / rmax if rmax > 0 else float("nan")
+
+
+def region_panels(grid, region=1024, n=4):
+    """[(region origin, radius fraction, items)] -- one validation panel per held-out region, in the
+    grid's order (the held-out order): the `n` windows of that region with the highest target
+    foreground fraction (recto >= 0.5 where weighted). One pass over the grid, once per run; the
+    first panel of the old layout showed four windows of one region only."""
+    per = {}
+    order = []
     for i, it in enumerate(grid):
-        if _region_of_item(it, region) == first:
-            continue
+        r = _region_of_item(it, region)
+        if r not in per:
+            per[r] = []
+            order.append(r)
         t, w = torch.as_tensor(it["tgt"])[0], torch.as_tensor(it["w"])[0]
-        fg = float(((t >= 128) & (w > 0)).float().mean())
-        scored.append((fg, i))
-    scored.sort(reverse=True)
-    return [grid[i] for _, i in scored[:int(n)]]
+        per[r].append((float(((t >= 128) & (w > 0)).float().mean()), i, _radius_frac(it)))
+    out = []
+    for r in order:
+        best = sorted(per[r], key=lambda q: -q[0])[:int(n)]
+        fr = [q[2] for q in best if np.isfinite(q[2])]
+        out.append((r, float(np.mean(fr)) if fr else float("nan"), [grid[q[1]] for q in best]))
+    return out
+
+
+def write_region_panels(out, step, net, panels, dev, layout, cascade=None):
+    """val_<step>_r<k>.png for every held-out region k, and val_<step>_regions.txt: k, the region's
+    rung-2 origin (z, y, x) and its radius fraction from the umbilicus."""
+    import os
+    lines = ["k\tregion_origin_zyx\tradius_frac\tpanel"]
+    for k, (r, frac, items) in enumerate(panels):
+        name = f"val_{int(step):06d}_r{k}.png"
+        val_png(os.path.join(str(out), "eval", name), net, items, dev, layout, cascade=cascade)
+        lines.append(f"{k}\t{r[0]},{r[1]},{r[2]}\t{frac:.3f}\t{name}")
+    with open(os.path.join(str(out), "eval", f"val_{int(step):06d}_regions.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def val_png(path, net, grid, dev, layout, cascade=None, verso=None):
@@ -958,7 +987,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         tmp.replace(ck)
         saved["step"] = step
 
-    panel_b = {}                     # the second panel's items, chosen once per grid
+    panels = {}                      # one validation panel per held-out region, chosen once per run
 
     def do_eval():
         nonlocal temps
@@ -983,11 +1012,9 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         try:
             (out / "eval").mkdir(parents=True, exist_ok=True)
             val_png(out / "eval" / f"val_{step:06d}.png", evfwd, grid, dev, layout, cascade=casval)
-            if "b" not in panel_b:
-                panel_b["b"] = second_panel(grid, int(cfg.region))
-            if panel_b["b"]:
-                val_png(out / "eval" / f"val_{step:06d}_b.png", evfwd, panel_b["b"], dev, layout,
-                        cascade=casval)
+            if "p" not in panels:
+                panels["p"] = region_panels(grid, int(cfg.region))
+            write_region_panels(out, step, evfwd, panels["p"], dev, layout, cascade=casval)
         except Exception as e:   # noqa: BLE001  -- a missing PIL must never stop a run
             print("[train] val_png:", repr(e), flush=True)
         t_png = time.time() - te - t_ev
