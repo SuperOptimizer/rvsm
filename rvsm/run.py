@@ -823,9 +823,10 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     def need(lo, job):
         """What the reader prepares for a unit: its shards always, and a teacher unit's CT as well."""
         with clock:
-            if lo not in keys:
-                keys[lo] = cache.fetch_region(np.array(lo, np.int64), ctx=cfg.ctx, patch=cfg.patch,
-                                              region=cfg.region)
+            have = lo in keys
+        if not have:                            # the download itself runs WITHOUT the cache lock
+            cache.fetch_region_outside(np.array(lo, np.int64), clock, ctx=cfg.ctx, patch=cfg.patch,
+                                       region=cfg.region, on_booked=lambda k: keys.__setitem__(lo, k))
         if job == "teacher" and bank is not None:
             return bank.read(ct_local, lo, region_size(pyr, lo, cfg.region), pyr=pyr)
         return None
@@ -1953,17 +1954,18 @@ def acknowledge_leases(out, cache, keys, clock, state, fetch_kw):
         if last is not None and last[0] == lid and (last[1] or time.time() - last[2] < LEASE_RETRY_S):
             continue
         homes = [tuple(int(v) for v in lo) for lo in r.get("lease") or ()]
-        ready = []
         with clock:
-            for lo in homes:
-                k = cache.region_key(lo)
-                if lo not in keys or cache.missing(k):
-                    try:
-                        keys[lo] = cache.fetch_region(np.array(lo, np.int64), evict=False, **fetch_kw)
-                    except stream.FetchFailed:      # not ready; retried after LEASE_RETRY_S
-                        continue
-                if not cache.missing(k):
-                    ready.append(list(lo))
+            todo = [lo for lo in homes if lo not in keys or cache.missing(cache.region_key(lo))]
+        for lo in todo:
+            # the lock is held only for the books: a download (minutes behind a slow origin) must not
+            # hold up the reader, whose next unit waits on the same lock (`fetch_region_outside`)
+            try:
+                cache.fetch_region_outside(np.array(lo, np.int64), clock, evict=False,
+                                           on_booked=lambda k, lo=lo: keys.__setitem__(lo, k), **fetch_kw)
+            except stream.FetchFailed:              # not ready; retried after LEASE_RETRY_S
+                continue
+        with clock:
+            ready = [list(lo) for lo in homes if not cache.missing(cache.region_key(lo))]
             cache.evict()
         write_lease_ack(out, w, lid, ready, r.get("round"))
         state[w] = (lid, len(ready) == len(homes), time.time())

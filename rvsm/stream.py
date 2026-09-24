@@ -18,11 +18,15 @@ cache is a plain object the producer calls: `fetch_region` before a pass, `relea
 
 What survives verbatim from usrm2 is the part that was load-bearing:
 
-- ONE keep-alive `aiohttp` session with a bounded pool of 32 connections (on the 5090, 32 gave 21 MiB/s
+- ONE keep-alive `aiohttp` session per calling thread (the producer's reader and its lease keeper
+  download concurrently, outside their cache lock: `fetch_region_outside`) with a bounded pool of 32
+  connections (on the 5090, 32 gave 21 MiB/s
   from dl.ash2txt.org with no errors against 8 MiB/s at 16; 64 churning jobs got 3), because the origin rewards reuse and
   punishes bursts;
 - `.part` + `os.replace`, so a killed process never leaves a half shard that decodes as garbage;
-- a per-path lock, so two regions wanting the same shard cost one GET;
+- a per-path lock, so two regions wanting the same shard cost one GET (within a thread; across two
+  threads a shard may be fetched twice, each under its own `.part` name, and the second `os.replace`
+  is harmless);
 - 404 -> a zero-length `<path>.absent` marker: an absent key IS the array's fill value (air), and
   without the marker every later window re-asks the origin for it;
 - retries with linear backoff, and a loud line on the final failure.
@@ -58,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 
 import numpy as np
@@ -212,9 +217,10 @@ class Fetcher:
                         r.raise_for_status()
                         buf = await r.read()
                     os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path + ".part", "wb") as f:
+                    tmp = _part(path)
+                    with open(tmp, "wb") as f:
                         f.write(buf)
-                    os.replace(path + ".part", path)   # never a half shard under a live reader
+                    os.replace(tmp, path)   # never a half shard under a live reader
                     self.bytes += len(buf)
                     self.fetched += 1
                     self.requests += 1
@@ -237,12 +243,13 @@ class Fetcher:
             return None
         if os.path.isfile(src):
             os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = _part(path)
             try:
-                os.link(src, path + ".part")
+                os.link(src, tmp)
             except OSError:
                 import shutil
-                shutil.copyfile(src, path + ".part")
-            os.replace(path + ".part", path)
+                shutil.copyfile(src, tmp)
+            os.replace(tmp, path)
             self.seeded += 1
             return "new", 0
         if os.path.isfile(src + ".absent") or (complete and os.path.basename(src) != "zarr.json"):
@@ -251,6 +258,13 @@ class Fetcher:
             self.absent += 1
             return "absent", 0
         return None
+
+
+def _part(path):
+    """The temporary name a download is written under before its `os.replace`: private to this process
+    and thread (the producer's reader and lease keeper download concurrently, each on its own loop, and
+    may want the same shard), and ending in `.part` so `ShardCache.inventory` removes a killed one."""
+    return f"{path}.{os.getpid()}.{threading.get_ident()}.part"
 
 
 async def fetch_group_meta(f, base):
@@ -320,6 +334,10 @@ class ShardCache:
         self.lease_source = self._run_leases if self.remote else None
         self.region_args = None             # (ctx, region, rung) of fetch_region: a leased key's paths
         self.inventoried = 0
+        # the asyncio loop, session and fetcher are PER THREAD (`_tl`): `download` runs without the
+        # caller's lock (the producer's lease keeper and reader), and one loop cannot run twice at once
+        self._tl, self._clients, self._clients_lock = threading.local(), [], threading.Lock()
+        self.pending = {}                   # region key -> downloads in flight (`fetch_region_outside`)
         self._loop = self._sess = self._f = None
         self._meta = False
         os.makedirs(os.path.dirname(self.base), exist_ok=True)
@@ -374,10 +392,27 @@ class ShardCache:
 
     # ---- the asyncio side, kept private ---------------------------------
 
+    # this thread's loop / session / fetcher
+    _loop = property(lambda self: getattr(self._tl, "loop", None),
+                     lambda self, v: setattr(self._tl, "loop", v))
+    _sess = property(lambda self: getattr(self._tl, "sess", None),
+                     lambda self, v: setattr(self._tl, "sess", v))
+    _f = property(lambda self: getattr(self._tl, "f", None), lambda self, v: setattr(self._tl, "f", v))
+
+    def _client(self):
+        """This thread's entry in `_clients` (what `close` shuts down and `stats` sums)."""
+        c = getattr(self._tl, "client", None)
+        if c is None:
+            c = self._tl.client = {"loop": None, "sess": None, "f": None}
+            with self._clients_lock:
+                self._clients.append(c)
+        return c
+
     def _run(self, coro):
-        """Run one coroutine on THIS cache's loop, so the keep-alive session survives between calls."""
+        """Run one coroutine on THIS THREAD's loop of this cache, so the keep-alive session survives
+        between calls."""
         if self._loop is None:
-            self._loop = asyncio.new_event_loop()
+            self._loop = self._client()["loop"] = asyncio.new_event_loop()
         return self._loop.run_until_complete(coro)
 
     async def _fetcher(self):
@@ -388,6 +423,8 @@ class ShardCache:
                 timeout=aiohttp.ClientTimeout(total=600, sock_connect=30))
             self._f = Fetcher(self._sess, self.url_of, jobs=self.jobs, retries=self.retries,
                               log=self.log, seedof=self.seed_of if self.seed else None)
+            c = self._client()
+            c["sess"], c["f"] = self._sess, self._f
         return self._f
 
     def url_of(self, path):
@@ -412,12 +449,18 @@ class ShardCache:
         return os.path.join(self.seed, rel), self._complete[lvl] and os.sep in rel
 
     def close(self):
-        if self._sess is not None:
-            self._run(self._sess.close())
-            self._sess = self._f = None
-        if self._loop is not None:
-            self._loop.close()
-            self._loop = None
+        with self._clients_lock:
+            clients, self._clients = list(self._clients), []
+        for c in clients:                   # every thread's session and loop
+            try:
+                if c["sess"] is not None:
+                    c["loop"].run_until_complete(c["sess"].close())
+                if c["loop"] is not None:
+                    c["loop"].close()
+            except Exception:  # noqa: BLE001  -- a loop still running in its thread is left to it
+                pass
+            c["loop"] = c["sess"] = c["f"] = None
+        self._tl = threading.local()
 
     # ---- the pyramid ----------------------------------------------------
 
@@ -505,6 +548,14 @@ class ShardCache:
         and the region is retried on a later pass -- and `failed_units` counts it. A path that does not
         exist on disk (an `absent` shard, the origin's 404) is never charged or held."""
         paths = list(dict.fromkeys(paths))
+        self.download(paths, key=key)
+        return self.book(paths, pin=pin, key=key)
+
+    def download(self, paths, key=None):
+        """The network half of `_fetch`: get `paths` onto disk (this thread's loop and session), book
+        nothing, raise `FetchFailed` on a `fail`. Touches none of the books, so it may run while
+        another thread holds the caller's cache lock (`fetch_region_outside`)."""
+        paths = list(dict.fromkeys(paths))
         if self.remote and paths:
             async def go():
                 f = await self._fetcher()
@@ -512,10 +563,16 @@ class ShardCache:
             got = self._run(go()) or []
             bad = [p for p, r in zip(paths, got) if (r[0] if isinstance(r, tuple) else r) == "fail"]
             if bad:
-                self.failed_units = getattr(self, "failed_units", 0) + 1
+                with self._clients_lock:
+                    self.failed_units = getattr(self, "failed_units", 0) + 1
                 self.log(f"rvsm cache: FAILED unit {key or '(pin)'}: {len(bad)} of {len(paths)} shards "
                          f"did not arrive (failed units so far: {self.failed_units}); nothing booked")
                 raise FetchFailed(key, bad)
+        return paths
+
+    def book(self, paths, pin=False, key=None):
+        """The books half of `_fetch`: charge / hold / pin every one of `paths` that is on disk."""
+        paths = list(dict.fromkeys(paths))
         for p in paths:
             if not os.path.exists(p):
                 continue
@@ -543,26 +600,72 @@ class ShardCache:
         coarse shard covers the whole region's footprint many times over). Returns the region key that
         `release` takes. A local volume fetches nothing. `evict=False` leaves the budget to a later
         `evict()` (a producer re-holding several leased regions at startup must hold them all first)."""
+        key, paths = self.plan_region(lo2, ctx=ctx, patch=patch, region=region, rung=rung)
+        t0, c0 = time.time(), self._counts()
+        self._fetch(paths, key=key)
+        if evict:
+            self.evict()
+        self._log_region(key, paths, t0, c0)
+        return key
+
+    def plan_region(self, lo2, ctx=tuple(range(1, ladder.NCTX + 1)), patch=256, region=1024, rung=2):
+        """(key, paths) of `fetch_region`, recorded (`paths_of`) but not fetched."""
         pyr = self.levels()
         key = self.region_key(lo2)
         paths = region_paths(pyr, lo2, ctx, region, rung)
         self._paths_of[key] = paths
         self.region_args = (tuple(ctx), region, rung)
-        t0 = time.time()
+        return key, paths
+
+    def fetch_region_outside(self, lo2, lock, evict=True, on_booked=None, **kw):
+        """`fetch_region` for a caller that serialises its use of the cache with `lock` (the producer's
+        `clock`), holding that lock only for the books: the region's paths are planned and it is marked
+        PENDING under the lock, its shards are downloaded WITHOUT it (minutes behind a slow origin, while
+        the other threads keep using the cache), then booked, pending cleared and (`evict`) the budget
+        applied under it again. A pending region's shards are never evicted (`evict`), so the ones that
+        were already on disk are still there when it is booked. `on_booked(key)` runs under the lock
+        right after the booking (the caller's own record of what it holds, updated in the same step).
+        Returns the key; `FetchFailed` as `fetch_region`, with nothing booked."""
+        with lock:
+            key, paths = self.plan_region(lo2, **kw)
+            self.pending[key] = self.pending.get(key, 0) + 1
+        booked = False
+        try:
+            t0, c0 = time.time(), self._counts()
+            self.download(paths, key=key)
+            with lock:
+                self.book(paths, key=key)
+                self._unpend(key)
+                booked = True
+                if on_booked is not None:
+                    on_booked(key)
+                if evict:
+                    self.evict()
+        finally:
+            if not booked:
+                with lock:
+                    self._unpend(key)
+        self._log_region(key, paths, t0, c0)
+        return key
+
+    def _unpend(self, key):
+        n = self.pending.get(key, 0) - 1
+        if n > 0:
+            self.pending[key] = n
+        else:
+            self.pending.pop(key, None)
+
+    def _counts(self):
         f = self._f
-        b0, n0, s0 = (f.bytes, f.fetched, f.seeded) if f is not None else (0, 0, 0)
-        self._fetch(paths, key=key)
-        if evict:
-            self.evict()
+        return (f.bytes, f.fetched, f.seeded) if f is not None else (0, 0, 0)
+
+    def _log_region(self, key, paths, t0, c0):
         if self.remote:
-            f, dt = self._f, max(time.time() - t0, 1e-6)
-            mb = ((f.bytes - b0) if f is not None else 0) / (1 << 20)
-            got = (f.fetched - n0) if f is not None else 0
-            seeded = (f.seeded - s0) if f is not None else 0
+            (b1, n1, s1), dt = self._counts(), max(time.time() - t0, 1e-6)
+            mb, got, seeded = (b1 - c0[0]) / (1 << 20), n1 - c0[1], s1 - c0[2]
             self.log(f"rvsm cache: region {key} {len(paths)} shards in {dt:.1f}s: {got} fetched "
                      f"({mb:.0f} MiB, {mb / dt:.1f} MiB/s), {seeded} from the seed "
                      f"({self.cache_bytes / (1 << 30):.1f} GB buffered)")
-        return key
 
     def release(self, key):
         """The region is done with: its shards become evictable (the ones no other live region holds)."""
@@ -632,6 +735,8 @@ class ShardCache:
             return 0
         target, n = 0.9 * self.budget, 0
         keep = self._leased_paths()
+        for k in list(self.pending):        # a region being downloaded outside the lock
+            keep.update(self.paths_of(k) or ())
         for p, _i in sorted(self.ref.items(), key=lambda q: q[1]):
             if self.cache_bytes <= target:
                 break
@@ -649,8 +754,11 @@ class ShardCache:
         return n
 
     def stats(self):
-        f = self._f
         g = 1 << 30
+        with self._clients_lock:
+            fs = [c["f"] for c in self._clients if c["f"] is not None]
+        f = type("F", (), {k: sum(getattr(x, k, 0) for x in fs)
+                           for k in ("fetched", "seeded", "have", "absent", "failed")})
         return {"gb": self.cache_bytes / g, "shards": len(self.size), "pinned": len(self.pin),
                 "rolling_gb": self.cache_bytes / g,
                 "pinned_gb": sum(self.size.get(p, 0) for p in self.pin) / g,

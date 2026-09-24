@@ -393,10 +393,10 @@ def test_a_lease_whose_fetch_fails_is_acknowledged_unready_and_retried(tmp_path,
     c = stream.ShardCache("https://example.invalid/volume", out, budget_gb=1)
     calls = []
 
-    def boom(lo, **kw):
+    def boom(lo, lock, **kw):
         calls.append(tuple(int(v) for v in lo))
         raise stream.FetchFailed("k", ["p"])
-    monkeypatch.setattr(c, "fetch_region", boom)
+    monkeypatch.setattr(c, "fetch_region_outside", boom)
     monkeypatch.setattr(c, "missing", lambda key: True)
     RUN.write_state(out, round=0)
     RUN._write_json(os.path.join(RUN.cursor_dir(out), "w0.json"),
@@ -408,3 +408,92 @@ def test_a_lease_whose_fetch_fails_is_acknowledged_unready_and_retried(tmp_path,
     assert RUN.acknowledge_leases(out, c, {}, lk, st, {}) == []          # not before the retry delay
     st[0] = (st[0][0], st[0][1], st[0][2] - RUN.LEASE_RETRY_S - 1)
     assert RUN.acknowledge_leases(out, c, {}, lk, st, {}) == [(0, "p.1")] and calls == [A, A]
+
+
+def test_a_download_outside_the_lock_keeps_the_region_through_evictions(ct_origin, tmp_path, windowed):
+    """`fetch_region_outside`: the lock is free while the shards download (another thread uses the
+    cache meanwhile), the region is PENDING for that time -- its shards already on disk survive an
+    eviction under a 1-byte budget -- and it is booked (held, and `on_booked` recorded) under the lock
+    at the end; a failed download books nothing and clears the pending mark."""
+    import threading
+    c = stream.ShardCache(ct_origin.url, str(tmp_path / "c"), budget_gb=1)
+    c.pin_small_levels(max_vox=4_000_000)
+    ka = c.fetch_region(A, **KW)
+    pa = {p for p in c.regions[ka] if os.path.exists(p)}
+    c.release(ka)                               # A is on disk but nobody holds it
+    lk, go, inside = threading.Lock(), threading.Event(), threading.Event()
+    real = c.download
+
+    def slow(paths, key=None):
+        inside.set()
+        assert go.wait(20)
+        return real(paths, key=key)
+    c.download = slow
+    seen = {}
+    th = threading.Thread(target=lambda: seen.update(k=c.fetch_region_outside(
+        A, lk, on_booked=lambda k: seen.update(booked=k), **KW)))
+    th.start()
+    assert inside.wait(20)
+    assert lk.acquire(timeout=2), "the lock is held across the download"
+    try:                                        # meanwhile, the other thread: fetch B and evict hard
+        assert c.pending == {ka: 1}
+        c.download = real
+        kb = c.fetch_region(B, evict=False, **KW)
+        c.release(kb)
+        c.budget = 1
+        c.evict()
+        assert all(os.path.exists(p) for p in pa), "a pending region's shards were evicted"
+        pb = {p for p in c.paths_of(kb) if p not in pa}
+        assert not any(os.path.exists(p) for p in pb if p not in c.pin)
+        c.download = slow
+    finally:
+        lk.release()
+    go.set()
+    th.join(30)
+    assert seen == {"k": ka, "booked": ka} and not c.pending
+    assert pa <= c.regions[ka] and not c.missing(ka)
+    c.evict()                                   # held now: still there
+    assert all(os.path.exists(p) for p in pa)
+    c.release(ka)
+    c.evict()
+    assert not any(os.path.exists(p) for p in pa)
+
+    def fail(paths, key=None):
+        raise stream.FetchFailed(key, list(paths)[:1])
+    c.download = fail
+    with pytest.raises(stream.FetchFailed):
+        c.fetch_region_outside(A, lk, on_booked=lambda k: seen.update(again=k), **KW)
+    assert not c.pending and "again" not in seen and ka not in c.regions
+    c.close()
+
+
+def test_two_threads_download_the_same_region_at_once(ct_origin, tmp_path, windowed):
+    """The reader and the lease keeper may want the same region at the same moment: each thread has its
+    own loop and session, each download is written under its own `.part` name, and both end booked with
+    the whole region resident and readable."""
+    import threading
+    c = stream.ShardCache(ct_origin.url, str(tmp_path / "c"), budget_gb=1)
+    c.pin_small_levels(max_vox=4_000_000)
+    lk, keys, errs = threading.Lock(), [], []
+    bar = threading.Barrier(2)
+
+    def one():
+        try:
+            bar.wait(10)
+            keys.append(c.fetch_region_outside(A, lk, **KW))
+        except Exception as e:  # noqa: BLE001
+            errs.append(e)
+    ths = [threading.Thread(target=one) for _ in range(2)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(60)
+    assert not errs and len(keys) == 2 and keys[0] == keys[1] and not c.pending
+    paths = c.paths_of(keys[0])
+    assert stream.resident(paths) and not c.missing(keys[0])
+    assert not [n for dp, _d, fn in os.walk(c.base) for n in fn if n.endswith(".part")]
+    pyr = ladder.rungs(ct_origin.path)
+    got = ladder.read_rung(c.levels(), 2, A, 32, dtype=np.uint8)
+    assert np.array_equal(got, ladder.read_rung(pyr, 2, A, 32, dtype=np.uint8))
+    assert c.stats()["fetched"] >= 1
+    c.close()
