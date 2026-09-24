@@ -680,8 +680,13 @@ def zero_footprints(cov, k, lo, held, region):
 def _grid_corners(cfg, heldout, p, rungs=None, limit=8):
     """[(k, lo)] of the validation grid, in build order: non-overlapping tiles of each held-out region
     at each rung, evenly subsampled to `limit` per (region, rung)."""
+    return [(k, lo) for k, lo, _ in _grid_corners_by_region(cfg, heldout, p, rungs, limit)]
+
+
+def _grid_corners_by_region(cfg, heldout, p, rungs=None, limit=8):
+    """`_grid_corners` with the index into `heldout` of the region each corner tiles."""
     out = []
-    for r in heldout:
+    for ri, r in enumerate(heldout):
         lo2, sz2 = np.array(r["lo"], np.int64), np.array(r["size"], np.int64)
         for k in (cfg.rungs if rungs is None else rungs):
             d = int(k) - 2
@@ -691,7 +696,7 @@ def _grid_corners(cfg, heldout, p, rungs=None, limit=8):
                   for x in range(0, max(int(sz[2]) - int(p[2]), 0) + 1, int(p[2]))]
             if limit and len(cs) > limit:
                 cs = [cs[i] for i in np.linspace(0, len(cs) - 1, limit).astype(int)]
-            out += [(int(k), org + np.array(c, np.int64)) for c in cs]
+            out += [(int(k), org + np.array(c, np.int64), ri) for c in cs]
     return out
 
 
@@ -719,6 +724,28 @@ def grid_sources(ds, heldout):
         lo = tuple(int(v) for v in h["lo"])
         out.append([list(lo)] + [TG.source_digest(ds.cat.path(c, lo)) for c in chans])
     return out
+
+
+def grid_global(cfg, round_, heads):
+    """The part of a grid item's identity that every item shares: the schema and target-definition
+    versions, the store round, the heads with targets and the config fields an item is built from
+    (`grid_key` without the corners and the per-region sources)."""
+    from rvsm import targets as TG
+    return {"round": int(round_), "heads": list(heads), "schema": GRID_SCHEMA, "target_def": TG.TARGET_DEF,
+            "keys": [q for q in RUNG_ITEM_KEYS if q != "tch"], "patch": int(cfg.patch),
+            "ctx": [int(v) for v in cfg.ctx], "channels": [str(c) for c in cfg.channels],
+            "planes": str(cfg.planes), "rungs": [int(v) for v in cfg.rungs]}
+
+
+def _item_name(glob, source, k, lo):
+    """A grid item's file name: a digest of everything the item is built from (the global part, its
+    region's source entry, its rung and corner). An item whose inputs changed gets a NEW name, so a
+    rebuild never overwrites a file a live `DiskGrid` may be reading."""
+    import hashlib
+    import json
+    h = hashlib.sha256(json.dumps({"g": glob, "src": source, "k": int(k), "lo": [int(v) for v in lo]},
+                                  sort_keys=True).encode()).hexdigest()[:20]
+    return f"item_r{int(k)}_{h}.pt"
 
 
 def grid_key(cfg, corners, round_, heads, sources=None):
@@ -757,10 +784,19 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
     A grid item is ~310 MB (the CT and nine context cubes at 256^3 are 160 MB of it), and eight held-out
     regions make ~190 items: ~60 GB, which is the whole host on a 64 GB machine. With `spill=<dir>` the
     grid is written there compressed as it is built and returned as a `DiskGrid`, which holds ONE item
-    in memory at a time; a directory whose manifest matches this grid (`grid_key`) is reused as it is, so
-    a restart does not rebuild it. Once every held-out region has a verso store, the grid with the
-    verso targets is a NEW generation in its own directory (`grid_dir`); the recto grid is untouched. `threads` builds items concurrently (the reads are volcomp decodes, which run
-    without the GIL); the item order, and so the grid, does not depend on it."""
+    in memory at a time. The directory is reused ITEM BY ITEM: `grid.json` keeps a record per item (its
+    file, rung, corner, region, that region's `grid_sources` entry and the global part, `grid_global`),
+    and only the items of a region whose source changed -- or that are missing -- are rebuilt, under new
+    file names (`_item_name`), before the manifest is replaced atomically and the files no manifest
+    references are deleted. So a restart rebuilds nothing, and one held-out region's committed fields
+    bundle rebuilds that region's items only. The item order is always the corner order, and an item
+    is byte-for-byte what a from-scratch build writes for the same sources. The returned `DiskGrid`
+    carries `rebuilt` / `reused` item counts.
+
+    Once every held-out region has a verso store, the grid with the verso targets is a NEW generation in
+    its own directory (`grid_dir`); the recto grid is untouched. `threads` builds items concurrently
+    (the reads are volcomp decodes, which run without the GIL); the item order, and so the grid, does
+    not depend on it."""
     ds = Patches(cfg, root=root, ct=ct, ax=ax, round_=round_, region_records=list(heldout),
                  sym=False, **kw)
     ds._open()
@@ -789,25 +825,78 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
     import json
     import os
     heads = grid_heads(ds, heldout)
-    key = grid_key(cfg, corners, round_, heads, grid_sources(ds, heldout))
+    sources = grid_sources(ds, heldout)
+    key = grid_key(cfg, corners, round_, heads, sources)
+    glob = grid_global(cfg, round_, heads)
     spill = grid_dir(spill, heads)
     os.makedirs(spill, exist_ok=True)
     man = os.path.join(spill, "grid.json")
+    want = []                                   # one record per corner, in corner (build) order
+    for k, lo, ri in _grid_corners_by_region(cfg, heldout, p, rungs=rungs, limit=limit):
+        src = sources[ri]
+        want.append({"file": _item_name(glob, src, k, lo), "rung": int(k), "lo": [int(v) for v in lo],
+                     "region": [int(v) for v in heldout[ri]["lo"]], "source": src, "global": glob})
+    old = {}
     try:
         with open(man) as f:
             old = json.load(f)
-        if old.get("key") == key and all(os.path.exists(os.path.join(spill, q)) for q in old["items"]):
-            return DiskGrid(spill, old["items"])
-    except (OSError, ValueError, KeyError):
-        pass
-    names = []
-    for i, it in enumerate(items()):
-        names.append(f"item_{i:04d}.pt")
-        _save_item(os.path.join(spill, names[-1]), it)
+    except (OSError, ValueError):
+        old = {}
+    # an item is reused when the manifest lists it with the same global part and region source (its
+    # name is a digest of both, plus rung and corner) and its file is there; an old-format manifest
+    # (key + items only) has no records, so everything is rebuilt, under the new names
+    have = {}
+    for r in old.get("records") or []:
+        try:
+            if os.path.exists(os.path.join(spill, r["file"])):
+                have[r["file"]] = r
+        except (TypeError, KeyError):
+            continue
+    names = [w["file"] for w in want]
+    todo = [i for i, w in enumerate(want)
+            if not (w["file"] in have and have[w["file"]].get("global") == w["global"]
+                    and have[w["file"]].get("source") == w["source"])]
+    if not todo and old.get("items") == names and old.get("key") == key:
+        _drop_orphans(spill, names)             # a crash between the manifest and the cleanup
+        g = DiskGrid(spill, names)
+        g.rebuilt, g.reused = 0, len(names)
+        return g
+    built = set()
+    todo_c = [(want[i]["rung"], np.asarray(want[i]["lo"], np.int64)) for i in todo]
+    if int(threads) <= 1 or len(todo_c) < 2:
+        gen = (build(c) for c in todo_c)
+    else:
+        import concurrent.futures as cf
+        ex = cf.ThreadPoolExecutor(int(threads))
+        gen = ex.map(build, todo_c)             # map keeps the order
+    try:
+        for i, it in zip(todo, gen):
+            name = want[i]["file"]
+            if name not in built:               # two held-out regions sharing a tile: one file
+                _save_item(os.path.join(spill, name), it)
+                built.add(name)
+    finally:
+        if int(threads) > 1 and len(todo_c) >= 2:
+            ex.shutdown(wait=True)
     with open(man + ".tmp", "w") as f:
-        json.dump({"key": key, "items": names, "n": len(names)}, f)
+        json.dump({"key": key, "items": names, "n": len(names), "records": want}, f)
     os.replace(man + ".tmp", man)
-    return DiskGrid(spill, names)
+    _drop_orphans(spill, names)
+    g = DiskGrid(spill, names)
+    g.rebuilt, g.reused = len(built), len(names) - len(todo)
+    return g
+
+
+def _drop_orphans(spill, names):
+    """Delete the item files in `spill` the manifest (`names`) no longer references."""
+    import os
+    keep = set(names)
+    for fn in os.listdir(spill):
+        if fn.startswith("item_") and (fn.endswith(".pt") or fn.endswith(".pt.tmp")) and fn not in keep:
+            try:
+                os.remove(os.path.join(spill, fn))
+            except OSError:
+                pass
 
 
 _PACK_MIN = 1 << 20      # arrays at least this big are compressed on disk
@@ -854,6 +943,7 @@ class DiskGrid:
     def __init__(self, root, names):
         import os
         self.paths = [os.path.join(root, n) for n in names]
+        self.rebuilt, self.reused = len(self.paths), 0      # `val_grid` sets what it actually did
 
     def __len__(self):
         return len(self.paths)

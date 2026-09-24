@@ -887,3 +887,101 @@ def test_a_committed_regeneration_changes_the_grid_and_readers_see_one_bundle(sy
         os.remove(os.path.join(synth_run.root, "stores", "round_0", "bundle",
                                stores.region_name(lo)[:-5] + ".json"))
         shutil.rmtree(stores.gen_path(base, 1))
+
+
+# ------------------------------------------------------------------------ the incremental spilled grid
+
+def _grid_files(d):
+    return {f for f in os.listdir(d) if f.startswith("item_")}
+
+
+def _bump_region(root, lo):
+    """Commit a regenerated verso bundle for one region: that region's grid source changes."""
+    import shutil
+    base = stores.store_path(root, "verso", lo, 0)
+    shutil.copytree(stores.store_path(root, "recto", lo, 0), stores.gen_path(base, 1))
+    stores.commit_bundle(root, lo, 0, 1)
+
+    def undo():
+        os.remove(os.path.join(root, "stores", "round_0", "bundle", stores.region_name(lo)[:-5] + ".json"))
+        shutil.rmtree(stores.gen_path(base, 1))
+    return undo
+
+
+def _same_grid_files(da, na, db, nb):
+    import filecmp
+    assert na == nb
+    for n in na:
+        assert filecmp.cmp(os.path.join(da, n), os.path.join(db, n), shallow=False), n
+
+
+def test_the_spilled_grid_rebuilds_only_the_regions_whose_source_changed(synth_run, tmp_path):
+    """One held-out region's committed bundle rebuilds that region's items only, under NEW names (the
+    old files are never overwritten, and are deleted once no manifest names them); the result is the
+    from-scratch grid for the new sources: the same item list, in corner order, byte for byte."""
+    held = [r for r in synth_run.regions if r["k"] == 2][:2]
+    assert len(held) == 2
+    kw = dict(root=synth_run.root, ct=synth_run.cfg.ct, ax=synth_run.ax, rungs=(2, 3), limit=2)
+    d = tmp_path / "grid"
+    g0 = sample.val_grid(synth_run.cfg, held, spill=str(d), threads=2, **kw)
+    dd = sample.grid_dir(str(d), ("recto", "verso"))
+    man0 = json.load(open(os.path.join(dd, "grid.json")))
+    assert g0.rebuilt == len(g0) and g0.reused == 0
+    files0 = _grid_files(dd)
+    assert files0 == set(man0["items"])
+    per = [sum(1 for r in man0["records"] if r["region"] == [int(v) for v in h["lo"]]) for h in held]
+    assert all(per) and sum(per) == len(g0)
+    lo0 = tuple(int(v) for v in held[0]["lo"])
+    undo = _bump_region(synth_run.root, lo0)
+    try:
+        paths0 = list(g0.paths)
+        g1 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+        files1 = _grid_files(dd)
+        assert g1.rebuilt == per[0] and g1.reused == per[1]
+        assert len(files1 - files0) == per[0]                  # new files: region 0's items only
+        assert len(files0 - files1) == per[0]                  # its old ones are gone (orphans)
+        r1 = json.load(open(os.path.join(dd, "grid.json")))["records"]
+        for a, b in zip(man0["records"], r1):
+            same = a["region"] != list(lo0)
+            assert (a["file"] == b["file"]) == same
+        assert [p for p, r in zip(paths0, man0["records"]) if r["region"] != list(lo0)] == \
+            [p for p, r in zip(g1.paths, r1) if r["region"] != list(lo0)]
+        fresh = tmp_path / "fresh"
+        g2 = sample.val_grid(synth_run.cfg, held, spill=str(fresh), **kw)
+        df = sample.grid_dir(str(fresh), ("recto", "verso"))
+        n1 = [os.path.basename(p) for p in g1.paths]
+        _same_grid_files(dd, n1, df, [os.path.basename(p) for p in g2.paths])
+        assert [q["lo"].tolist() for q in g1] == [q["lo"].tolist() for q in g2]
+        g3 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)   # a restart: nothing rebuilt
+        assert g3.rebuilt == 0 and g3.reused == len(g1) and list(g3.paths) == list(g1.paths)
+    finally:
+        undo()
+    g4 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)       # back to the old sources
+    assert g4.rebuilt == per[0] and [os.path.basename(p) for p in g4.paths] == man0["items"]
+
+
+def test_the_grid_drops_orphans_and_rebuilds_an_old_format_manifest(synth_run, tmp_path):
+    """A manifest from before the per-item records (key + items only) is a full rebuild, never a
+    crash; its files, and any stray item file, are deleted once the new manifest is in place."""
+    held = [r for r in synth_run.regions if r["k"] == 2][:1]
+    kw = dict(root=synth_run.root, ct=synth_run.cfg.ct, ax=synth_run.ax, rungs=(2,), limit=2)
+    d = tmp_path / "grid"
+    dd = sample.grid_dir(str(d), ("recto", "verso"))
+    os.makedirs(dd)
+    for n in ("item_0000.pt", "item_0001.pt"):
+        open(os.path.join(dd, n), "wb").write(b"old")
+    json.dump({"key": "0123456789abcdef", "items": ["item_0000.pt", "item_0001.pt"], "n": 2},
+              open(os.path.join(dd, "grid.json"), "w"))
+    g = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+    assert g.rebuilt == len(g) and g.reused == 0
+    assert _grid_files(dd) == {os.path.basename(p) for p in g.paths}
+    assert "records" in json.load(open(os.path.join(dd, "grid.json")))
+    ref = sample.val_grid(synth_run.cfg, held, **kw)
+    assert [q["lo"].tolist() for q in g] == [q["lo"].tolist() for q in ref]
+    open(os.path.join(dd, "item_r2_stray.pt"), "wb").write(b"x")        # e.g. a crash's leftover
+    open(os.path.join(dd, "item_r2_stray.pt.tmp"), "wb").write(b"x")
+    g2 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+    assert g2.rebuilt == 0 and _grid_files(dd) == {os.path.basename(p) for p in g.paths}
+    os.remove(g.paths[0])                                                 # a missing item: rebuilt
+    g3 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
+    assert g3.rebuilt == 1 and list(g3.paths) == list(g.paths) and os.path.exists(g.paths[0])

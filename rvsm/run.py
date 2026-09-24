@@ -2245,20 +2245,24 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
                                threads=max(min(int(os.cpu_count() or 1) // 2, 4), 1))
 
     val = build_grid()
-    jlog(out, "sched", {"kind": "val_grid", "items": len(val), "s": round(time.time() - t_g, 1)})
+    jlog(out, "sched", {"kind": "val_grid", "items": len(val), "s": round(time.time() - t_g, 1),
+                        "rebuilt": int(getattr(val, "rebuilt", len(val))),
+                        "reused": int(getattr(val, "reused", 0))})
 
     def refresh_grid():
         """At an evaluation boundary: when the held-out labels a reader sees have changed (the verso
-        appeared, or a regenerated bundle was committed), the grid key changes and the verso/field grid
-        generation is (re)built; the recto reference grid directory is never touched. The trainer's
-        DiskGrid is updated IN PLACE, so the next evaluation reads the new items."""
+        appeared, or a regenerated bundle was committed), the items of the regions whose labels changed
+        are rebuilt under new names (the rest are reused, `sample.val_grid`); the recto reference grid
+        directory is never touched. The trainer's DiskGrid is updated IN PLACE, so the next evaluation
+        reads the new items."""
         t_r = time.time()
         new = build_grid()
         if getattr(new, "paths", None) is not None and list(new.paths) != list(val.paths):
             val.paths[:] = list(new.paths)
             jlog(out, "sched", {"kind": "val_grid_refresh", "items": len(val),
                                 "dir": os.path.dirname(val.paths[0]) if val.paths else "",
-                                "s": round(time.time() - t_r, 1)})
+                                "s": round(time.time() - t_r, 1), "rebuilt": int(new.rebuilt),
+                                "reused": int(new.reused)})
     st0 = read_state(out)
     state = {"round": int(st0.get("round", 0)), "stop": False, "ref": st0.get("round_ref")}
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
