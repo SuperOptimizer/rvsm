@@ -126,9 +126,13 @@ def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None
     sym  (): the cube symmetry index drawn by the worker (0 = identity), applied on the GPU
     rung (), norm (2,): the rung k and the (mean, std) of the z-score (std 0 = per-patch)
     cm   (Z/2, Y/2, X/2) uint8: the rung-(k+1) target block over the patch footprint -- the `mask` source
-         of the cascade channel, upsampled 2x on the GPU
+         of the cascade channel, upsampled 2x on the GPU. EMPTY (0, 0, 0) in a training draw whose
+         cascade mode never reads it (self, off, label-free): the key stays, so the stem width and the
+         collate do not change, but the block is neither read by the worker nor copied to the card
     cx   (1, Z, Y, X) uint8: the TENTH context cube (rung k + ctx[-1] + 1), the one extra cube the
-         rung-(k+1) input needs that the rung-k input does not
+         rung-(k+1) input needs that the rung-k input does not. EMPTY (1, 0, 0, 0) in a training draw
+         whose cascade mode never reads it (mask, off, label-free). In self / mix it is always sent: the
+         `cascade_drop` draw happens on the device, after the copy
     lo1  (3,) int64 / cyx1 (2, Z): the corner and axis of that rung-(k+1) cube, so `prep` can rebuild
          the coarse input's radial vector
     rmax (): the radius plane's denominator, in rung-k voxels
@@ -221,6 +225,8 @@ class Patches(torch.utils.data.IterableDataset):
         # send only the target rows with support (`rung_item(compact=True)`); `loader` turns it on for
         # batch 1 -- items with different row sets would not collate
         self.compact = False
+        # training draws leave empty the cascade extra the run's cascade mode never reads (`uses`)
+        self.lean = True
 
     # ---- opening (in the worker, never in the parent) --------------------
 
@@ -470,19 +476,37 @@ class Patches(torch.utils.data.IterableDataset):
 
     # ---- the extras ------------------------------------------------------
 
-    def _cascade_extras(self, k, lo, shape, rec=None):
+    def _cascade_extras(self, k, lo, shape, rec=None, lean=False):
         """`cm` (the rung-(k+1) target block over the patch footprint, half the patch on every axis) and,
         for the self/mix cascade modes, the tenth context cube `cx` and the corner `lo1` of the coarse
         cube. The top rung has no rung above it, so its cascade block is zero -- which is also what
-        `cascade_drop` teaches the model to expect."""
+        `cascade_drop` teaches the model to expect. `lean=True` (a training draw) leaves EMPTY the one
+        of the two this run's cascade mode never reads (`uses`); the validation grid always has both."""
         p, lo = ladder.shape3(shape), np.asarray(lo, np.int64)
         hp = np.maximum(p // 2, 1)
-        cm = self._target_block(self.channels[0], int(k) + 1, lo // 2, hp)
+        use_cm, use_cx = self.uses() if lean else (True, True)
+        cm = self._target_block(self.channels[0], int(k) + 1, lo // 2, hp) if use_cm else \
+            np.zeros((0, 0, 0), np.uint8)
         d = (int(self.ctx[-1]) + 1) if self.ctx else 1
         c0 = lo + p // 2
-        cx = self._ctx_cube(rec, k, d, lo, p) if rec is not None else \
-            ladder.read_rung(self.pyr, int(k) + d, c0 // (1 << d) - p // 2, p, dtype=np.uint8)
+        if not use_cx:
+            cx = np.zeros((1, 0, 0, 0), np.uint8)
+        elif rec is not None:
+            cx = self._ctx_cube(rec, k, d, lo, p)
+        else:
+            cx = ladder.read_rung(self.pyr, int(k) + d, c0 // (1 << d) - p // 2, p, dtype=np.uint8)
         return {"cm": cm, "cx": cx, "lo1": c0 // 2 - p // 2}
+
+    def uses(self):
+        """(cm, cx): whether this run's training cascade reads the coarse target block (mask, mix) and
+        the tenth context cube (self, mix). A label-free draw feeds no cascade at all. `lean` False
+        sends both whatever the mode."""
+        if not self.lean:
+            return True, True
+        if self.label_free:
+            return False, False
+        mode = str(getattr(self.cfg, "cascade", "self") or "off")
+        return mode in ("mask", "mix"), mode in ("self", "mix")
 
     SUPER_MAX = 128 << 20    # a visit's context super-cube is cached when it is at most this many voxels
 
@@ -578,7 +602,7 @@ class Patches(torch.utils.data.IterableDataset):
         sym = int(draw_sym(rng, tuple(p))) if self.sym else 0
         cx = [self._ctx_cube(rec, k, d, lo, ct.shape) for d in self.ctx] if self.ctx else ()
         return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, self.ax, sym, compact=self.compact,
-                         **self._plane_extras(k), **self._cascade_extras(k, lo, ct.shape, rec=rec))
+                         **self._plane_extras(k), **self._cascade_extras(k, lo, ct.shape, rec=rec, lean=True))
 
     def _dead(self, rec):
         """A rung 3-6 visit whose HOME region is held out, or is not a rung-2 region of the walk (its

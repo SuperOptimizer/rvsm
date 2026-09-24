@@ -299,6 +299,8 @@ class Cascade:
 
     def _mask(self, b, i, dev, dtype, S):
         """The `mask` source for sample i: the coarse target block, optionally roughened, upsampled 2x."""
+        assert b["cm"][i].numel() > 0, "cascade mask source on an item drawn without its coarse block " \
+            "(`Patches.uses`: the loader's cfg.cascade must be the trainer's)"
         c = b["cm"][i:i + 1].to(dev).to(dtype)[:, None] / 255.0
         if self.noise:
             r = float(self._rand())
@@ -366,7 +368,7 @@ class Cascade:
             if self.drop > 0 and float(self._rand()) < self.drop:
                 continue
             if self.mode == "self" or (self.mode == "mix" and float(self._rand()) < self.self_p):
-                assert self.net is not None and b.get("cx") is not None, \
+                assert self.net is not None and b.get("cx") is not None and b["cx"][i].numel() > 0, \
                     "cascade self mode needs a net and the tenth context cube"
                 t0 = time.perf_counter()
                 out[i:i + 1] = self._self(b, i, dev, dtype, S)

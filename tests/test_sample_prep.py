@@ -309,6 +309,43 @@ def test_weight_is_zero_near_the_umbilicus_for_verso(synth_run):
     assert w[ds.channels.index("recto")].max() > 0, "recto is supervised everywhere"
 
 
+@pytest.mark.parametrize("mode", ["self", "mask", "mix", "off"])
+def test_a_training_draw_sends_only_the_cascade_extra_its_mode_reads(synth_run, mode):
+    """`cm` is empty unless the cascade reads the mask source, `cx` unless it runs the self pass; what
+    `prepare` builds from the lean item is the full item's, bit for bit, with the same cascade draws."""
+    from dataclasses import replace
+    cfg = replace(synth_run.cfg, cascade=mode)
+    L = cfg.layout()
+    lean = sample.Patches(cfg, root=synth_run.root, ct=cfg.ct, ax=synth_run.ax,
+                          region_records=synth_run.regions, seed=7)
+    full = sample.Patches(cfg, root=synth_run.root, ct=cfg.ct, ax=synth_run.ax,
+                          region_records=synth_run.regions, seed=7)
+    full.lean = False
+    torch.manual_seed(0)
+    net = M.build("1m", cin=L.cin, cout=L.cout, verbose=False) if mode in ("self", "mix") else None
+    want_cm, want_cx = mode in ("mask", "mix"), mode in ("self", "mix")
+    for i, (a, b) in enumerate(zip(iter(lean), iter(full))):
+        if i == 6:
+            break
+        assert (a["cm"].numel() > 0) == want_cm and (a["cx"].numel() > 0) == want_cx
+        assert b["cm"].numel() > 0 and b["cx"].numel() > 0
+        outs = []
+        for it in (a, b):
+            cas = prep.Cascade(mode, self_p=0.5, drop=0.3, noise=True, net=net, seed=11 + i)
+            outs.append(prep.prepare(prep.batch1(it), torch.device("cpu"), cascade=cas, layout=L))
+        for u, v in zip(*outs):
+            assert torch.equal(u, v)
+
+
+def test_a_mask_cascade_on_an_item_without_its_block_fails_loudly(small_cfg):
+    L = small_cfg.layout()
+    it = _fake_item(nctx=L.nctx, p=8, k=2)
+    it["cm"] = torch.zeros((0, 0, 0), dtype=torch.uint8)
+    with pytest.raises(AssertionError, match="coarse block"):
+        prep.prepare(prep.batch1(it), torch.device("cpu"), layout=L,
+                     cascade=prep.Cascade("mask", drop=0.0, noise=False))
+
+
 def test_label_free_needs_no_stores(region_cfg, umbilicus):
     """Pretraining draws windows from the CT alone: no catalog, no store, no target."""
     from rvsm import axis as AX
@@ -319,6 +356,7 @@ def test_label_free_needs_no_stores(region_cfg, umbilicus):
     got = [next(it) for _ in range(8)]
     assert all(tuple(sorted(q)) == tuple(sorted(RUNG_ITEM_KEYS)) for q in got)
     assert all(not q["w"].any() and not q["tgt"].any() for q in got)
+    assert all(q["cm"].numel() == 0 and q["cx"].numel() == 0 for q in got)   # no cascade is fed
     assert any(int(q["ct"][0].max()) > 0 for q in got)
 
 
