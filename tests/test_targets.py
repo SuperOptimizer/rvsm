@@ -644,3 +644,25 @@ def test_the_device_batch_size_does_not_change_the_bytes(slab_region, tmp_path, 
     monkeypatch.setattr(targets, "FIELD_BATCH", 3)
     targets.region_fields(b.root, b.lo, b.ax, rungs=(2,), device=dev, **KW)
     _same_stores(a, b, rungs=(2,))
+
+
+def test_device_fields_wait_for_the_gpu_lock(slab_region):
+    """The producer's GPU fields never run beside a network pass: `region_fields(device=...)` does its
+    device work under the `gpu_lock` the pass holds."""
+    import threading
+    import time
+    from rvsm import run as RUN
+    r = slab_region(name="lk", n=128, recto_x=80, verso_x=70)
+    lk = RUN.TracedLock("gpu")
+    lk.acquire()                                    # a pass in flight
+    done = threading.Event()
+    th = threading.Thread(target=lambda: (targets.region_fields(r.root, r.lo, r.ax, rungs=(2,),
+                                                                device="cpu", gpu_lock=lk, **KW),
+                                          done.set()))
+    th.start()
+    time.sleep(1.5)
+    assert not done.is_set() and not targets.fields_current(r.root, r.lo, rungs=(2,), reach=12)
+    lk.release()
+    th.join(120)
+    assert done.is_set() and targets.fields_current(r.root, r.lo, rungs=(2,), reach=12)
+    assert lk.holder() is None

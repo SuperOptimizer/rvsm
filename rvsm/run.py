@@ -521,6 +521,9 @@ def torch_full_like_u8(t, v):
     return torch.full_like(t, int(v), dtype=torch.uint8)
 
 
+STUDENT_COMPILE_MODE = "default"   # the producer's student: torch.compile without autotuning
+
+
 class StudentSlot:
     """The student the producer runs, reloaded when its file changes and not otherwise.
 
@@ -529,10 +532,14 @@ class StudentSlot:
     (`ckpt/teacher_round_<r>.pt`, the EMA snapshotted when round r opened): a round's targets must come
     from one fixed network, not from the student that is being trained on them."""
 
-    def __init__(self, out, device=None, compile=True):
+    def __init__(self, out, device=None, compile=True, mode=None):
         self.out = str(out)
         self.path = os.path.join(self.out, "ckpt", "student.pt")
         self.device, self.compile = device, bool(compile)
+        # the producer's compile mode: "default" (no autotuning) unless RVSM_STUDENT_COMPILE_MODE says
+        # otherwise. max-autotune benchmarks every candidate kernel on the card, and behind Thunder's
+        # GPU proxy (an RPC per benchmark) the first student pass sat in that for 25+ minutes
+        self.mode = str(mode or os.environ.get("RVSM_STUDENT_COMPILE_MODE", STUDENT_COMPILE_MODE))
         self.st, self.mtime, self.loaded, self.sha = None, None, None, None
 
     def source(self, round_=0, teacher=None):
@@ -555,7 +562,14 @@ class StudentSlot:
                 import hashlib
                 with open(p, "rb") as f:          # read ONCE: the digest is of the bytes loaded
                     buf = f.read()
-                st = infer.student_fn(p, device=self.device, compile=self.compile, data=buf)
+                # a new checkpoint of the same network goes INTO the loaded (compiled) module: one
+                # compile per slot per process, not one per publish (`infer.Student.reload`)
+                reload = getattr(self.st, "reload", None)
+                if reload is not None and reload(p, data=buf):
+                    st = self.st
+                else:
+                    st = infer.student_fn(p, device=self.device, compile=self.compile, data=buf,
+                                          **({"mode": self.mode} if self.compile else {}))
                 self.st, self.mtime, self.loaded = st, m, p
                 self.sha = hashlib.sha256(buf).hexdigest()
                 del buf
@@ -665,6 +679,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     finishing the unit in flight. Every region is one json line in `logs/produce.jsonl`."""
     from rvsm import axis as AX, ladder, regions as RG, stores, stream, targets as TG
     out = str(out)
+    ncomp = limit_compile_threads()
     if role_gpu is not None and device is None:
         device = f"cuda:{int(role_gpu)}"
     if mem_frac:
@@ -692,6 +707,13 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
 
     stamp({"phase": "start"})
     threading.Thread(target=hb_ticker, args=(tick, hb_stop), name="rvsm-hb", daemon=True).start()
+    import torch  # noqa: F401  -- loaded now, so that the USR1 handler below is the last one set
+    register_stack_dumps()
+    stacks = stack_dump_file(out, "produce")    # the stall watch writes here (and to stderr)
+    unit_now = {}                               # the GPU unit in flight: job, region, t0
+    unit_now["locks"] = []                      # the traced locks whose holders a stall dump names
+    threading.Thread(target=unit_watchdog, args=(out, unit_now, stacks, hb_stop),
+                     name="rvsm-unit-watch", daemon=True).start()
 
     cache = stream.ShardCache(cfg.ct, out, budget_gb=cfg.cache_gb, seed=cfg.ct_seed or None,
                               log=lambda m: jlog(out, "produce", {"kind": "cache", "msg": str(m)},
@@ -715,13 +737,25 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     # every core at low priority
     fdev = str(device) if device is not None and str(device).startswith("cuda") else None
     jobs = 1 if fdev is not None else max(int(os.cpu_count() or 1), 1)
+    vram_cap = _vram_cap(device, mem_frac)      # bytes this process may reserve on its card (None: CPU)
+    fbatch = int(getattr(cfg, "fields_batch", 0) or 0) or \
+        (3 if vram_cap is not None and vram_cap >= 30 * (1 << 30) else 1)
+    # the GPU fields never run beside a network pass: a pass holds this for its whole forward, the
+    # fields hold it for a region's device work, and both empty the allocator's cache after
+    gpu_lock = TracedLock("gpu", log=lambda rec: jlog(out, "produce", rec, echo=False))
     jlog(out, "produce", {"kind": "start", "pid": os.getpid(), "device": str(device),
                           "regions": len(route), "heldout": len(held), "pinned": pinned,
                           "backend": str(backend), "field_rungs": list(frungs), "jobs": jobs,
-                          "fields_device": fdev or "cpu"})
+                          "fields_device": fdev or "cpu", "compile_threads": ncomp,
+                          "fields_batch": fbatch,
+                          "vram_cap_gb": None if vram_cap is None else round(vram_cap / (1 << 30), 2)})
 
     bank, slot = None, StudentSlot(out, device=device, compile=cfg.compile)
-    rslot = StudentSlot(out, device=device, compile=cfg.compile)   # the frozen regeneration student
+    # the frozen regeneration student is the SAME slot: its checkpoint is loaded into the one compiled
+    # module in place (`infer.Student.reload`) and the live one back after it. A second compiled
+    # student beside the live one and the teacher bank left no room for a pass's transient memory
+    # inside the producer's VRAM fraction (the 16:48 stall)
+    rslot = slot
     keys = {}
     backlog_keys = set()                        # regions fetched for the regeneration backlog
 
@@ -776,7 +810,12 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     fpool = TG.field_pool(jobs, owner=os.getpid()) if fdev is None and jobs > 1 else None
     pre = {}                                    # (lo, job) -> future of the reader's inputs
 
-    clock = threading.Lock()                    # the shard cache is not thread-safe: one caller at a time
+    # the shard cache is not thread-safe: one caller at a time. Traced: a wait over a minute logs who
+    # holds it (and since when), and the stall watch prints the holder with every stack dump
+    clock = TracedLock("clock", log=lambda rec: jlog(out, "produce", rec, echo=False))
+    unit_now["locks"] += [clock, gpu_lock]
+    readers = {"ex": reader}                    # replaced when a read times out (the stuck thread is left)
+    skip_until = {}                             # region -> time before which no GPU unit is started on it
 
     def need(lo, job):
         """What the reader prepares for a unit: its shards always, and a teacher unit's CT as well."""
@@ -790,7 +829,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
 
     def prefetch(lo, job):
         if (lo, job) not in pre:
-            pre[(lo, job)] = reader.submit(need, lo, job)
+            pre[(lo, job)] = readers["ex"].submit(need, lo, job)
 
     lease_state = {}                            # worker -> (lease_id, ready?, last attempt)
 
@@ -844,7 +883,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     def fields(lo, round_, t0, cursor):
         try:
             TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs, pool=fpool,
-                             device=fdev)
+                             device=fdev, batch=fbatch, gpu_lock=gpu_lock if fdev else None)
             g = TG.source_verso(out, lo, round_)[0]
             if g > stores.bundle_gen(out, lo, round_) and TG.fields_current(out, lo, round_, frungs):
                 # the new verso AND all of its fields are finished: only now do readers move to them
@@ -897,6 +936,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     continue
                 job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs,
                                 regen=st.get("verso_regen"))
+                if job is not None and job != "fields" and skip_until.get(lo, 0.0) > time.time():
+                    continue                    # its read timed out within the hour: not again yet
                 if job is not None:
                     units.append((lo, job))
             gpu_units = _gpu_order([u for u in units if u[1] != "fields"])
@@ -948,11 +989,30 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 stamp({"phase": f"round{round_}", "job": job,
                                  "region": list(lo), "last_ts": t0, "L": L, "cursor": cursor})
                 prefetch(lo, job)
+                unit_now.update(job=job, region=list(lo), t0=t0, dumped=0, phase="read")
+                _stall_timer(stacks)                # a C-level timer too: it needs no GIL to dump
+                jlog(out, "produce", {"kind": "unit_start", "job": job, "region": list(lo),
+                                      "round": round_, "phase": "read"}, echo=False)
+                import concurrent.futures as _cf
                 try:
-                    got = pre.pop((lo, job)).result()
+                    got = pre.pop((lo, job)).result(timeout=READ_TIMEOUT_S)
+                except _cf.TimeoutError:
+                    # the reader never came back (a shard fetch or the cache lock that hung): give up on
+                    # this unit, put the region aside for an hour, and read on a FRESH thread -- the
+                    # stuck one is abandoned, and every read queued behind it is resubmitted
+                    _unit_done(unit_now)
+                    skip_until[lo] = time.time() + READ_SKIP_S
+                    jlog(out, "produce", {"kind": "reader_timeout", "job": job, "region": list(lo),
+                                          "s": round(time.time() - t0, 1),
+                                          "clock_holder": clock.holder()})
+                    readers["ex"].shutdown(wait=False, cancel_futures=True)
+                    readers["ex"] = cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-read")
+                    pre.clear()
+                    break
                 except stream.FetchFailed as e:
                     # a shard did not arrive: nothing was booked and no store is written; the region
                     # stays unfinished, so a later pass over the window retries it
+                    _unit_done(unit_now)
                     jlog(out, "produce", {"kind": "fetch_failed", "region": list(lo), "job": job,
                                           "shards": len(e.paths),
                                           "failed_units": int(getattr(cache, "failed_units", 0))})
@@ -963,8 +1023,22 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 wslots.acquire()                    # backpressure: never more than two units unwritten
                 with lock:
                     busy.add(lo)
+                gpu_lock.acquire()                  # no GPU fields beside the pass (and none cached)
                 try:
+                    _vram_check(out, job, lo, vram_cap)
                     t1 = time.time()
+                    # a pass that will COMPILE first (a student slot's first forward in this process)
+                    # can take many minutes; say so before it starts, so a stall is visible
+                    cst = None if job == "teacher" else (rslot if _frozen else slot).st
+                    pending = bool(cst is not None and getattr(cst, "compiled", False)
+                                   and not getattr(cst, "warm", True))
+                    g0 = _compiled_graphs()
+                    unit_now.update(phase="gpu")
+                    jlog(out, "produce", {"kind": "unit_gpu", "job": job, "region": list(lo),
+                                          "round": round_, "size": [int(v) for v in size],
+                                          "compile_pending": pending,
+                                          "step": None if cst is None else int(getattr(cst, "step", 0))},
+                         echo=False)
                     if job == "teacher":
                         P, W, attrs = bank.probs_u8(ct_local, lo, size, rois=got)
                         pooled = RG.pool_chain(P, RG.COARSE_RUNGS)
@@ -997,12 +1071,23 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         del planes
                         pooled = None
                     t_gpu = time.time() - t1
+                    gpu_lock.release()
+                    _unit_done(unit_now)
+                    g1 = _compiled_graphs()
+                    if g1 > g0:                     # this pass compiled (or recompiled) something
+                        jlog(out, "produce", {"kind": "compile", "job": job, "region": list(lo),
+                                              "graphs": g1 - g0, "total_graphs": g1,
+                                              "pass_s": round(t_gpu, 1)})
                     extra = {"L": L, "cursor": cursor, "read_wait_s": round(t_in, 2),
                              "gpu_s": round(t_gpu, 2), **_vram()}
                     with lock:
                         pend.append(writer.submit(finish, job, lo, round_, t0, rows, attrs,
                                                   pooled, extra))
                 except BaseException:
+                    if gpu_lock.holder() is not None and gpu_lock.holder()["thread"] == \
+                            threading.current_thread().name:
+                        gpu_lock.release()
+                    _unit_done(unit_now)
                     with lock:
                         busy.discard(lo)
                     wslots.release()
@@ -1023,7 +1108,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if read_phase(out, "") == "produce" and not busy:
                     write_phase(out, "train")     # the window is drained: give the card back
     finally:
-        for ex in (reader, writer, fielder):
+        readers["ex"].shutdown(wait=False, cancel_futures=True)
+        for ex in (writer, fielder):
             ex.shutdown(wait=True)
         if fpool is not None:
             fpool.shutdown(wait=True)
@@ -1046,6 +1132,55 @@ def _vram():
     except Exception:  # noqa: BLE001
         pass
     return {}
+
+
+def _vram_cap(device, mem_frac):
+    """The bytes this process may reserve on its CUDA card: `mem_frac` of it (the producer's fraction),
+    or all of it; None without CUDA."""
+    if device is None or not str(device).startswith("cuda"):
+        return None
+    try:
+        import torch
+        tot = torch.cuda.get_device_properties(torch.device(device)).total_memory
+        return int(tot * float(mem_frac)) if mem_frac else int(tot)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+VRAM_HEADROOM = 1 << 30      # a pass starting with less than this left under the cap is logged
+
+
+def _vram_check(out, job, lo, cap):
+    """Before a network pass: give the allocator's cached blocks back (the fields' among them) and log
+    a `vram_pressure` line when what is still reserved leaves less than `VRAM_HEADROOM` under `cap` --
+    the state in which the caching allocator thrashes (free / retry at the fraction cap, no progress)
+    instead of failing."""
+    if cap is None:
+        return None
+    try:
+        import torch
+        torch.cuda.empty_cache()
+        res, alloc = torch.cuda.memory_reserved(), torch.cuda.memory_allocated()
+    except Exception:  # noqa: BLE001
+        return None
+    if cap - res < VRAM_HEADROOM:
+        jlog(out, "produce", {"kind": "vram_pressure", "job": job, "region": list(lo),
+                              "reserved_gb": round(res / (1 << 30), 2),
+                              "allocated_gb": round(alloc / (1 << 30), 2),
+                              "cap_gb": round(cap / (1 << 30), 2)})
+    return res
+
+
+def _compiled_graphs():
+    """How many graphs torch.compile has compiled in this process (0 before torch is imported)."""
+    import sys
+    utils = sys.modules.get("torch._dynamo.utils")
+    if utils is None:
+        return 0
+    try:
+        return int(utils.counters["stats"]["unique_graphs"])
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr):
@@ -1146,14 +1281,162 @@ def _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, rungs=
             cache.release(keys.pop(lo))
 
 
+UNIT_STALL_S = 300.0    # a unit in flight this long gets every thread's stack dumped, and again every
+                        # UNIT_STALL_S after that
+READ_TIMEOUT_S = 1200.0  # a unit's read (its shards, a teacher's CT) that has not come back is abandoned
+READ_SKIP_S = 3600.0     # ... and its region gets no GPU unit for this long
+LOCK_WAIT_LOG_S = 60.0   # a traced lock waited on this long logs its holder
+_STACK_FILES = {}        # kept open for the process's life
+
+
+class TracedLock:
+    """A `threading.Lock` that knows who holds it: the holder's thread name and since when. `with` it
+    as with a lock; a wait longer than `LOCK_WAIT_LOG_S` logs a `lock_wait` line naming the holder (and
+    keeps waiting). The producer's shard-cache lock is one: a stall behind it names its cause."""
+
+    def __init__(self, name, log=None):
+        import threading
+        self.name, self.log = str(name), log
+        self._lk = threading.Lock()
+        self._who, self._since = None, None
+
+    def holder(self):
+        who, since = self._who, self._since
+        return None if who is None else {"thread": who, "s": round(time.time() - since, 1)}
+
+    def acquire(self):
+        import threading
+        t0 = time.time()
+        while not self._lk.acquire(timeout=LOCK_WAIT_LOG_S):
+            if self.log is not None:
+                try:
+                    self.log({"kind": "lock_wait", "lock": self.name,
+                              "thread": threading.current_thread().name,
+                              "waited_s": round(time.time() - t0, 1), "holder": self.holder()})
+                except Exception:  # noqa: BLE001
+                    pass
+        self._who, self._since = threading.current_thread().name, time.time()
+        return True
+
+    def release(self):
+        self._who = self._since = None
+        self._lk.release()
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def _unit_done(unit):
+    """The unit in flight is over: forget it (the watch's lock list stays) and stop its stall timer."""
+    for k in ("job", "region", "t0", "phase", "dumped"):
+        unit.pop(k, None)
+    try:
+        import faulthandler
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stall_timer(f, every=None):
+    """`faulthandler.dump_traceback_later`: every `every` (`UNIT_STALL_S`) seconds until `_unit_done`,
+    all thread stacks into `f` from faulthandler's own C thread -- which, unlike the Python watch,
+    dumps even while some thread holds the GIL in native code."""
+    try:
+        import faulthandler
+        faulthandler.dump_traceback_later(float(every or UNIT_STALL_S), repeat=True, file=f)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def register_stack_dumps():
+    """`kill -USR1 <pid>` dumps every thread's Python stack to this process's stderr (for the producer:
+    run.log). Called first thing in the spawned producer and again once torch and its libraries are
+    loaded, so nothing installed in between can have replaced it."""
+    try:
+        import faulthandler
+        import signal
+        import sys
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=False)
+        return True
+    except (AttributeError, ValueError, RuntimeError, OSError):
+        return False
+
+
+def stack_dump_file(out, name):
+    """`<out>/logs/<name>_stacks.txt`, opened once for the process's life: where the stall watch writes
+    its dumps (and stderr gets them too)."""
+    p = os.path.join(str(out), "logs", f"{name}_stacks.txt")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    f = _STACK_FILES.get(p)
+    if f is None:
+        f = _STACK_FILES[p] = open(p, "a", buffering=1)
+    return f
+
+
+def unit_watchdog(out, unit, f, stop, every=UNIT_STALL_S, poll=10.0):
+    """The producer's stall watch: while a unit (its read or its GPU pass) has been in flight longer
+    than `every` seconds, dump all thread stacks into `f` and to stderr and log a `unit_stall` line
+    naming the holders of the traced locks in `unit["locks"]` -- once per `every`, so the next stall
+    says where it is without anyone attaching to the process."""
+    import faulthandler
+    import sys
+    while not stop.wait(poll):
+        try:
+            u = dict(unit)
+            if "t0" not in u:
+                continue
+            age = time.time() - float(u["t0"])
+            if age >= every * (int(u.get("dumped", 0)) + 1):
+                holders = {lk.name: lk.holder() for lk in u.get("locks") or ()}
+                head = (f"\n==== unit_stall {time.strftime('%Y-%m-%d %H:%M:%S')} pid {os.getpid()} "
+                        f"job {u.get('job')} region {u.get('region')} phase {u.get('phase')} "
+                        f"in flight {age:.0f} s, locks {holders} ====\n")
+                for dst in (f, sys.stderr):
+                    try:
+                        dst.write(head)
+                        dst.flush()
+                        faulthandler.dump_traceback(file=dst, all_threads=True)
+                        dst.flush()
+                    except Exception:  # noqa: BLE001
+                        pass
+                unit["dumped"] = int(u.get("dumped", 0)) + 1
+                jlog(out, "produce", {"kind": "unit_stall", "job": u.get("job"), "region": u.get("region"),
+                                      "phase": u.get("phase"), "s": round(age, 1), "locks": holders,
+                                      "stacks": f.name}, echo=False)
+        except Exception:  # noqa: BLE001  -- the watch must never take the producer down
+            pass
+
+
+def limit_compile_threads(n=1):
+    """Keep torch inductor's compile workers in this process: `TORCHINDUCTOR_COMPILE_THREADS` (unless
+    the environment already sets it; `RVSM_COMPILE_THREADS` overrides `n`), also applied to an
+    already-imported inductor config.
+
+    Inductor's default is one compile SUBPROCESS per core. On the 8-core production host a producer
+    compiling the student with max-autotune started eight of them beside the trainer, and host RAM
+    went from 20 to 64 GB in two minutes (the 17:20 reboot). In-process compiling is slower once per
+    process and costs no extra processes."""
+    import sys
+    n = int(os.environ.get("RVSM_COMPILE_THREADS", n))
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", str(max(n, 1)))
+    cfgmod = sys.modules.get("torch._inductor.config")
+    if cfgmod is not None:
+        cfgmod.compile_threads = int(os.environ["TORCHINDUCTOR_COMPILE_THREADS"])
+    return int(os.environ["TORCHINDUCTOR_COMPILE_THREADS"])
+
+
 def _produce_entry(cfg_json, out, gpu, frac, backend):
     """The spawned producer's entry point. Sets `CUDA_VISIBLE_DEVICES` BEFORE torch is imported, which
     is why this module imports torch nowhere at the top level."""
     own_process_group()         # the producer, its forkserver and its fields pool: one killable group
+    register_stack_dumps()      # `kill -USR1` dumps the producer's threads into run.log
+    limit_compile_threads()
     if gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(int(gpu))
-    from rvsm import cli
-    cli._stack_dumps()          # `kill -USR1` dumps the producer's threads too
     cfg = CFG.Config(**{k: CFG._coerce(k, v) for k, v in cfg_json.items() if k in CFG._TYPES})
     try:
         return produce_loop(cfg, out, role_gpu=None, device=("cuda:0" if gpu is not None else None),
@@ -1340,6 +1623,8 @@ def maybe_regen_verso(cfg, out, step):
     rewrites every verso store made by an earlier checkpoint as a NEW generation (never in place;
     `verso_needs_regen`). Returns True when it fires; never fires twice."""
     st = read_state(out)
+    if not bool(getattr(cfg, "verso_regen", True)):
+        return False
     if int(st.get("round", 0)) != 0 or not st.get("verso_on") or st.get("verso_regen"):
         return False
     pair_, _why = eval_streak(out, step)          # the EXACT current record, never an older one

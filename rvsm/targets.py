@@ -99,8 +99,10 @@ checks over the candidate voxels. Two implementations of the same rules:
     EDT (Triton kernels on CUDA) and ndimage replacements, written op for op in the numpy version's
     float32 order, `FIELD_BATCH` = 3 blocks per device batch. ~50 ms of device time per block on an
     RTX 5080 laptop GPU, ~0.83 GB of VRAM per block in the batch (2.5 GB at peak); the whole region (the
-    stores decoded once, pooled on the device, 584 blocks, then the six q=0 writes) ~53 s, of which
-    ~13 s is the volcomp encode of the last stores. On a GPU behind a proxy what counts is launches and
+    stores decoded one chunk row at a time, pooled on the device, 584 blocks, then the six q=0 writes)
+    ~53 s, of which ~13 s is the volcomp encode of the last stores. Host memory peaks at ~3.4 GB over
+    the process (the two 1 GB rung-2 output arrays the one-write-per-shard rule needs, a few decoded
+    chunk rows, the pooled rungs), no child process. On a GPU behind a proxy what counts is launches and
     synchronisations, so a batch goes through in ~540 launches (~180 per block, against ~1190 for one
     block before batching and fused labelling / walk kernels) and ~4 synchronisations (the pair-check
     compaction, one convergence check per labelling, the one read-back).
@@ -884,18 +886,83 @@ def _batches(tasks, size):
     return out
 
 
-def _fields_torch(init, tasks, device, take, rung_done=None, batch=None):
+class _SlabStore:
+    """A region store decoded a 128-plane z-slab (one row of chunks) at a time, for `_fields_torch`.
+
+    Rung 2 is served from the slabs a window touches, which are decoded on first use and dropped once
+    every later window starts below them (`drop_below`: the blocks run z-major), so at most the three or
+    four chunk rows a halo-48 window spans are in memory instead of the whole 1 GB store. Rungs 3 and
+    4 are the whole store's 2x / 4x pool (128 / 16 MB), built slab by slab as the slabs are decoded
+    (`pool2` of a slab of an even number of planes is that slab's share of the whole pool)."""
+
+    def __init__(self, arr, ks, dev):
+        self.arr, self.dev = arr, dev
+        self.S = tuple(int(v) for v in arr.shape[-3:])
+        self.slab = stores.CHUNK
+        self.rows = {}                              # chunk row -> decoded (128, Y, X) uint8
+        self.pooled = set()                         # chunk rows already folded into rung 3
+        self.need3 = max(ks) >= 3
+        self.r3 = np.zeros(tuple(v // 2 for v in self.S), np.uint8) if self.need3 else None
+        self.r4 = None
+        self.lock = __import__("threading").Lock()
+
+    def _row(self, c):
+        if c not in self.rows:
+            z0 = c * self.slab
+            v = np.asarray(self.arr[z0:min(z0 + self.slab, self.S[0])], np.uint8)
+            self.rows[c] = v
+            if self.need3 and c not in self.pooled:
+                self.r3[z0 // 2:(z0 + v.shape[0]) // 2] = _pool_device(v, self.dev)
+                self.pooled.add(c)
+        return self.rows[c]
+
+    def drop_below(self, c):
+        for q in [q for q in self.rows if q < c]:
+            del self.rows[q]
+
+    def shape(self, k):
+        return tuple(v >> (int(k) - 2) for v in self.S)
+
+    def window(self, k, lo, shape):
+        """`_window` of the rung-k store (the whole store's pool above rung 2), air outside it."""
+        with self.lock:
+            if int(k) == 2:
+                out = np.zeros(tuple(int(v) for v in shape), np.uint8)
+                lo = np.asarray(lo, np.int64)
+                a = np.maximum(lo, 0)
+                b = np.minimum(lo + np.asarray(shape, np.int64), np.asarray(self.S, np.int64))
+                if (b > a).all():
+                    for c in range(int(a[0]) // self.slab, (int(b[0]) - 1) // self.slab + 1):
+                        v = self._row(c)
+                        z0, z1 = max(int(a[0]), c * self.slab), min(int(b[0]), c * self.slab + v.shape[0])
+                        out[z0 - lo[0]:z1 - lo[0], a[1] - lo[1]:b[1] - lo[1], a[2] - lo[2]:b[2] - lo[2]] = \
+                            v[z0 - c * self.slab:z1 - c * self.slab, a[1]:b[1], a[2]:b[2]]
+                return out
+            for c in range(-(-self.S[0] // self.slab)):     # every slab pooled, then rung 3 / 4
+                if c not in self.pooled:
+                    self._row(c)
+                    del self.rows[c]
+            self.rows.clear()
+            if int(k) == 3:
+                return _window(self.r3, lo, shape)
+            if self.r4 is None:
+                self.r4 = _pool_device(self.r3, self.dev)
+            return _window(self.r4, lo, shape)
+
+
+def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_lock=None):
     """`region_fields`' blocks on a torch `device`, in task order, each result handed to `take`.
 
-    The region's recto / verso stores are decoded ONCE, whole (a block read with a 48 halo decodes up
-    to 27 of the 128^3 chunks for one 224^3 window; the whole store is each chunk once), pooled to rungs
-    3 / 4 on the device, and every block's window is cut out of that host copy with air outside it --
-    `read_pooled`'s bytes. The blocks go through the device `batch` (`FIELD_BATCH`) at a time: the
-    windows and the per-block axis / coverage vectors are prepared on a helper thread and copied
-    without synchronising, everything `_block` computes on the host (axis offsets, core, coverage, the
-    fields, the encoding) is computed on the device, and each batch is read back once (its encoded
-    cores and support rows). `rung_done(k)` is called after the last block of rung k has been handed
-    to `take`."""
+    The region's recto / verso stores are decoded one chunk row at a time (`_SlabStore`: a block read
+    with a 48 halo straight from zarr decodes up to 27 of the 128^3 chunks for one 224^3 window; this
+    decodes each chunk once and holds at most a few rows), pooled to rungs 3 / 4 on the device, and
+    every block's window is cut out of them with air outside -- `read_pooled`'s bytes. The blocks go
+    through the device `batch` (`FIELD_BATCH`) at a time: the windows and the per-block axis / coverage
+    vectors are prepared on a helper thread and copied without synchronising, everything `_block`
+    computes on the host (axis offsets, core, coverage, the fields, the encoding) is computed on the
+    device, and each batch is read back once (its encoded cores and support rows). `rung_done(k)` is
+    called after the last block of rung k has been handed to `take`. Host memory: a few chunk rows and
+    the pooled rungs of each store, the batch's windows and its pinned staging, released at the end."""
     import contextlib
 
     import torch
@@ -906,41 +973,37 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None):
     ver_a = stores.open_store(vp) if vp else None
     origin2 = np.asarray(rec_a.attrs["origin_zyx"], np.int64)
     ks = sorted({int(t[0]) for t in tasks})
-    fine = {"recto": np.asarray(rec_a[:], np.uint8),
-            "verso": None if ver_a is None else np.asarray(ver_a[:], np.uint8)}
-    vols = {}
-    for key, v in fine.items():
-        cur = v
-        for k in range(2, max(ks) + 1):
-            if k > 2 and cur is not None:
-                cur = _pool_device(cur, dev)
-            if k in ks:
-                vols[(key, k)] = cur
-    del fine, cur, v
+    src = {"recto": _SlabStore(rec_a, ks, dev), "verso": None if ver_a is None else _SlabStore(ver_a, ks, dev)}
     groups = _batches(tasks, batch)
-    last2 = max((i for i, g in enumerate(groups) if int(g[0][0]) == 2), default=-1)
     axk = {k: AX.axis_at(np.asarray(ax, np.float64), k) for k in ks}
     stream = torch.cuda.Stream(dev) if dev.type == "cuda" else None
     ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
 
-    def cut(group):
+    def cut(gi):
+        group = groups[gi]
         k, n = int(group[0][0]), group[0][2]
         rsh = tuple(int(v) + 2 * int(halo) for v in n)
         rlos = [np.asarray(lo, np.int64) - (origin2 >> (k - 2)) - int(halo) for _, lo, _ in group]
-        rec = np.stack([_window(vols[("recto", k)], r, rsh) for r in rlos])
-        ver = None if vols[("verso", k)] is None else \
-            np.stack([_window(vols[("verso", k)], r, rsh) for r in rlos])
-        ext = [int(v) for v in vols[("recto", k)].shape]
+        rec = np.stack([src["recto"].window(k, r, rsh) for r in rlos])
+        ver = None if src["verso"] is None else np.stack([src["verso"].window(k, r, rsh) for r in rlos])
+        if k == 2:                                  # rung-2 rows no later window reads are dropped
+            later = [int(t[1][0]) - int(origin2[0]) - int(halo) for g in groups[gi + 1:] for t in g
+                     if int(t[0]) == 2]
+            low = (max(min(later), 0) // stores.CHUNK) if later else 1 << 30
+            for sv in src.values():
+                if sv is not None:
+                    sv.drop_below(low)
+        ext = list(src["recto"].shape(k))
         return rsh, rec, ver, _host_inputs(axk[k], [lo for _, lo, _ in group], rsh, rlos, ext, halo)
 
     import concurrent.futures as cf
-    with torch.no_grad(), ctx, cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fcut") as cutter:
-        nxt = cutter.submit(cut, groups[0]) if groups else None
+    if gpu_lock is None:
+        gpu_lock = contextlib.nullcontext()
+    with gpu_lock, torch.no_grad(), ctx, cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fcut") as cutter:
+        nxt = cutter.submit(cut, 0) if groups else None
         for gi, group in enumerate(groups):
             rsh, rec, ver, host = nxt.result()
-            if gi == last2:                        # the rung-2 stores are the big ones: drop them early
-                vols[("recto", 2)] = vols[("verso", 2)] = None
-            nxt = cutter.submit(cut, groups[gi + 1]) if gi + 1 < len(groups) else None
+            nxt = cutter.submit(cut, gi + 1) if gi + 1 < len(groups) else None
             k, n = int(group[0][0]), group[0][2]
             dy, dx, core, cover = _block_inputs_torch(host, rsh, float(axis_r_um) / ladder.rung_um(k),
                                                       halo, dev)
@@ -965,10 +1028,14 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None):
                       _support(cnt_h[j].tolist())))
             if rung_done is not None and (gi + 1 == len(groups) or int(groups[gi + 1][0][0]) != k):
                 rung_done(k)
-    if stream is not None:
-        stream.synchronize()
-        del vols
-        torch.cuda.empty_cache()            # hand the ~2.5 GB back to the process's other GPU users
+        del src
+        if stream is not None:              # still under the lock: the next pass finds the card clean
+            stream.synchronize()
+            torch.cuda.empty_cache()        # hand the fields' blocks back to the process's other users
+            try:
+                torch._C._host_emptyCache()  # and the pinned staging buffers back to the host
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _blocks(shape, block):
@@ -1052,7 +1119,7 @@ def fields_current(root, lo, round_=0, rungs=(2, 3, 4), reach=REACH, tmin=TMIN, 
 
 def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXIS_R_UM,
                   thr=0.5, cap=CAP, tmin=TMIN, tmax=TMAX, reach=REACH, block=BLOCK, halo=HALO,
-                  force=False, pool=None, device=None):
+                  force=False, pool=None, device=None, batch=None, gpu_lock=None):
     """Build the `midline` and `thickness` stores of one region, at every rung in `rungs`.
 
     `root` is the run directory, `lo` the region corner in rung-2 voxels, `ax` the umbilicus control
@@ -1068,7 +1135,9 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     at region granularity. `pool` is a `field_pool` the caller keeps alive across regions (a producer);
     without one, `jobs > 1` forks a pool for this call. `device` (a torch device or its name) computes
     every block with `block_fields_torch` on that device, in this process and in block order, instead
-    (`_fields_torch`); `jobs` and `pool` are then unused.
+    (`_fields_torch`), `batch` blocks at a time (default `FIELD_BATCH`), holding `gpu_lock` (a lock
+    shared with whatever else uses the card in this process) for the device work; `jobs` and `pool` are
+    then unused.
 
     A pooled rung whose shape is not a multiple of 128 is padded up to one, because a store's shape must
     be; the padding is code 0, i.e. no data. For the production region (1024 at rung 2) rungs 3 and 4 are
@@ -1132,7 +1201,8 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
         with cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fwrite") as wr:
             futs = []
             _fields_torch(init, tasks, device, take,
-                          rung_done=lambda k: futs.append(wr.submit(write_rung, *byk[k])))
+                          rung_done=lambda k: futs.append(wr.submit(write_rung, *byk[k])),
+                          batch=batch, gpu_lock=gpu_lock)
             for f in futs:
                 f.result()
         return rep

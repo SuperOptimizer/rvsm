@@ -813,12 +813,7 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
                          **ds._plane_extras(int(k)), **ds._cascade_extras(int(k), lo, ct_.shape))
 
     def items():
-        if int(threads) <= 1:
-            yield from (build(c) for c in corners)
-            return
-        import concurrent.futures as cf
-        with cf.ThreadPoolExecutor(int(threads)) as ex:
-            yield from ex.map(build, corners)      # map keeps the corner order
+        yield from _bounded_map(build, corners, threads)
 
     if spill is None:
         return list(items())
@@ -863,21 +858,12 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
         return g
     built = set()
     todo_c = [(want[i]["rung"], np.asarray(want[i]["lo"], np.int64)) for i in todo]
-    if int(threads) <= 1 or len(todo_c) < 2:
-        gen = (build(c) for c in todo_c)
-    else:
-        import concurrent.futures as cf
-        ex = cf.ThreadPoolExecutor(int(threads))
-        gen = ex.map(build, todo_c)             # map keeps the order
-    try:
-        for i, it in zip(todo, gen):
-            name = want[i]["file"]
-            if name not in built:               # two held-out regions sharing a tile: one file
-                _save_item(os.path.join(spill, name), it)
-                built.add(name)
-    finally:
-        if int(threads) > 1 and len(todo_c) >= 2:
-            ex.shutdown(wait=True)
+    for i, it in zip(todo, _bounded_map(build, todo_c, threads)):
+        name = want[i]["file"]
+        if name not in built:                   # two held-out regions sharing a tile: one file
+            _save_item(os.path.join(spill, name), it)
+            built.add(name)
+        del it
     with open(man + ".tmp", "w") as f:
         json.dump({"key": key, "items": names, "n": len(names), "records": want}, f)
     os.replace(man + ".tmp", man)
@@ -885,6 +871,36 @@ def val_grid(cfg, heldout, root=None, ct=None, ax=None, round_=0, rungs=None, li
     g = DiskGrid(spill, names)
     g.rebuilt, g.reused = len(built), len(names) - len(todo)
     return g
+
+
+def _bounded_map(fn, xs, threads):
+    """`fn` over `xs` in order, on `threads` threads, with at most `threads` results built ahead of the
+    consumer. `ThreadPoolExecutor.map` submits EVERYTHING at once and holds each finished result until
+    it is taken, so with a consumer slower than the builders (compressing and writing a ~310 MB item)
+    the whole grid could pile up in memory; here at most 2 * `threads` items exist at a time (building
+    or waiting) plus the one being written."""
+    n = max(int(threads), 1)
+    if n <= 1 or len(xs) < 2:
+        for x in xs:
+            yield fn(x)
+        return
+    import collections
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(n) as ex:
+        q = collections.deque()
+        it = iter(xs)
+        for x in it:
+            q.append(ex.submit(fn, x))
+            if len(q) >= 2 * n:
+                break
+        end = object()
+        while q:
+            r = q.popleft().result()
+            nxt = next(it, end)
+            if nxt is not end:
+                q.append(ex.submit(fn, nxt))
+            yield r
+            del r
 
 
 def _drop_orphans(spill, names):

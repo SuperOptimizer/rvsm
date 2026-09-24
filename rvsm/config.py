@@ -160,7 +160,9 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        "loss_prob_dice", "loss_pair",
                        # scheduling of the verso passes and of the round gate (pass-3 item 11, P3-03)
                        "verso_regen_gain", "round_min_steps_after_verso", "verso_min_regions",
-                       "ram_trainer_gb", "ram_host_exit")
+                       "ram_trainer_gb", "ram_host_exit",
+                       # the producer's GPU fields batch and whether it regenerates old verso stores
+                       "fields_batch", "verso_regen")
 
 
 @dataclass
@@ -257,6 +259,9 @@ class Config:
                                        # stores from older checkpoints are regenerated once (new generation)
     round_min_steps_after_verso: int = 8000   # round 0 is promoted only this long after verso_on
     verso_min_regions: int = 200       # ... and with at least this many finished verso stores
+    verso_regen: bool = True           # regenerate round 0's old verso stores once (verso_regen_gain)
+    fields_batch: int = 0              # blocks per GPU fields batch in the producer (~0.83 GB each);
+                                       # 0: 1 when the producer's VRAM budget is under 30 GB, else 3
     ram_trainer_gb: float = 40.0       # the trainer's own RSS past this: checkpoint and exit cleanly
     ram_host_exit: float = 0.90        # ... or the host's memory in use past this share of MemTotal
     verso_gate_dice: float = 0.6       # ... or earlier, once the held-out recto reaches this dice

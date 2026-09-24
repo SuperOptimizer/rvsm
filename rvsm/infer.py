@@ -660,8 +660,45 @@ class Student:
         net.load_state_dict(sd)
         net.eval()
         self.raw = net
-        self.net = (torch.compile(net, mode=mode) if (compile and self.dev.type == "cuda") else net)
+        self.arch = self._arch(cfg, layout, st)
+        self.compiled = bool(compile and self.dev.type == "cuda")
+        self.warm = False                     # no forward yet: a compiled student compiles on it
+        # dynamic=False: every window is the same (1, cin, w, w, w) tensor (`StudentInputs.prep`, a
+        # region thinner than a window padded to one), so ONE static graph; a stray new shape then
+        # compiles a second static graph instead of a dynamic-shape one
+        self.net = torch.compile(net, mode=mode, dynamic=False) if self.compiled else net
         self.planes = tuple(str(c) for c in layout.channels) + self.FIELDS
+
+    @staticmethod
+    def _arch(cfg, layout, st):
+        """What the NETWORK is (not its weights): two checkpoints with the same arch can share one
+        built -- and one compiled -- module."""
+        return (str(cfg.size), int(layout.cin), int(layout.cout), int(st.get("add_skip", 0)),
+                tuple(str(c) for c in layout.channels))
+
+    def reload(self, ckpt, data=None, temps=True):
+        """Load another checkpoint's weights INTO this student's module, in place, and return True; or
+        return False (nothing changed) when its network differs (`_arch`), so the caller builds a new
+        `Student`.
+
+        In place is the point: the compiled forward (`torch.compile`, guarded on the module and on
+        its parameters' shapes and dtypes, never on their values) is reused as it is, so a producer that
+        follows the live checkpoint compiles ONCE per process. A new module per checkpoint recompiled
+        on every publish (minutes with max-autotune, and every old compiled graph kept its module
+        alive), and after `torch._dynamo.config.cache_size_limit` of them the forward silently fell
+        back to eager."""
+        st, cfg, layout, sd, tmps, step = load_student_ckpt(ckpt, map_location=self.dev, data=data)
+        if self._arch(cfg, layout, st) != self.arch:
+            return False
+        with torch.no_grad():
+            cur = self.raw.state_dict()
+            assert set(cur) == set(sd), f"{ckpt}: the state dict keys differ from the loaded student's"
+            for k, v in sd.items():
+                cur[k].copy_(v.to(cur[k].device, cur[k].dtype))
+        self.ckpt, self.cfg, self.layout, self.step = str(ckpt), cfg, layout, step
+        self.temps = tmps if temps else {}
+        self.use_temps = bool(temps)
+        return True
 
     # ---- the planes ----------------------------------------------------------------------------
     def temp(self, rung):
@@ -705,6 +742,7 @@ class Student:
         def go(x):
             with torch.no_grad(), P.autocast(self.dev):
                 y = self.net(x.contiguous(memory_format=M.memfmt()))
+            self.warm = True                  # the compile (if any) is behind us
             y = y[0] if isinstance(y, (list, tuple)) else y
             return torch.cat([f(y) for f in parts], 1)
         go.plane_names = names

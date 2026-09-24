@@ -867,3 +867,90 @@ def test_a_constant_region_comes_back_constant_at_the_corners():
         assert float(err.max()) <= 0.25, (v, float(err.max()))
         for c in ((0, 0, 0), (n - 1, n - 1, n - 1), (0, n - 1, 0)):
             assert abs(float(pl[c]) - v) <= 0.25, c
+
+
+# --------------------------------------------------------------------------- #
+# the producer's student: one compile per process
+# --------------------------------------------------------------------------- #
+def _other_ckpt(tmp_path, cfg, name, seed, step):
+    from rvsm import model as M
+    L = cfg.layout()
+    torch.manual_seed(seed)
+    net = M.build(cfg.size, cin=L.cin, cout=L.cout, verbose=False)
+    return infer.save_student(str(tmp_path / name), net.state_dict(), cfg, temps={2: 1.25}, step=step)
+
+
+def test_a_student_reloads_a_new_checkpoint_into_the_same_module(student_env, student_ckpt, tmp_path):
+    """`Student.reload` puts another checkpoint's weights into the loaded module in place: the result is
+    what a freshly built `Student` of that checkpoint computes, and the module (so the compiled forward)
+    is the same object. A different network is refused, not half-loaded."""
+    e = student_env
+    other = _other_ckpt(tmp_path, e.cfg, "other.pt", 7, 456)
+    s = infer.student_fn(student_ckpt, device="cpu", compile=False)
+    raw, net = s.raw, s.net
+    kw = dict(heads=["recto"], meta=e.meta, device="cpu", window=WIN, halo=HALO, cascade_depth=0)
+    before = infer.student_region(s, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 64), **kw)["recto"]
+    assert s.reload(other) is True
+    assert s.raw is raw and s.net is net and s.step == 456 and s.ckpt == other and s.temps == {2: 1.25}
+    got = infer.student_region(s, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 64), **kw)["recto"]
+    fresh = infer.student_fn(other, device="cpu", compile=False)
+    want = infer.student_region(fresh, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 64), **kw)["recto"]
+    assert np.array_equal(got, want) and not np.array_equal(got, before)
+    import dataclasses
+    from rvsm import model as M
+    c2 = dataclasses.replace(e.cfg, size="5m" if str(e.cfg.size) != "5m" else "1m")
+    L = c2.layout()
+    big = infer.save_student(str(tmp_path / "big.pt"),
+                             M.build(c2.size, cin=L.cin, cout=L.cout, verbose=False).state_dict(), c2)
+    assert s.reload(big) is False and s.ckpt == other          # another network: nothing touched
+
+
+def test_the_producer_slot_follows_the_live_checkpoint_in_place(student_ckpt, tmp_path, region_cfg):
+    """`run.StudentSlot` loads a newly published `student.pt` into the student it already has."""
+    import shutil
+    from rvsm import run as RUN
+    out = tmp_path / "run"
+    (out / "ckpt").mkdir(parents=True)
+    live = out / "ckpt" / "student.pt"
+    shutil.copy(student_ckpt, live)
+    slot = RUN.StudentSlot(str(out), device="cpu", compile=False)
+    s1 = slot.get(0)
+    assert s1.step == 123
+    other = _other_ckpt(tmp_path, region_cfg, "next.pt", 3, 789)
+    shutil.copy(other, str(live) + ".tmp")
+    os.replace(str(live) + ".tmp", live)
+    os.utime(live, (1e9, 1e9))                                  # a different mtime, whatever the clock
+    s2 = slot.get(0)
+    assert s2 is s1 and s2.step == 789 and s2.ckpt == str(live)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compile counting needs the CUDA path")
+def test_the_compiled_student_compiles_once_for_every_region_shape_and_checkpoint(student_env, student_ckpt,
+                                                                                   tmp_path, monkeypatch):
+    """Every window reaches the compiled student as the same (1, cin, w, w, w) tensor -- a region cut
+    by the volume end or thinner than a window is padded to whole windows -- and a new checkpoint is
+    loaded into the same module: so one compile serves every region and every checkpoint, and the
+    compiled pass writes what the eager student does."""
+    import torch._dynamo
+    e = student_env
+    graphs = []
+
+    def counting(gm, example_inputs):
+        graphs.append(tuple(tuple(t.shape) for t in example_inputs if torch.is_tensor(t)))
+        return gm.forward
+
+    real = torch.compile
+    monkeypatch.setattr(torch, "compile", lambda net, **kw: real(net, backend=counting,
+                                                                dynamic=kw.get("dynamic")))
+    torch._dynamo.reset()
+    s = infer.student_fn(student_ckpt, device="cuda", compile=True, mode="default")
+    eager = infer.student_fn(student_ckpt, device="cuda", compile=False)
+    kw = dict(heads=["recto"], meta=e.meta, device="cuda", window=WIN, halo=HALO, cascade_depth=1)
+    for lo, size in (((0, 64, 0), (64, 64, 64)), ((0, 64, 0), (50, 20, 64)), ((64, 0, 96), (64, 64, 32))):
+        got = infer.student_region(s, e.cfg.ct, e.ax, lo, size, **kw)["recto"]
+        want = infer.student_region(eager, e.cfg.ct, e.ax, lo, size, **kw)["recto"]
+        assert got.shape == tuple(size) and np.array_equal(got, want), size
+    assert s.reload(_other_ckpt(tmp_path, e.cfg, "o.pt", 5, 9)) is True
+    infer.student_region(s, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 64), **kw)
+    assert len(graphs) == 1, graphs
+    torch._dynamo.reset()

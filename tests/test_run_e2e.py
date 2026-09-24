@@ -1415,3 +1415,118 @@ def test_the_manual_verso_hold(tmp_path):
     assert cli.main(["verso", "release", "--out", out]) == 0 and not RUN.verso_held(out)
     assert RUN.apply_verso_hold(out, 32000, True, why) is True           # released: decides normally
     assert cli.main(["verso", "bogus", "--out", out]) == 2
+
+
+
+def test_a_stalled_unit_gets_its_stacks_dumped_and_logged(tmp_path, capfd):
+    """The producer's watchdog: a unit in flight past the limit dumps every thread's stack into
+    logs/produce_stacks.txt AND stderr, names the holders of the traced locks, and logs a `unit_stall`
+    line (once per period)."""
+    import threading
+    import time
+    out = str(tmp_path)
+    f = RUN.stack_dump_file(out, "produce")
+    lk = RUN.TracedLock("clock")
+    unit, stop = {"job": "verso", "region": [1, 2, 3], "t0": time.time() - 1.0, "phase": "read",
+                  "locks": [lk]}, threading.Event()
+    lk.acquire()                                               # held by this (the main) thread
+    th = threading.Thread(target=RUN.unit_watchdog, args=(out, unit, f, stop),
+                          kwargs={"every": 0.5, "poll": 0.05}, daemon=True)
+    th.start()
+    deadline = time.time() + 5
+    while unit.get("dumped", 0) < 1 and time.time() < deadline:
+        time.sleep(0.05)
+    stop.set()
+    th.join(2)
+    lk.release()
+    txt = open(os.path.join(out, "logs", "produce_stacks.txt")).read()
+    assert "unit_stall" in txt and "verso" in txt and "MainThread" in txt and "Thread" in txt
+    assert "unit_stall" in capfd.readouterr().err
+    rows = [json.loads(q) for q in open(os.path.join(out, "logs", "produce.jsonl"))]
+    st = [r for r in rows if r["kind"] == "unit_stall"]
+    assert st and st[0]["region"] == [1, 2, 3] and st[0]["locks"]["clock"]["thread"] == "MainThread"
+    RUN._unit_done(unit)
+    assert unit == {"locks": [lk]}
+
+
+def test_a_traced_lock_names_its_holder_to_a_waiter(monkeypatch):
+    import threading
+    import time
+    monkeypatch.setattr(RUN, "LOCK_WAIT_LOG_S", 0.1)
+    said = []
+    lk = RUN.TracedLock("clock", log=said.append)
+    got = threading.Event()
+
+    def hold():
+        with lk:
+            got.set()
+            time.sleep(0.5)
+    th = threading.Thread(target=hold, name="rvsm-lease")
+    th.start()
+    got.wait(2)
+    with lk:
+        pass
+    th.join()
+    assert said and said[0]["kind"] == "lock_wait" and said[0]["holder"]["thread"] == "rvsm-lease"
+    assert lk.holder() is None
+
+
+def _usr1_child(path, ready):
+    """A spawned child set up as `_produce_entry` sets itself up (stderr is the run log), then torch."""
+    import os
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    os.dup2(fd, 2)
+    from rvsm import run
+    run.register_stack_dumps()
+    import torch  # noqa: F401
+    run.register_stack_dumps()
+    ready.set()
+    import time
+    time.sleep(30)
+
+
+def test_sigusr1_dumps_the_stacks_of_a_spawned_producer(tmp_path):
+    """`kill -USR1` on a SPAWNED child (as the producer is started) writes every thread's stack into
+    its stderr."""
+    import multiprocessing as mp
+    import signal
+    import time
+    log = str(tmp_path / "run.log")
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    p = ctx.Process(target=_usr1_child, args=(log, ready), daemon=True)
+    p.start()
+    try:
+        assert ready.wait(120)
+        os.kill(p.pid, signal.SIGUSR1)
+        deadline = time.time() + 10
+        txt = ""
+        while time.time() < deadline and "most recent call first" not in txt:
+            time.sleep(0.1)
+            txt = open(log).read() if os.path.exists(log) else ""
+        assert "most recent call first" in txt and "_usr1_child" in txt
+        assert p.is_alive()                                    # a dump, not a kill
+    finally:
+        p.kill()
+        p.join(5)
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs a CUDA allocator")
+def test_a_pass_under_vram_pressure_is_logged(tmp_path):
+    import torch
+    out = str(tmp_path)
+    x = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")        # 64 MB reserved and in use
+    res = torch.cuda.memory_reserved()
+    RUN._vram_check(out, "verso", (1, 2, 3), res + (512 << 20))         # half a GB of headroom
+    RUN._vram_check(out, "verso", (1, 2, 3), res + (4 << 30))           # plenty
+    rows = [json.loads(q) for q in open(os.path.join(out, "logs", "produce.jsonl"))]
+    assert [r["kind"] for r in rows] == ["vram_pressure"] and rows[0]["region"] == [1, 2, 3]
+    del x
+
+
+def test_the_regeneration_student_is_the_live_slot():
+    """No second compiled student: the frozen regeneration checkpoint is loaded into the live slot."""
+    import inspect
+    src = inspect.getsource(RUN.produce_loop)
+    assert "rslot = slot" in src and "StudentSlot(out, device=device, compile=cfg.compile)" in src
+    assert src.count("StudentSlot(") == 1

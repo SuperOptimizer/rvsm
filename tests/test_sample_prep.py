@@ -985,3 +985,26 @@ def test_the_grid_drops_orphans_and_rebuilds_an_old_format_manifest(synth_run, t
     os.remove(g.paths[0])                                                 # a missing item: rebuilt
     g3 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
     assert g3.rebuilt == 1 and list(g3.paths) == list(g.paths) and os.path.exists(g.paths[0])
+
+
+def test_the_grid_builders_never_run_far_ahead_of_the_writer():
+    """`_bounded_map` keeps the order and never holds more than 2 * threads results ahead of a slow
+    consumer (`ThreadPoolExecutor.map` would build the whole grid into memory)."""
+    import threading
+    import time
+    live, peak, lock = [0], [0], threading.Lock()
+
+    def build(i):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        return i
+
+    out = []
+    for r in sample._bounded_map(build, list(range(40)), 3):
+        time.sleep(0.005)                              # the writer is the slow side
+        out.append(r)
+        with lock:
+            live[0] -= 1
+    assert out == list(range(40)) and peak[0] <= 2 * 3 + 1
+    assert list(sample._bounded_map(lambda i: i * i, [1, 2, 3], 1)) == [1, 4, 9]
