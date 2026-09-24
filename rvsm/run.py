@@ -899,7 +899,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                 regen=st.get("verso_regen"))
                 if job is not None:
                     units.append((lo, job))
-            gpu_units = [u for u in units if u[1] != "fields"]
+            gpu_units = _gpu_order([u for u in units if u[1] != "fields"])
             regen = st.get("verso_regen")
             if round_ == 0 and regen and not st.get("verso_regen_done") and not gpu_units:
                 # the regeneration BACKLOG, worked through when the lookahead window has nothing for
@@ -1052,6 +1052,17 @@ def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr):
     from rvsm import infer
     return infer.student_region(stu, ct, ax, lo, size, sign=sign, heads=want, meta=meta5, pyr=pyr,
                                 as_tensor=True)
+
+
+def _gpu_order(units):
+    """The GPU units of one pass over the window, blocking passes first. A region without its recto
+    (round 0: `teacher`; round r >= 1: `self`) is one a sampler worker cannot use at all, and the
+    in-order DataLoader then holds every worker until it lands; a region lacking only its `verso` is
+    already trainable (the verso earns a revisit later). Before this the window ran in walk order,
+    so once verso came on a window of ~20 one-minute verso passes ran ahead of the teacher pass the
+    fastest worker was waiting on and the trainer sat idle for 14 minutes (paris4, step 46440).
+    Stable: walk order is kept within each class."""
+    return sorted(units, key=lambda u: 1 if u[1] == "verso" else 0)
 
 
 def _window(route, pos, cursor, L, held, head=None):
