@@ -48,10 +48,12 @@ class WalkPatches(sample.Patches):
         r = (read_state(self.out) or {}).get("round")
         return r is not None and int(r) != int(self.round)
 
-    def _publish(self, w, W, pos, region_s, done=(), npass=0, lease=()):
+    def _publish(self, w, W, pos, region_s, done=(), npass=0, lease=(), wait_since=None):
         """Publish this worker's walk position, stamped with its round, and its lease (the home regions
         it is reading or about to read). A walk whose round is over does not write at all (the readers
-        in `run` reject a record of another round as well: this check and the write are not atomic)."""
+        in `run` reject a record of another round as well: this check and the write are not atomic).
+        `wait_since`: when this worker started waiting for its pending homes (None: it is not waiting);
+        the producer logs a `starved` line for a wait past a minute."""
         if self._stale():
             return False
         n = self.__dict__["_lease_n"] = self.__dict__.get("_lease_n", 0) + 1
@@ -61,7 +63,7 @@ class WalkPatches(sample.Patches):
                      "region_s": float(region_s), "t": time.time(),
                      "done": sorted(int(q) for q in done), "pass": int(npass),
                      "lease": [list(lo) for lo in dict.fromkeys(tuple(v) for v in lease)],
-                     "lease_id": self._lease_id})
+                     "lease_id": self._lease_id, "wait_since": wait_since})
         return True
 
     def _await_ack(self, w, home, timeout=None):
@@ -135,6 +137,7 @@ class WalkPatches(sample.Patches):
         rng = np.random.default_rng(self.seed + 1000 * w + 7919 * npass + pos)
         pend, revisit, seen_no_verso = [], [], {}     # pend / revisit hold (position, visit)
         t_last, region_s = time.time(), 0.0
+        wait_t0 = None                        # when the current wait for the pending homes started
 
         def floor():        # a revisit (position -1) is not a place in the walk
             return min([q for q, _ in pend if q >= 0] + [pos])
@@ -157,8 +160,9 @@ class WalkPatches(sample.Patches):
                     return
                 # waiting: lease what is pending, so a home the producer let go is fetched again
                 f = floor()
+                wait_t0 = wait_t0 or time.time()
                 self._publish(w, W, f, region_s, {v for v in visited if v >= f}, npass,
-                              lease=self._lease(i for _, i in pend))
+                              lease=self._lease(i for _, i in pend), wait_since=wait_t0)
                 jlog(self.out, "train", {"kind": "wait", "worker": int(w),
                                          "train_wait_s": self.wait_s, "pending": len(pend)},
                      echo=False)
@@ -166,6 +170,7 @@ class WalkPatches(sample.Patches):
                 self.cat = type(self.cat)(self.root, self.round)   # drop the cached MISSes
                 continue
             q, i = pend.pop(pick)
+            wait_t0 = None
             rec = self.visits[i]
             lo = self._region_lo(rec)
             had_verso = self.cat.done("verso", lo)

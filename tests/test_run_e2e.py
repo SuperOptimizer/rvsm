@@ -314,6 +314,59 @@ def test_the_window_reaches_past_the_fastest_worker(tmp_path):
     assert (42,) in new and (51,) in new and (52,) not in new and (29,) not in new
 
 
+def test_a_leased_region_outside_the_window_gets_its_teacher_pass_first(tmp_path):
+    """paris4 20:13-20:46: a worker waited 33 minutes on a region that needed a teacher pass while the
+    producer ran 16 verso passes, because the region was not in `_window` (cursor .. head + L visits):
+    a worker leases the homes of its next visits along its OWN stride, ~6x further than head + L, and a
+    region whose first walk position is behind the cursor is never in the window. Every leased region
+    is now in the producer's set, and its blocking pass runs before everything else, in lease order."""
+    out = str(tmp_path / "c")
+    for w, p in enumerate((5, 5, 5, 5, 5, 6)):
+        lease = [[31 + w]] if w != 3 else [[90], [96], [12]]     # worker 3 waits on 90, 96 and 12
+        RUN._write_json(os.path.join(RUN.cursor_dir(out), f"w{w}.json"),
+                        {"pos": p, "stride": 6, "worker": w, "lease": lease,
+                         "wait_since": 1000.0 if w == 3 else None})
+    recs = RUN.cursor_records(out)
+    cursor, head = RUN.read_cursor(out), RUN.read_cursor_head(out)
+    route = [(n,) for n in range(100)]
+    pos = {(n,): n for n in range(100)}
+    win = RUN._window(route, pos, cursor, 9, [], head=head)
+    assert (90,) not in win and (96,) not in win and (12,) not in win     # the bug
+    lorder = RUN.lease_order(recs)
+    assert lorder[:6] == [(31,), (32,), (33,), (90,), (35,), (36,)] and lorder[6:] == [(96,), (12,)]
+    ws = RUN._working_set(lorder, win)
+    assert ws[:len(lorder)] == lorder and len(ws) == len(set(ws)) and set(win) <= set(ws)
+    # the next producer pass: every region lacks its recto (teacher), a few window ones only their verso
+    units = [(lo, "verso" if lo in {(40,), (41,)} else "teacher") for lo in ws]
+    order = RUN._gpu_order(units, leased=lorder)
+    assert order[:len(lorder)] == [(lo, "teacher") for lo in lorder]
+    assert [u for u in order if u[1] == "verso"] == order[-2:]
+    # and the starved worker is explained in one line
+    lines = RUN._log_starved(out, recs, {}, set(ws), lambda lo: "teacher",
+                             lambda lo: {"busy": False, "skipped": False, "no_size": False}, now=1100.0)
+    assert len(lines) == 1 and lines[0]["worker"] == 3 and lines[0]["waited_s"] == 100.0
+    assert [r["region"] for r in lines[0]["waiting_on"]] == [[90], [96], [12]]
+    assert all(r["in_set"] for r in lines[0]["waiting_on"])
+    last = {3: 1090.0}                                         # logged 10 s ago: not again yet
+    assert RUN._log_starved(out, recs, last, set(), lambda lo: "teacher",
+                            lambda lo: {}, now=1100.0) == []
+    assert RUN._log_starved(out, recs, {}, set(), lambda lo: "teacher", lambda lo: {}, now=1030.0) == []
+
+
+def test_a_waiting_worker_publishes_since_when(tmp_path):
+    """The worker's cursor record carries `wait_since` while it waits (None otherwise): what the
+    producer's `starved` line is made from."""
+    from rvsm.walk import WalkPatches
+    out = str(tmp_path)
+    RUN.write_state(out, round=0)
+    ds = WalkPatches.__new__(WalkPatches)
+    ds.out, ds.round = out, 0
+    assert ds._publish(2, 6, 4, 1.0, lease=[(0, 0, 0)], wait_since=123.0)
+    assert RUN.cursor_records(out)[0]["wait_since"] == 123.0
+    assert ds._publish(2, 6, 5, 1.0, lease=[(0, 0, 0)])
+    assert RUN.cursor_records(out)[0]["wait_since"] is None
+
+
 def test_the_lookahead_is_re_estimated_from_the_logs(tmp_path, small_cfg):
     """L = ceil(T_produce / T_train) * K_active + extra, from `logs/produce.jsonl` and state.json."""
     out = str(tmp_path / "L")

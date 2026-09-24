@@ -897,6 +897,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     clock = TracedLock("clock", log=lambda rec: jlog(out, "produce", rec, echo=False))
     unit_now["locks"] += [clock, gpu_lock]
     readers = {"ex": reader}                    # replaced when a read times out (the stuck thread is left)
+    starved_t = {}                              # worker -> when its last `starved` line was logged
     skip_until = {}                             # region -> time before which no GPU unit is started on it
 
     def need(lo, job):
@@ -996,7 +997,12 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             head = max(read_cursor_head(out, round_), cursor)
             if time.time() - t_reest > REEST_S:
                 L, t_reest = lookahead(cfg, out, k_active), time.time()
+            recs = cursor_records(out, round_)
             leased = cursor_leases(out, round_)
+            # the regions the workers have LEASED -- their declared need, in lease order -- come first,
+            # wherever they lie; the window past the head is the speculative part (`_working_set`)
+            lorder = lease_order(recs)
+            lset = set(lorder)
             stamp({"phase": f"round{round_}", "last_ts": time.time(),
                              "L": L, "cursor": cursor, "head": head})
 
@@ -1016,7 +1022,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
 
             cat = RG.Catalog(out, round_, ttl=1.0)
             units = []
-            for lo in _window(route, pos, cursor, L, held, head=head):
+            for lo in _working_set(lorder, _window(route, pos, cursor, L, held, head=head)):
                 with lock:
                     if lo in busy:
                         continue
@@ -1028,7 +1034,13 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     continue                    # its read timed out within the hour: not again yet
                 if job is not None:
                     units.append((lo, job))
-            gpu_units = _gpu_order([u for u in units if u[1] != "fields"])
+            gpu_units = _gpu_order([u for u in units if u[1] != "fields"], leased=lorder)
+            if cache.remote and cache.cache_bytes > cache.budget:
+                # over the CT budget: no speculative region is fetched; the leased ones (and the regions
+                # already held) still are
+                with clock:
+                    have = set(keys)
+                gpu_units = [u for u in gpu_units if u[0] in lset or u[0] in have]
             regen = st.get("verso_regen")
             if round_ == 0 and regen and not st.get("verso_regen_done") and not gpu_units:
                 # the regeneration BACKLOG, worked through when the lookahead window has nothing for
@@ -1052,6 +1064,11 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         backlog_keys.add(lo)
                         break
             gate.set_pending(j for _, j in gpu_units)   # the fields make way for these
+            _log_starved(out, recs, starved_t, {u[0] for u in units} | {u[0] for u in gpu_units},
+                         lambda lo: _next_job(cat, lo, round_, verso_on, out, rungs=frungs,
+                                              regen=st.get("verso_regen")),
+                         lambda lo: {"busy": lo in busy, "skipped": skip_until.get(lo, 0.0) > time.time(),
+                                     "no_size": region_size(pyr, lo, cfg.region) is None})
             did = False
             for lo, job in units:               # the CPU units go straight to their own pool
                 if job == "fields" and not stopping():
@@ -1390,15 +1407,86 @@ def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr):
                                 as_tensor=True)
 
 
-def _gpu_order(units):
+def _gpu_order(units, leased=None):
     """The GPU units of one pass over the window, blocking passes first. A region without its recto
     (round 0: `teacher`; round r >= 1: `self`) is one a sampler worker cannot use at all, and the
     in-order DataLoader then holds every worker until it lands; a region lacking only its `verso` is
     already trainable (the verso earns a revisit later). Before this the window ran in walk order,
     so once verso came on a window of ~20 one-minute verso passes ran ahead of the teacher pass the
     fastest worker was waiting on and the trainer sat idle for 14 minutes (paris4, step 46440).
-    Stable: walk order is kept within each class."""
-    return sorted(units, key=lambda u: 1 if u[1] == "verso" else 0)
+    Stable: walk order is kept within each class.
+
+    `leased` (`lease_order`): the blocking passes of LEASED regions go before every other, in lease
+    order -- a lease is a worker's declared need (paris4, 20:13-20:46: a worker waited 33 minutes on a
+    region outside the window while 16 verso passes ran)."""
+    rank = {lo: i for i, lo in enumerate(leased or ())}
+
+    def key(u):
+        if u[1] == "verso":
+            return (2, 0)
+        return (0, rank[u[0]]) if u[0] in rank else (1, 0)
+    return sorted(units, key=key)
+
+
+def lease_order(recs):
+    """The workers' leased regions (`cursor_records`), each once, in the order they are needed: every
+    worker's first lease (the home it is reading or waiting on), then every worker's second, and so on."""
+    ls = []
+    for r in sorted(recs, key=lambda r: int(r.get("worker", 0) or 0)):
+        one = []
+        for lo in r.get("lease") or ():
+            try:
+                one.append(tuple(int(v) for v in lo))
+            except (TypeError, ValueError):
+                continue
+        ls.append(one)
+    out, seen = [], set()
+    for k in range(max((len(x) for x in ls), default=0)):
+        for x in ls:
+            if k < len(x) and x[k] not in seen:
+                seen.add(x[k])
+                out.append(x[k])
+    return out
+
+
+def _working_set(lorder, window):
+    """The producer's regions for one pass: every LEASED region first (lease order), wherever it lies
+    in the walk -- a worker leases the homes of its next visits along its own stride, far past
+    `head + L`, and a region whose first walk position is behind the cursor is not in `_window` at all
+    -- then the window's regions not already named."""
+    seen = set(lorder)
+    return list(lorder) + [lo for lo in window if lo not in seen]
+
+
+STARVED_S = 60.0         # a worker waiting this long for its pending homes gets a `starved` line
+
+
+def _log_starved(out, recs, last, in_set, job_of, why_of, now=None):
+    """One `starved` line per worker per STARVED_S while it waits (its cursor record's `wait_since`):
+    the leased regions it waits on that still lack a pass, each with that pass, whether it is in this
+    producer pass's set, and the reasons it might not be (busy, skipped after a read timeout, no
+    size). Returns the lines logged."""
+    now = time.time() if now is None else now
+    got = []
+    for r in recs:
+        ws = r.get("wait_since")
+        w = r.get("worker")
+        if not isinstance(ws, (int, float)) or now - ws < STARVED_S or now - last.get(w, 0.0) < STARVED_S:
+            continue
+        regs = []
+        for lo in r.get("lease") or ():
+            try:
+                lo = tuple(int(v) for v in lo)
+                job = job_of(lo)
+            except Exception:  # noqa: BLE001
+                continue
+            if job in ("teacher", "self"):
+                regs.append({"region": list(lo), "job": job, "in_set": lo in in_set, **why_of(lo)})
+        rec = {"kind": "starved", "worker": w, "waited_s": round(now - ws, 1), "waiting_on": regs}
+        jlog(out, "produce", rec)
+        last[w] = now
+        got.append(rec)
+    return got
 
 
 def _window(route, pos, cursor, L, held, head=None):
