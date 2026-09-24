@@ -481,6 +481,32 @@ def _verso_on(path):
         return None
 
 
+def _region_of_item(item, region):
+    """The rung-2 region origin of a grid item's window corner."""
+    k = int(torch.as_tensor(item["rung"]).reshape(-1)[0])
+    lo = [int(v) for v in torch.as_tensor(item["lo"]).reshape(-1)[:3]]
+    return tuple(((v << max(k - 2, 0)) // int(region)) * int(region) for v in lo)
+
+
+def second_panel(grid, region=1024, n=4):
+    """`n` grid items for the SECOND validation panel (`val_<step>_b.png`): from held-out regions other
+    than the first item's (the first panel is always the grid's first four windows, all from one
+    region), the ones with the highest target foreground fraction (recto >= 0.5 where weighted), so
+    the panel shows sheet. One pass over the grid, done once per run."""
+    if not grid:
+        return []
+    first = _region_of_item(grid[0], region)
+    scored = []
+    for i, it in enumerate(grid):
+        if _region_of_item(it, region) == first:
+            continue
+        t, w = torch.as_tensor(it["tgt"])[0], torch.as_tensor(it["w"])[0]
+        fg = float(((t >= 128) & (w > 0)).float().mean())
+        scored.append((fg, i))
+    scored.sort(reverse=True)
+    return [grid[i] for _, i in scored[:int(n)]]
+
+
 def val_png(path, net, grid, dev, layout, cascade=None, verso=None):
     """The middle z-slice of the first four validation patches, three tiles wide:
 
@@ -932,6 +958,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         tmp.replace(ck)
         saved["step"] = step
 
+    panel_b = {}                     # the second panel's items, chosen once per grid
+
     def do_eval():
         nonlocal temps
         if not grid:
@@ -955,6 +983,11 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         try:
             (out / "eval").mkdir(parents=True, exist_ok=True)
             val_png(out / "eval" / f"val_{step:06d}.png", evfwd, grid, dev, layout, cascade=casval)
+            if "b" not in panel_b:
+                panel_b["b"] = second_panel(grid, int(cfg.region))
+            if panel_b["b"]:
+                val_png(out / "eval" / f"val_{step:06d}_b.png", evfwd, panel_b["b"], dev, layout,
+                        cascade=casval)
         except Exception as e:   # noqa: BLE001  -- a missing PIL must never stop a run
             print("[train] val_png:", repr(e), flush=True)
         t_png = time.time() - te - t_ev

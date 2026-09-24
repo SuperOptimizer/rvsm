@@ -820,3 +820,21 @@ def test_the_trainer_holds_no_batch_per_step(tiny_cfg):
     warm = max(rss[n // 4: n // 2])
     late = max(rss[3 * n // 4:])
     assert late - warm < PAD_MB, f"trainer RSS grew {late - warm:.0f} MB after warm-up: {rss[::5]}"
+
+
+def test_the_second_panel_is_another_region_with_the_most_sheet(full_cfg):
+    """val_<step>_b.png: items from held-out regions other than the first item's, highest target
+    foreground first."""
+    a = _item(full_cfg, k=2, seed=1)
+    others = []
+    for j, frac in enumerate((0.1, 0.9, 0.5, 0.0, 0.7)):
+        it = _item(full_cfg, k=2, seed=10 + j)
+        it["lo"] = torch.tensor([2048 * (j + 1), 0, 0])
+        t = torch.zeros_like(it["tgt"])
+        t[0].view(-1)[: int(frac * t[0].numel())] = 255
+        it["tgt"] = t
+        others.append(it)
+    same = _item(full_cfg, k=2, seed=3)                      # the first item's region: never chosen
+    same["tgt"] = torch.full_like(same["tgt"], 255)
+    got = TR.second_panel([a, same] + others, region=1024)
+    assert [int(g["lo"][0]) for g in got] == [2048 * 2, 2048 * 5, 2048 * 3, 2048 * 1]
