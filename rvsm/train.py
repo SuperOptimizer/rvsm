@@ -260,6 +260,37 @@ def ect_seed(step, micro=0):
     return 1_000_003 * int(step) + 7_919 * int(micro) + 17
 
 
+def train_compile_mode():
+    """The trainer's `torch.compile(net)` mode: `RVSM_TRAIN_COMPILE_MODE` when set ("max-autotune",
+    "reduce-overhead", "max-autotune-no-cudagraphs", "default"), else None -- torch's default, what the
+    trainer has always compiled with. An environment override, not a Config field, so the host can
+    switch it for a live run without touching the resume fingerprint."""
+    m = os.environ.get("RVSM_TRAIN_COMPILE_MODE", "").strip()
+    return m or None
+
+
+def uses_cudagraphs(mode):
+    """Does this compile mode capture CUDA graphs (then every step must mark its start)?"""
+    return mode in ("max-autotune", "reduce-overhead")
+
+
+def train_compile_threads():
+    """`RVSM_TRAIN_COMPILE_THREADS`: inductor compile workers for THIS process (the trainer) only.
+
+    The run's environment sets TORCHINDUCTOR_COMPILE_THREADS=1 for everybody (eight inductor workers in
+    the producer once took 40 GB of host RAM). This sets `torch._inductor.config.compile_threads`
+    in-process instead of the environment variable: the supervisor process is also the trainer, and
+    the producer it spawns inherits its environment -- an env var set here would raise the producer's
+    pool too. Must run before the first compile (the worker pool is created lazily at it). Returns the
+    count in force, or None when the override is not set."""
+    n = os.environ.get("RVSM_TRAIN_COMPILE_THREADS", "").strip()
+    if not n:
+        return None
+    import torch._inductor.config as ic
+    ic.compile_threads = max(int(n), 1)
+    return ic.compile_threads
+
+
 STOP_SAVE_MIN = 200      # a stop_now() exit checkpoints only this many steps past the last checkpoint
 NONFINITE_MAX = 20       # consecutive skipped steps (non-finite gradient) that abort a run
 
@@ -1013,7 +1044,27 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         if cfg.cascade in ("self", "mix") else None
 
     acfg = _aug_cfg(cfg, out)
-    model = torch.compile(net) if cfg.compile else net
+    cmode = train_compile_mode() if cfg.compile else None
+    if cfg.compile:
+        nthr = train_compile_threads()
+        model = torch.compile(net, **({"mode": cmode} if cmode else {}))
+        if cmode or nthr:
+            print(f"[train] torch.compile mode={cmode or 'default'} compile_threads={nthr or 'env'}",
+                  flush=True)
+    else:
+        model = net
+    # CUDA graphs (max-autotune / reduce-overhead): a step's outputs live in the graph's static pool,
+    # overwritten by the next replay; marking each forward as a new step tells the cudagraph trees so
+    graphs = bool(cmode and uses_cudagraphs(cmode) and dev.type == "cuda")
+    if graphs:
+        # ... and the gradients must live OUTSIDE that pool: a .grad the compiled backward allocated
+        # during capture is overwritten by the next replay, which breaks the accumulation (torch
+        # raises "accessing gradient tensor output of CUDAGraphs that has been overwritten"). Stable
+        # zeroed buffers from here on, zeroed in place (`set_to_none=False`). Every parameter of the
+        # net receives a gradient every step, so a zero buffer changes nothing the optimiser sees.
+        for p_ in net.parameters():
+            if p_.requires_grad and p_.grad is None:
+                p_.grad = torch.zeros_like(p_)
     aux_on = bool(cfg.loss_excl or cfg.loss_selfcons or cfg.loss_skel or cfg.loss_affinity)
     aux_dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
 
@@ -1130,6 +1181,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
 
         if net.ckpt_act and not ct.requires_grad:
             ct.requires_grad_()    # here, not in forward(): requires_grad_ inside it is a graph break
+        if graphs:
+            torch.compiler.cudagraph_mark_step_begin()
         with prep.autocast(dev):
             pred = model(ct)
             outs = [o.float() for o in pred] if isinstance(pred, (list, tuple)) else [pred.float()]
@@ -1213,7 +1266,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         if not grad_gate(net, 1.0):
             # a non-finite gradient never reaches the optimiser, the schedule or the EMA: the step is
             # skipped (its batch is spent), counted and logged; a run of them is a diverged run
-            opt.zero_grad(set_to_none=True)
+            opt.zero_grad(set_to_none=not graphs)
             bad_run, bad_total = bad_run + 1, bad_total + 1
             _log(str(out / "logs" / "train.jsonl"),
                  {"kind": "nonfinite_grad", "step": step, "consecutive": bad_run, "total": bad_total})
@@ -1224,7 +1277,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             continue
         bad_run = 0
         opt.step()
-        opt.zero_grad(set_to_none=True)
+        opt.zero_grad(set_to_none=not graphs)
         sched.step()
         ema_update(ema, net, decay)
         ph.mark("clip+adamw+ema")
@@ -1273,7 +1326,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         # about to take the host down). `step` is a complete optimiser boundary (it only moves after
         # opt.step); a partial accumulation is DISCARDED. Checkpoint only when it is worth it (>= 200
         # steps since the last one: a save is ~1.4 GB of host copies at the worst moment).
-        opt.zero_grad(set_to_none=True)
+        opt.zero_grad(set_to_none=not graphs)
         last = saved["step"] if saved["step"] is not None else step0
         do_save = step - int(last) >= STOP_SAVE_MIN
         _log(str(out / "logs" / "train.jsonl"),

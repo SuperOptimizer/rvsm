@@ -988,3 +988,44 @@ def test_ckpt_every_checkpoints_between_evaluations_and_resumes_without_repeatin
     lr1 = [r["lr"] for r in rows(out1, "train.jsonl") if r.get("step") == 20 and "lr" in r]
     lr2 = [r["lr"] for r in rows(out2, "train.jsonl") if r.get("step") == 20 and "lr" in r]
     assert lr1 and lr1 == lr2                                  # the schedule resumed by step
+
+
+def test_the_train_compile_overrides_come_from_the_environment(monkeypatch):
+    """`RVSM_TRAIN_COMPILE_MODE` picks the trainer's torch.compile mode (unset: torch's default, as
+    before); `RVSM_TRAIN_COMPILE_THREADS` sets inductor's compile workers in THIS process's config and
+    leaves the environment -- which a spawned producer inherits -- alone."""
+    import os
+
+    import torch._inductor.config as ic
+    monkeypatch.delenv("RVSM_TRAIN_COMPILE_MODE", raising=False)
+    monkeypatch.delenv("RVSM_TRAIN_COMPILE_THREADS", raising=False)
+    assert TR.train_compile_mode() is None and TR.train_compile_threads() is None
+    monkeypatch.setenv("RVSM_TRAIN_COMPILE_MODE", " max-autotune ")
+    assert TR.train_compile_mode() == "max-autotune" and TR.uses_cudagraphs("max-autotune")
+    assert TR.uses_cudagraphs("reduce-overhead") and not TR.uses_cudagraphs("max-autotune-no-cudagraphs")
+    assert not TR.uses_cudagraphs(None)
+    monkeypatch.setattr(ic, "compile_threads", ic.compile_threads)
+    env = os.environ.get("TORCHINDUCTOR_COMPILE_THREADS")
+    monkeypatch.setenv("RVSM_TRAIN_COMPILE_THREADS", "3")
+    assert TR.train_compile_threads() == 3 and ic.compile_threads == 3
+    assert os.environ.get("TORCHINDUCTOR_COMPILE_THREADS") == env
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a CUDA device")
+def test_the_step_loop_runs_under_cuda_graphs(tiny_cfg, monkeypatch):
+    """`reduce-overhead` (CUDA graphs, no autotuning -- the cheap stand-in for max-autotune's graphs):
+    the whole step loop, the deep losses and the EMA on outputs that live in the graph pool, with an
+    accumulation of two, runs and stays finite, and the net compiles without a graph break."""
+    from pathlib import Path
+
+    from torch._dynamo.utils import counters
+    monkeypatch.setenv("RVSM_TRAIN_COMPILE_MODE", "reduce-overhead")
+    cfg = replace(tiny_cfg, out=str(Path(tiny_cfg.out).parent / "graphs"), steps=6, eval_every=6,
+                  compile=True)
+    counters.clear()
+    ck = TR.train(cfg, patches_factory=_factory(cfg), val_items=[_item(cfg, k=2, seed=7)], device="cuda",
+                  accum=2)
+    st = torch.load(ck, map_location="cpu", weights_only=False)
+    assert st["step"] == 6 and all(torch.isfinite(v.float()).all() for v in st["ema"].values())
+    assert not counters["graph_break"], dict(counters["graph_break"])
+    assert not counters["inductor"].get("cudagraph_skips"), dict(counters["inductor"])
