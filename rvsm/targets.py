@@ -122,6 +122,7 @@ device (no atomics whose order matters, no cudnn, no autotuning).
 """
 import hashlib
 import json
+import math
 import os
 
 import numpy as np
@@ -409,22 +410,31 @@ def _tt(a, dev, dt=None):
     return t if dt is None else t.to(dt)
 
 
-def medial_torch(band):
+def medial_torch(band, cap=None):
     """`medial` of a bool tensor (a volume or a batch). The local-maximum test is made on the SQUARED
     distances, which are exact integers: for integers a < b, sqrt(b) - sqrt(a) > 1e-6 at any size a block
     can have, so `d2 >= max(d2)` is exactly scipy's `d >= max(d) - 1e-6`. An empty band has no medial
-    voxel (its complement is everywhere at distance 0)."""
+    voxel (its complement is everywhere at distance 0).
+
+    `cap` (a band is a few voxels thick): the transform is capped (`edt.edt2(cap=)`), which is exact
+    wherever the depth is <= cap; when some band voxel is deeper (it comes back +inf) the batch is
+    transformed again uncapped, so the result is always the uncapped one."""
+    import torch
     from rvsm import edt as E
-    d2, _ = E.edt2(~band, indices=False)
+    d2, _ = E.edt2(~band, indices=False, cap=cap)
+    if cap is not None and bool(torch.any(band & torch.isinf(d2))):
+        d2, _ = E.edt2(~band, indices=False)
     return band & (d2 >= E.max_filter3(d2))
 
 
-def face_distance_torch(surf, dy, dx):
+def face_distance_torch(surf, dy, dx, cap=None):
     """`face_distance` of a bool (B,Z,Y,X) batch: (d, u, ix int32 (3,B,Z,Y,X)). A block with no surface
-    voxel has u = +inf (and d = +-inf) everywhere instead of `None`."""
+    voxel has u = +inf (and d = +-inf) everywhere instead of `None`. With `cap` (`edt_cap`), a voxel
+    further than `cap` from the surface has u = +inf and an unspecified index; every other voxel's
+    d, u and ix are exactly the uncapped ones."""
     import torch
     from rvsm import edt as E
-    d2, ix = E.edt2(surf, index_dtype=torch.int32)
+    d2, ix = E.edt2(surf, index_dtype=torch.int32, cap=cap)
     u = torch.sqrt(d2)
     del d2
     Y, X = surf.shape[-2:]
@@ -514,6 +524,26 @@ def _pair_checks_torch(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n):
 
 NCOUNT = len(SUPPORT)      # the per-block support row: voxels, the nine reasons, valid
 
+# the device transforms are capped (`edt.edt2(cap=)`) at what the rules can read; RVSM_FIELDS_CAP=0
+# computes them over whole lines
+EDT_CAP = os.environ.get("RVSM_FIELDS_CAP", "1") not in ("0", "false", "no")
+MEDIAL_CAP = 16.0    # the medial transform's cap: deeper bands fall back to the uncapped transform
+
+
+def edt_cap(reach):
+    """How far the face distances of a block must be exact, for rung-scaled `reach`:
+
+    - the no_recto / no_verso / coverage / thickness rules read u, d at voxels with u <= reach;
+    - the reciprocal rule reads the nearest recto face of the verso face point p_v (and the other way
+      round): |p_v - p_r| <= u_v + u_r <= 2 reach, so that face is within 2 reach of p_v;
+    - the normals read the Gaussian-smoothed d (sigma NORMAL_SIGMA, truncate 4: a cube of half-width
+      ceil(4 sigma) per axis) one voxel either side of a face point, i.e. voxels within
+      (ceil(4 sigma) + 1) * sqrt(3) of it, whose |d| is at most that distance.
+    Beyond these, a voxel's value only has to fail no_recto / no_verso, which +inf does. One voxel of
+    slack on top."""
+    g = (math.ceil(4.0 * NORMAL_SIGMA) + 1) * math.sqrt(3.0)
+    return float(math.ceil(max(2.0 * float(reach), g)) + 1)
+
 
 def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, dev):
     """The tensor core of `block_fields_torch` for a batch: `recto` / `verso` (B,Z,Y,X) uint8 (verso
@@ -537,10 +567,12 @@ def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, d
     lvl = int(round(thr * 255))
     br = rec >= lvl
     del rec
-    dr, ur, ixr = face_distance_torch(medial_torch(br), dy, dx)
+    cap = edt_cap(reach) if EDT_CAP else None
+    mcap = MEDIAL_CAP if EDT_CAP else None
+    dr, ur, ixr = face_distance_torch(medial_torch(br, mcap), dy, dx, cap)
     fail(ur > reach, "no_recto")                 # also every voxel of a block without a recto face
     bv = torch.zeros_like(br) if verso is None else _tt(verso, dev) >= lvl
-    dv, uv, ixv = face_distance_torch(medial_torch(bv), dy, dx)
+    dv, uv, ixv = face_distance_torch(medial_torch(bv, mcap), dy, dx, cap)
     fail(uv > reach, "no_verso")                 # ... and without a verso face
     if cover is not None:
         fail(_tt(cover, dev, torch.float32) <= torch.maximum(ur, uv) + COVER_MARGIN, "coverage")
@@ -1096,8 +1128,9 @@ def _faceless(rec, ver, hr, hv, dy, dx, core, cover, thr, rk, tn, tx, cap, sl, n
     ro = np.flatnonzero(hr & ~hv)
     if ro.size:
         ti = torch.as_tensor(ro, device=dev)
-        _, ur, _ = face_distance_torch(medial_torch(_to_dev(rec[ro], dev) >= int(round(thr * 255))),
-                                       dy[ti], dx[ti])
+        _, ur, _ = face_distance_torch(medial_torch(_to_dev(rec[ro], dev) >= int(round(thr * 255)),
+                                                    MEDIAL_CAP if EDT_CAP else None),
+                                       dy[ti], dx[ti], edt_cap(rk) if EDT_CAP else None)
         nr = (core[ti] & (ur > rk)).reshape(len(ro), -1).sum(1)
         del ur
         cnt[ti, 0] = nvox[ti]

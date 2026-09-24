@@ -57,7 +57,7 @@ def _triton_kernels():
             import triton.language as tl
 
             @triton.jit
-            def _pass(G, V, I, A, B, OA, OB, n, inner, NC: tl.constexpr, BY: tl.constexpr,
+            def _pass(G, V, I, A, B, OA, OB, n, inner, CAP2, NC: tl.constexpr, BY: tl.constexpr,
                       BK: tl.constexpr):
                 # one program = outputs y0 .. y0+BY-1 of the lines k0 .. k0+BK-1 of one outer index.
                 # Candidate i can only win at y if (y - i)^2 <= g(y)^2 (i = y itself scores g(y)^2),
@@ -72,7 +72,9 @@ def _triton_kernels():
                 base = o * n * inner + k                                   # [BK]
                 off = base[None, :] + y.to(tl.int64)[:, None] * inner
                 gt = tl.load(G + off, mask=ok, other=0.0)
-                r2 = tl.max(tl.max(gt, axis=1), axis=0)
+                # a CAP (`edt2(cap=)`): only results <= CAP2 are wanted, and a candidate further than
+                # sqrt(CAP2) from y scores more than that, so the window never needs to be wider
+                r2 = tl.minimum(tl.max(tl.max(gt, axis=1), axis=0), CAP2)
                 r = tl.minimum(tl.ceil(tl.sqrt(r2)), n * 1.0).to(tl.int32)
                 lo = tl.maximum(y0 - r, 0)
                 hi = tl.minimum(y0 + BY + r, n)
@@ -86,6 +88,7 @@ def _triton_kernels():
                     m = c < best                     # strict: the FIRST minimum along the line wins
                     best = tl.where(m, c, best)
                     bi = tl.where(m, i, bi)
+                best = tl.where(best > CAP2, float("inf"), best)        # beyond the cap: unknown
                 tl.store(V + off, best, mask=ok)
                 tl.store(I + off, bi, mask=ok)
                 if NC >= 1:
@@ -229,8 +232,9 @@ def _triton_failed(e):
     warnings.warn(f"rvsm.edt: Triton kernels unusable ({e!r}); using the torch implementations")
 
 
-def _minplus_torch(g, chunk_bytes=256 << 20):
-    """(v, i) with v[r, y] = min_i g[r, i] + (y - i)^2 and i its first argmin; g (R, N) float32."""
+def _minplus_torch(g, chunk_bytes=256 << 20, cap2=INF):
+    """(v, i) with v[r, y] = min_i g[r, i] + (y - i)^2 and i its first argmin; g (R, N) float32. A
+    value above `cap2` is returned as +inf (as the capped Triton pass does)."""
     R, N = g.shape
     ar = torch.arange(N, device=g.device, dtype=torch.float32)
     d2 = (ar[:, None] - ar[None, :]) ** 2                    # [y, i]
@@ -239,25 +243,28 @@ def _minplus_torch(g, chunk_bytes=256 << 20):
     c = max(1, int(chunk_bytes // (4 * N * N)))
     for s in range(0, R, c):
         vv, ii = torch.min(g[s:s + c, None, :] + d2[None], dim=2)
+        if cap2 != INF:
+            vv = torch.where(vv > cap2, INF, vv)
         v[s:s + c] = vv
         ix[s:s + c] = ii.to(torch.int32)
     return v, ix
 
 
-def _axis_pass_torch(g, axis, carry):
+def _axis_pass_torch(g, axis, carry, cap2=INF):
     gp = g.movedim(axis, -1)
     shp = gp.shape
-    v, i = _minplus_torch(gp.contiguous().view(-1, shp[-1]))
+    v, i = _minplus_torch(gp.contiguous().view(-1, shp[-1]), cap2=cap2)
     v = v.view(shp).movedim(-1, axis).contiguous()
     i = i.view(shp).movedim(-1, axis).contiguous()
     il = i.long()
     return v, i, [torch.gather(c, axis, il) for c in carry]
 
 
-def _axis_pass(g, axis, carry=(), torch_only=False):
+def _axis_pass(g, axis, carry=(), torch_only=False, cap2=INF):
     """One separable pass along `axis` of the contiguous 3-D float32 `g`: (v, i, carried) with
     v = min over the line position p of g[..p..] + (y - p)^2, i its first argmin (int32) and every
-    int32 tensor of `carry` gathered at that argmin."""
+    int32 tensor of `carry` gathered at that argmin. A v above `cap2` is +inf, its i and carried
+    values unspecified (`edt2(cap=)`)."""
     k = _triton_kernels() if (g.is_cuda and not torch_only) else False
     if k:
         shp = g.shape
@@ -276,12 +283,13 @@ def _axis_pass(g, axis, carry=(), torch_only=False):
         BK = 1 if inner == 1 else min(16, 1 << (inner - 1).bit_length())
         BY = 32 if BK > 1 else 64
         try:
-            k[0][(outer, -(-inner // BK), -(-n // BY))](g, v, i, a, b, oa, ob, n, inner, NC=len(carry),
-                                                         BY=BY, BK=BK, num_warps=4 if BK > 1 else 2)
+            k[0][(outer, -(-inner // BK), -(-n // BY))](g, v, i, a, b, oa, ob, n, inner, float(cap2),
+                                                         NC=len(carry), BY=BY, BK=BK,
+                                                         num_warps=4 if BK > 1 else 2)
             return v, i, out
         except Exception as e:  # noqa: BLE001  -- a host where Triton cannot compile: the torch path
             _triton_failed(e)
-    return _axis_pass_torch(g, axis, list(carry))
+    return _axis_pass_torch(g, axis, list(carry), cap2)
 
 
 def _first_pass(surf, axis, torch_only=False):
@@ -306,21 +314,29 @@ def _first_pass(surf, axis, torch_only=False):
     return v, i
 
 
-def edt2(surf, indices=True, torch_only=False, index_dtype=torch.int64):
+def edt2(surf, indices=True, torch_only=False, index_dtype=torch.int64, cap=None):
     """(squared distance float32, nearest index (3, *surf.shape)) to the True voxels of the bool tensor
     `surf`, a (Z,Y,X) volume or a (B,Z,Y,X) batch of them (each transformed on its own; the index is
     within its own volume). A volume with no True voxel at all is +inf everywhere (the index 0).
     `indices=False` returns (squared distance, None) and carries no indices through the passes.
     `torch_only` skips the Triton kernels (the tests compare the two); `index_dtype=torch.int32` keeps
-    the indices at half the memory."""
+    the indices at half the memory.
+
+    `cap`: only distances up to `cap` are wanted. A voxel whose squared distance is <= cap^2 gets
+    EXACTLY the uncapped result -- value and nearest index -- and any other voxel +inf (index
+    unspecified): each pass then scans at most ceil(cap) candidates on either side instead of up to the
+    whole line. Exact because a pass's winner for such a voxel lies within `cap` of it and scores
+    <= cap^2, so its own input value is exact (by induction over the passes), and every candidate
+    further away scores more than cap^2 -- it can neither win nor tie, so the first minimum is the same."""
     assert surf.dim() in (3, 4) and surf.dtype == torch.bool
     assert 3 * max(surf.shape[-3:]) ** 2 < 2 ** 24, "squared distances must stay exact in float32"
     a0 = surf.dim() - 3
     # scipy's order: axis 0, then 1, then 2; each pass carries the earlier passes' nearest coordinates
     v, iz = _first_pass(surf, a0, torch_only)
-    v, iy, c = _axis_pass(v, a0 + 1, (iz,) if indices else (), torch_only)
+    cap2 = INF if cap is None else float(cap) * float(cap)
+    v, iy, c = _axis_pass(v, a0 + 1, (iz,) if indices else (), torch_only, cap2)
     del iz
-    v, ix, c = _axis_pass(v, a0 + 2, (c[0], iy) if indices else (), torch_only)
+    v, ix, c = _axis_pass(v, a0 + 2, (c[0], iy) if indices else (), torch_only, cap2)
     if not indices:
         return v, None
     return v, torch.stack((c[0], c[1], ix)).to(index_dtype)

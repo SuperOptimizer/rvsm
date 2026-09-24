@@ -743,3 +743,53 @@ def test_faceless_blocks_are_skipped_with_the_same_bytes(slab_region, tmp_path, 
         targets.region_fields(root, (0, 0, 0), ax, rungs=(2, 3), device=dev, **KW)
     _same_stores(types.SimpleNamespace(root=str(tmp_path / "curved0"), lo=(0, 0, 0)),
                  types.SimpleNamespace(root=str(tmp_path / "curved1"), lo=(0, 0, 0)))
+
+
+@pytest.mark.parametrize("dev", TORCH_DEVICES)
+def test_capped_transforms_write_the_same_bytes(slab_region, tmp_path, monkeypatch, dev):
+    """The device fields with their transforms capped (`edt_cap`, `MEDIAL_CAP`) against uncapped ones:
+    byte-identical stores on the curved region, the paired / split / recto-only slabs, and a region
+    whose recto band is thicker than twice the medial cap (the medial transform saturates and falls
+    back to the uncapped one), at rungs 2 and 3."""
+    import types
+    from rvsm import edt as E
+    calls = {"n": 0}
+    real = E.edt2
+
+    def counted(*a, **k):
+        if k.get("cap") is None and not k.get("indices", True):
+            calls["n"] += 1                     # an uncapped medial transform: the fallback
+        return real(*a, **k)
+    monkeypatch.setattr(E, "edt2", counted)
+    lo = (0, 0, 0)
+
+    def thick(root):
+        n = 128
+        z, y, x = np.meshgrid(np.arange(n), np.arange(n), np.arange(n), indexing="ij")
+        rec = np.where(np.abs(x - 60) <= 20, 255, 0).astype(np.uint8)     # 41 voxels thick: depth 21
+        ver = np.where(np.abs(x - 95) <= 1, 255, 0).astype(np.uint8)
+        for name, v in (("recto", rec), ("verso", ver)):
+            stores.write(stores.store_path(root, name, lo), v, lo, rung=2, channels=(name,), q=8)
+        zs = np.arange(0, n + 1, 16, dtype=np.float64)
+        return np.stack([zs, np.full_like(zs, 64.0), np.full_like(zs, -400.0)])
+    for name, make in (("curved", _curved_region), ("thick", thick)):
+        roots = {}
+        for cap in (False, True):
+            monkeypatch.setattr(targets, "EDT_CAP", cap)
+            root = str(tmp_path / f"{name}{int(cap)}")
+            ax = make(root)
+            n0 = calls["n"]
+            targets.region_fields(root, lo, ax, rungs=(2, 3), device=dev, **KW)
+            roots[cap] = types.SimpleNamespace(root=root, lo=lo)
+            if name == "thick" and cap:
+                assert calls["n"] > n0, "the thick band should have fallen back to the uncapped medial"
+        _same_stores(roots[False], roots[True])
+    for name, kw in (("pair", dict(recto_x=80, verso_x=70)), ("split", dict(recto_x=100, verso_x=20)),
+                     ("reconly", dict(recto_x=80, verso_x=-100))):
+        rs = {}
+        for cap in (False, True):
+            monkeypatch.setattr(targets, "EDT_CAP", cap)
+            r = slab_region(name=f"c{name}{int(cap)}", n=128, **kw)
+            targets.region_fields(r.root, r.lo, r.ax, rungs=(2, 3), device=dev, **KW)
+            rs[cap] = r
+        _same_stores(rs[False], rs[True])

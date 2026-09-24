@@ -151,3 +151,26 @@ def test_the_walk_kernel_is_the_numpy_walk(dev):
                            t(np.array(nblk, np.int32)[b]), 64, t(br), t(bv))
     assert np.array_equal(got.cpu().numpy(), want)
 
+
+
+@pytest.mark.parametrize("dev", DEVICES)
+@pytest.mark.parametrize("torch_only", [False, True])
+def test_a_capped_edt_is_exact_up_to_the_cap(dev, torch_only):
+    """`edt2(cap=)`: every voxel within `cap` of the mask gets the uncapped squared distance AND the
+    uncapped nearest index (so scipy's tie order); every other voxel +inf. Random masks (sparse ones
+    leave most voxels far beyond small caps), a batch, several caps, the Triton and the torch pass."""
+    if dev == "cpu" and not torch_only:
+        pytest.skip("the CPU has only the torch pass")
+    rng = np.random.default_rng(7)
+    ms = _masks(rng) + [rng.random((3, 40, 37, 29)) < 0.001]
+    for m in ms:
+        t = torch.from_numpy(m).to(dev)
+        v, ix = E.edt2(t, torch_only=torch_only)
+        for cap in (1.0, 2.5, 6.0, 13.0, 49.0):
+            vc, ixc = E.edt2(t, torch_only=torch_only, cap=cap)
+            near = v <= cap * cap
+            assert torch.equal(vc[near], v[near]), cap
+            assert torch.equal(ixc[:, near], ix[:, near]), cap
+            assert torch.isinf(vc[~near]).all(), cap
+            vn, none = E.edt2(t, indices=False, torch_only=torch_only, cap=cap)
+            assert none is None and torch.equal(vn, vc)
