@@ -919,3 +919,72 @@ def test_prefetch_wait_is_zero_when_the_consumer_is_the_bottleneck():
     assert n == 7
     assert pf.take_wait_s() < 0.05
     assert 0.045 < pf.take_fetch_s() < 0.1
+
+
+def test_ckpt_every_checkpoints_between_evaluations_and_resumes_without_repeating(tiny_cfg):
+    """`ckpt_every` 5 with `eval_every` 10 over 20 steps: checkpoints (and the driver's state) at 5, 10,
+    15 and 20, evaluations only at 10 and 20. A resume from the step-15 checkpoint continues at step 16
+    with the walk where that checkpoint left it -- the same visits the first run trained on after 15,
+    none from before -- its schedule at step 16, and its next evaluation at 20."""
+    import shutil
+    from pathlib import Path
+
+    from rvsm import run as RUN
+    from tests.test_run_e2e import _stub_walk
+    base = Path(tiny_cfg.out).parent
+    cfg = replace(tiny_cfg, out=str(base / "ce1"), steps=20, eval_every=10, ckpt_every=5)
+    assert cfg.fingerprint() == replace(cfg, ckpt_every=0).fingerprint()   # never in the fingerprint
+    val = [_item(cfg, k=2, seed=7)]
+
+    def factory(out, seen, start=None):
+        def gen():
+            for vid in _stub_walk(out, n=40, start=start):
+                seen.append(vid)
+                yield _item(cfg, k=cfg.rungs[vid % len(cfg.rungs)], seed=vid)
+        return gen
+
+    def hook_of(out, kinds, keep=None):
+        def hook(info):
+            kinds.append((info["step"], info["kind"]))
+            RUN.checkpoint_state(str(out), info["step"], 0)    # what run.py's hook does at every kind
+            if keep is not None and info["step"] == 15:
+                shutil.copy(info["ckpt"], keep / "ck15.pt")
+                shutil.copy(Path(out) / "state.json", keep / "state15.json")
+        return hook
+
+    out1 = Path(cfg.out)
+    (out1 / "logs").mkdir(parents=True)
+    seen1, kinds1 = [], []
+    TR.train(cfg, patches_factory=factory(out1, seen1), val_items=val, device="cpu",
+             hook=hook_of(out1, kinds1, keep=base))
+
+    def rows(out, name):
+        return [json.loads(q) for q in (Path(out) / "logs" / name).read_text().splitlines()]
+    ck1 = [(r["step"], r["at"]) for r in rows(out1, "train.jsonl") if r.get("kind") == "ckpt"]
+    assert ck1 == [(5, "ckpt"), (10, "eval"), (15, "ckpt"), (20, "eval")]
+    assert all(r["s"] >= 0 for r in rows(out1, "train.jsonl") if r.get("kind") == "ckpt")
+    assert [r["step"] for r in rows(out1, "eval.jsonl")] == [10, 20]
+    assert kinds1 == [(5, "ckpt"), (10, "eval"), (15, "ckpt"), (20, "eval")]
+    assert (out1 / "ckpt_prev.pt").exists()                   # the rotation runs at every save
+    assert torch.load(out1 / "ckpt_prev.pt", map_location="cpu", weights_only=False)["step"] == 15
+    st15 = json.loads((base / "state15.json").read_text())
+    assert st15["step"] == 15 and st15["walk"]["workers"]["0"]["pos"] == 15
+    # one visit per step (CPU: no prefetch), and one more the loop drew before it saw the step budget
+    assert len(seen1) == 21
+
+    # ---- resume from the step-15 checkpoint and its state
+    out2 = base / "ce2"
+    (out2 / "logs").mkdir(parents=True)
+    shutil.copy(base / "ck15.pt", out2 / "ckpt.pt")
+    shutil.copy(base / "state15.json", out2 / "state.json")
+    seen2, kinds2 = [], []
+    ck = TR.train(cfg, out=out2, resume=True, patches_factory=factory(out2, seen2, RUN.resume_walk(str(out2), 0)),
+                  val_items=val, device="cpu", hook=hook_of(out2, kinds2))
+    assert torch.load(ck, map_location="cpu", weights_only=False)["step"] == 20
+    assert seen2[:5] == seen1[15:20] and not set(seen2) & set(seen1[:15])   # none repeated, none lost
+    assert kinds2 == [(20, "eval")]
+    assert [r["step"] for r in rows(out2, "eval.jsonl")] == [20]
+    assert [r["step"] for r in rows(out2, "train.jsonl") if r.get("kind") == "ckpt"] == [20]
+    lr1 = [r["lr"] for r in rows(out1, "train.jsonl") if r.get("step") == 20 and "lr" in r]
+    lr2 = [r["lr"] for r in rows(out2, "train.jsonl") if r.get("step") == 20 and "lr" in r]
+    assert lr1 and lr1 == lr2                                  # the schedule resumed by step

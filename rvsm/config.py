@@ -162,7 +162,10 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        "verso_regen_gain", "round_min_steps_after_verso", "verso_min_regions",
                        "ram_trainer_gb", "ram_host_exit",
                        # the producer's GPU fields batch and whether it regenerates old verso stores
-                       "fields_batch", "verso_regen")
+                       "fields_batch", "verso_regen",
+                       # the checkpoint-only cadence: WHEN the resume state is written, never what is
+                       # trained (a checkpoint boundary runs no evaluation, calibration or gate)
+                       "ckpt_every")
 
 
 @dataclass
@@ -266,6 +269,8 @@ class Config:
     ram_host_exit: float = 0.90        # ... or the host's memory in use past this share of MemTotal
     verso_gate_dice: float = 0.6       # ... or earlier, once the held-out recto reaches this dice
     eval_every: int = 2000             # held-out evaluation cadence, in steps
+    ckpt_every: int = 1000             # checkpoint-only cadence, in steps (0 = checkpoint at evals only):
+                                       # the resume state an evaluation writes, without the evaluation
     calibrate: bool = True             # refit the temperatures after every eval
     infer_window: int = 256            # sliding-window edge at inference
     infer_halo: int = 32               # window overlap discarded on each side

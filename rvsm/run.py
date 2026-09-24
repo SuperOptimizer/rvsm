@@ -2345,6 +2345,16 @@ def walk_snapshot(out, round_=None):
     return {"stride": stride, "round": None if round_ is None else int(round_), "workers": ws}
 
 
+def checkpoint_state(out, step, round_):
+    """state.json for the checkpoint just written at `step`: the step, the slowest worker's cursor and
+    the walk snapshot a resume starts from (`resume_walk`). Written at EVERY checkpoint boundary --
+    evaluation, `ckpt_every`, the RAM guard's -- after the checkpoint itself, so the walk it records is
+    at or past what that checkpoint trained on and a resume never repeats a visit."""
+    return write_state(out, step=int(step), round=int(round_), cursor=read_cursor(out, round_),
+                       region_s=region_seconds(out, round_), walk=walk_snapshot(out, round_),
+                       verso_on=bool(read_state(out).get("verso_on", False)))
+
+
 def resume_walk(out, round_):
     """The walk a resumed trainer starts from: the snapshot the last checkpoint wrote into state.json,
     else (a run older than the snapshot) the workers' own cursor files -- never position 0 when the
@@ -2971,13 +2981,21 @@ def run(cfg, out=None, init=None, device=None, backend="torch", producer=True):
 
     def hook(info):
         """Every `eval_every` steps: publish the state, honour STOP and PHASE, run the two gates, and
-        refresh the validation grid when the held-out labels changed."""
+        refresh the validation grid when the held-out labels changed. At a checkpoint-only boundary
+        (`kind` "ckpt", `cfg.ckpt_every`) or after the RAM guard's checkpoint ("stop"): publish the
+        state and honour STOP, nothing else -- no evaluation ran, so no gate may read one."""
         step = int(info["step"])
+        kind = info.get("kind", "eval")
+        if kind != "eval":
+            checkpoint_state(out, step, state["round"])
+            if kind == "ckpt" and stop_requested(out):
+                jlog(out, "sched", {"kind": "stop", "step": step})
+                state["stop"] = True
+                return True
+            return False
         if isinstance(val, sample.DiskGrid):
             refresh_grid()
-        write_state(out, step=step, round=state["round"], cursor=read_cursor(out, state["round"]),
-                    region_s=region_seconds(out, state["round"]), walk=walk_snapshot(out, state["round"]),
-                    verso_on=bool(read_state(out).get("verso_on", False)))
+        checkpoint_state(out, step, state["round"])
         if stop_requested(out):
             jlog(out, "sched", {"kind": "stop", "step": step})
             state["stop"] = True

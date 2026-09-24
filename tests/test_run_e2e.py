@@ -62,7 +62,7 @@ def run_cfg(region_cfg, fake_teacher, tmp_path, has_volcomp):
         pytest.skip("a region store is a volcomp array; no libvolcomp on this host")
     return replace(region_cfg,
                    out=str(tmp_path / "e2e"), teacher_ckpts={"fake": fake_teacher.ckpt},
-                   mode="cpu", gpus=(), rounds=2, steps=20, eval_every=5,
+                   mode="cpu", gpus=(), rounds=2, steps=20, eval_every=5, ckpt_every=3,
                    verso_after_steps=5, verso_min_dice=0.0, round_min_steps_after_verso=0, verso_min_regions=1,
                    verso_regen_gain=10.0, round_steps=5, heldout=1, workers=0,
                    min_regions_before_train=2, lookahead_extra=2, reserve_gb=0.001,
@@ -145,6 +145,10 @@ def test_rvsm_run_two_rounds_end_to_end(run_cfg, tmp_path, capsys):
     assert {r["kind"] for r in pr} >= {"teacher", "verso", "self"}, {r["kind"] for r in pr}
     assert all(isinstance(r["s"], float) for r in pr)
     assert RUN.tail_jsonl(os.path.join(out, "logs", "sched.jsonl"), 500)
+    # checkpoint-only boundaries ran between the evaluations (and ran no evaluation of their own)
+    cks = [r for r in RUN.tail_jsonl(os.path.join(out, "logs", "train.jsonl"), 2000) if r.get("kind") == "ckpt"]
+    assert any(r["at"] == "ckpt" for r in cks) and any(r["at"] == "eval" for r in cks)
+    assert not {r["step"] for r in ev} & {r["step"] for r in cks if r["at"] == "ckpt"}
 
     # ---- `rvsm status` reads the directory and prints it
     capsys.readouterr()

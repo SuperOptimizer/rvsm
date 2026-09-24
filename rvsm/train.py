@@ -932,7 +932,10 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     evaluation, the PNG and the calibration are skipped and only the checkpoint is written.
 
     `hook(info)` is called after every evaluation+checkpoint, with `{step, net, opt, ema, temps, out,
-    ckpt}`; returning something truthy ENDS the loop (the checkpoint is already on disk). That is the
+    ckpt, kind}`; returning something truthy ENDS the loop (the checkpoint is already on disk). `kind`
+    is "eval" at an evaluation boundary, "ckpt" at a checkpoint-only one (`cfg.ckpt_every`: no
+    evaluation ran, so no gate may read one) and "stop" after the RAM guard's checkpoint (the loop is
+    over whatever the hook returns). That is the
     one seam `rvsm/run.py` needs: the state file, the STOP marker, the timeshare phase swap and the
     verso / round gates all live there and none of them belong in the step loop. `ckpt` overrides where
     the checkpoint is written (the driver keeps it at `<out>/ckpt/student.pt`, beside the round
@@ -1026,6 +1029,15 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             keep_prev(ck)
         tmp.replace(ck)
         saved["step"] = step
+
+    ckpt_every = max(int(getattr(cfg, "ckpt_every", 0) or 0), 0)
+
+    def checkpoint(kind):
+        """`save()` at a boundary, logged as a `ckpt` line with its wall seconds."""
+        tc = time.time()
+        save()
+        _log(str(out / "logs" / "train.jsonl"),
+             {"kind": "ckpt", "step": step, "at": kind, "s": round(time.time() - tc, 2)})
 
     panels = {}                      # one validation panel per held-out region, chosen once per run
 
@@ -1235,17 +1247,24 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                   "train_wait_s": round(src.take_wait_s(), 3), "fetch_s": _r3(src.take_fetch_s()),
                   "step_s": round(dt / max(step - s0, 1), 3), **ph.take()})
             rung_n, nvox, t0, s0 = {}, 0, time.time(), step
-        if step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps:
+        at_eval = step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps
+        at_ckpt = ckpt_every > 0 and step % ckpt_every == 0
+        if at_eval or at_ckpt:
             why_stop = stopping()
             if why_stop:
                 break
-            do_eval()
-            save()
+            if at_eval:
+                do_eval()
+            # a checkpoint-only boundary (`ckpt_every`) saves exactly what an evaluation's does and
+            # hands the hook `kind="ckpt"`: the driver writes the resume state (step, walk) and honours
+            # STOP, but runs no evaluation, calibration or gate
+            checkpoint("eval" if at_eval else "ckpt")
             # `quiesce` is the loader's shutdown protocol: a round transition calls it before it
             # resets the round's cursor state (review T19)
             if hook is not None and hook({"step": step, "net": net, "opt": opt, "ema": ema,
                                           "temps": temps, "out": str(out), "ckpt": str(ck),
-                                          "quiesce": src.close}):
+                                          "quiesce": src.close,
+                                          "kind": "eval" if at_eval else "ckpt"}):
                 break
             t0, s0 = time.time(), step
     why_stop = why_stop or stopping()      # the prefetch ends its iteration when stop() is set
@@ -1263,7 +1282,12 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
               "discarded_steps": 0 if do_save else int(step - int(last))})
         src.close(timeout=5.0)
         if do_save:
-            save()
+            checkpoint("stop")
+            # the driver records the resume state of THIS checkpoint (its step and walk): without it
+            # state.json kept the last evaluation's walk and a resume replayed the steps in between
+            if hook is not None:
+                hook({"step": step, "net": net, "opt": opt, "ema": ema, "temps": temps,
+                      "out": str(out), "ckpt": str(ck), "quiesce": src.close, "kind": "stop"})
         return str(ck)
     src.close()
     save()
