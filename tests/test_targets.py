@@ -706,3 +706,40 @@ def test_fields_that_yield_between_batches_write_the_same_bytes(slab_region, mon
     n_batches = 8 + 1                                  # 128^3 at block 64: 8 rung-2 blocks, 1 rung-3
     assert len(others) == n_batches - 1 and lk.holder() is None
     _same_stores(a, b)
+
+
+@pytest.mark.parametrize("dev", TORCH_DEVICES)
+@pytest.mark.parametrize("B", [1, 3, 8])
+def test_faceless_blocks_are_skipped_with_the_same_bytes(slab_region, tmp_path, monkeypatch, dev, B):
+    """A device block whose window has no recto voxel (all core "no_recto") or no verso voxel (the
+    recto face distance only) is answered without the rest of its transforms: the stores -- codes,
+    support counts, per-block support rows -- are byte-identical to computing every block, on a curved
+    region, an all-air region, and slabs whose faces fall into only some blocks' windows (mixed
+    batches of full / recto-only / faceless blocks)."""
+    import types
+    monkeypatch.setattr(targets, "FIELD_BATCH", B)
+    cases = [("air", dict(recto_x=-100, verso_x=-100)),     # no face anywhere
+             ("rec_only", dict(recto_x=80, verso_x=-100)),   # recto faces, never a verso
+             ("split", dict(recto_x=100, verso_x=20)),       # x-low windows: verso only; x-high: recto only
+             ("pair", dict(recto_x=80, verso_x=70))]         # a real pair in half the blocks
+    seen = {}
+    for name, kw in cases:
+        roots = {}
+        for skip in (False, True):
+            monkeypatch.setattr(targets, "SKIP_FACELESS", skip)
+            r = slab_region(name=f"{name}{int(skip)}", n=128, **kw)
+            rep = targets.region_fields(r.root, r.lo, r.ax, rungs=(2, 3), device=dev, **KW)
+            roots[skip] = r
+            seen[(name, skip)] = rep["skipped_blocks"]
+        _same_stores(roots[False], roots[True])
+    assert seen[("air", True)]["no_recto"] == seen[("air", True)]["blocks"] == 9
+    assert seen[("rec_only", True)]["no_verso"] > 0 and seen[("split", True)]["no_recto"] > 0
+    assert seen[("split", True)]["no_verso"] > 0
+    assert all(seen[(nm, False)]["skipped"] == 0 for nm, _ in cases)
+    for skip in (False, True):                          # and the curved region, every block with faces
+        monkeypatch.setattr(targets, "SKIP_FACELESS", skip)
+        root = str(tmp_path / f"curved{int(skip)}")
+        ax = _curved_region(root)
+        targets.region_fields(root, (0, 0, 0), ax, rungs=(2, 3), device=dev, **KW)
+    _same_stores(types.SimpleNamespace(root=str(tmp_path / "curved0"), lo=(0, 0, 0)),
+                 types.SimpleNamespace(root=str(tmp_path / "curved1"), lo=(0, 0, 0)))

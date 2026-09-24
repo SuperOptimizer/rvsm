@@ -871,6 +871,9 @@ def _encode_torch(m, t, ok, cap):
 
 
 FIELD_BATCH = 3      # blocks per device batch: ~0.83 GB of VRAM each at 224^3, 2.5 GB at 3
+# a device block whose window has no recto (or no verso) voxel at the threshold is answered without its
+# transforms (`_faceless`): the same bytes and support counts. RVSM_FIELDS_SKIP=0 computes every block
+SKIP_FACELESS = os.environ.get("RVSM_FIELDS_SKIP", "1") not in ("0", "false", "no")
 
 
 def _batches(tasks, size):
@@ -975,6 +978,8 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
     ks = sorted({int(t[0]) for t in tasks})
     src = {"recto": _SlabStore(rec_a, ks, dev), "verso": None if ver_a is None else _SlabStore(ver_a, ks, dev)}
     groups = _batches(tasks, batch)
+    lvl = int(round(thr * 255))
+    stats = {"blocks": 0, "no_recto": 0, "no_verso": 0}      # blocks answered without their transforms
     axk = {k: AX.axis_at(np.asarray(ax, np.float64), k) for k in ks}
     stream = torch.cuda.Stream(dev) if dev.type == "cuda" else None
     ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
@@ -994,7 +999,11 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
                 if sv is not None:
                     sv.drop_below(low)
         ext = list(src["recto"].shape(k))
-        return rsh, rec, ver, _host_inputs(axk[k], [lo for _, lo, _ in group], rsh, rlos, ext, halo)
+        # which windows have a face at all (on this helper thread, off the device's critical path)
+        hr = (rec >= lvl).reshape(len(group), -1).any(1)
+        hv = np.zeros(len(group), bool) if ver is None else (ver >= lvl).reshape(len(group), -1).any(1)
+        return rsh, rec, ver, _host_inputs(axk[k], [lo for _, lo, _ in group], rsh, rlos, ext, halo), \
+            (hr, hv)
 
     import concurrent.futures as cf
     if gpu_lock is None:
@@ -1012,17 +1021,26 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
         for gi, group in enumerate(groups):
             if gi and yield_point is not None:
                 yield_point(flush)
-            rsh, rec, ver, host = nxt.result()
+            rsh, rec, ver, host, (hr, hv) = nxt.result()
             nxt = cutter.submit(cut, gi + 1) if gi + 1 < len(groups) else None
             k, n = int(group[0][0]), group[0][2]
             dy, dx, core, cover = _block_inputs_torch(host, rsh, float(axis_r_um) / ladder.rung_um(k),
                                                       halo, dev)
             rk, tn, tx = rung_params(k, reach, tmin, tmax)
-            m, t, ok, cnt = _block_fields_t(_to_dev(rec, dev), None if ver is None else _to_dev(ver, dev),
-                                            dy, dx, thr, rk, tn, tx, core, cover, dev)
             sl = (slice(None),) + tuple(slice(int(halo), int(halo) + int(v)) for v in n)
-            enc = _encode_torch(m[sl], t[sl], ok[sl], cap)
-            del dy, dx, core, cover, m, t, ok
+            stats["blocks"] += len(group)
+            full = hr & hv
+            if full.all() or not SKIP_FACELESS:
+                m, t, ok, cnt = _block_fields_t(_to_dev(rec, dev), None if ver is None else _to_dev(ver, dev),
+                                                dy, dx, thr, rk, tn, tx, core, cover, dev)
+                enc = _encode_torch(m[sl], t[sl], ok[sl], cap)
+                del m, t, ok
+            else:
+                enc, cnt = _faceless(rec, ver, hr, hv, dy, dx, core, cover, thr, rk, tn, tx, cap, sl, n,
+                                     dev)
+                stats["no_recto"] += int((~hr).sum())
+                stats["no_verso"] += int((hr & ~hv).sum())
+            del dy, dx, core, cover
             if stream is not None:                 # one read-back per batch
                 he = torch.empty(enc.shape, dtype=torch.uint8, pin_memory=True)
                 hc = torch.empty(cnt.shape, dtype=torch.int64, pin_memory=True)
@@ -1039,6 +1057,7 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
             if rung_done is not None and (gi + 1 == len(groups) or int(groups[gi + 1][0][0]) != k):
                 rung_done(k)
         del src
+        stats["skipped"] = stats["no_recto"] + stats["no_verso"]
         if stream is not None:              # still under the lock: the next pass finds the card clean
             stream.synchronize()
             torch.cuda.empty_cache()        # hand the fields' blocks back to the process's other users
@@ -1046,6 +1065,50 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
                 torch._C._host_emptyCache()  # and the pinned staging buffers back to the host
             except Exception:  # noqa: BLE001
                 pass
+    return stats
+
+
+def _faceless(rec, ver, hr, hv, dy, dx, core, cover, thr, rk, tn, tx, cap, sl, n, dev):
+    """A device batch in which some windows have no face: (enc (2,B,*n) uint8, counts (B, NCOUNT)) as
+    `_block_fields_t` + `_encode_torch` would give them, computing only what those blocks' answer
+    depends on.
+
+    `hr` / `hv`: does each window have a recto / verso voxel at the threshold. Without a recto voxel
+    there is no recto face, `ur` is +inf everywhere, and every core voxel fails "no_recto" first:
+    nothing is valid, the codes are 0, the counts are (voxels, no_recto = voxels, 0, ...). With a recto
+    face but no verso voxel, `uv` is +inf: a core voxel fails "no_recto" where `ur > reach` and
+    "no_verso" everywhere else, so only the recto face distance is computed (the numpy path's own early
+    return is the same rule, `block_fields`). The blocks with both run through `_block_fields_t` as a
+    smaller batch -- a batch's blocks are computed independently, so its size never changes a byte."""
+    import torch
+    B = len(hr)
+    enc = torch.zeros((2, B) + tuple(int(v) for v in n), dtype=torch.uint8, device=dev)
+    cnt = torch.zeros((B, NCOUNT), dtype=torch.int64, device=dev)
+    nvox = core.reshape(B, -1).sum(1)
+    full = np.flatnonzero(hr & hv)
+    if full.size:
+        ti = torch.as_tensor(full, device=dev)
+        m, t, ok, c = _block_fields_t(_to_dev(rec[full], dev), _to_dev(ver[full], dev), dy[ti], dx[ti],
+                                      thr, rk, tn, tx, core[ti], cover[ti], dev)
+        enc[:, ti] = _encode_torch(m[sl], t[sl], ok[sl], cap)
+        cnt[ti] = c
+        del m, t, ok, c
+    ro = np.flatnonzero(hr & ~hv)
+    if ro.size:
+        ti = torch.as_tensor(ro, device=dev)
+        _, ur, _ = face_distance_torch(medial_torch(_to_dev(rec[ro], dev) >= int(round(thr * 255))),
+                                       dy[ti], dx[ti])
+        nr = (core[ti] & (ur > rk)).reshape(len(ro), -1).sum(1)
+        del ur
+        cnt[ti, 0] = nvox[ti]
+        cnt[ti, 1] = nr
+        cnt[ti, 2] = nvox[ti] - nr
+    em = np.flatnonzero(~hr)
+    if em.size:
+        ti = torch.as_tensor(em, device=dev)
+        cnt[ti, 0] = nvox[ti]
+        cnt[ti, 1] = nvox[ti]
+    return enc, cnt
 
 
 def _blocks(shape, block):
@@ -1211,9 +1274,9 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
         byk = {k: (k, Sk, paths, want) for k, Sk, paths, want in todo}
         with cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fwrite") as wr:
             futs = []
-            _fields_torch(init, tasks, device, take,
-                          rung_done=lambda k: futs.append(wr.submit(write_rung, *byk[k])),
-                          batch=batch, gpu_lock=gpu_lock)
+            rep["skipped_blocks"] = _fields_torch(
+                init, tasks, device, take, rung_done=lambda k: futs.append(wr.submit(write_rung, *byk[k])),
+                batch=batch, gpu_lock=gpu_lock)
             for f in futs:
                 f.result()
         return rep

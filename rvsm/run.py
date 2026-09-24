@@ -966,7 +966,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
 
     def fields(lo, round_, t0, cursor):
         try:
-            TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs, pool=fpool,
+            rep = TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs, pool=fpool,
                              device=fdev, batch=fbatch,
                              gpu_lock=gate.fields_hold(t0, tag={"region": list(lo), "round": round_})
                              if fdev else None)
@@ -976,7 +976,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 stores.commit_bundle(out, lo, round_, g, t=time.time())
             jlog(out, "produce", {"kind": "fields", "region": list(lo), "round": round_,
                                   "s": round(time.time() - t0, 2), "cursor": cursor, "gen": g,
-                                  "device": fdev or "cpu"})
+                                  "device": fdev or "cpu",
+                                  "skipped": (rep or {}).get("skipped_blocks")})
         finally:
             with lock:
                 busy.discard(lo)
