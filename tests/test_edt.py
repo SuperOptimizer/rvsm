@@ -62,6 +62,15 @@ def test_the_triton_kernels_equal_the_torch_implementations():
         v, ix = E.edt2(t)
         vt, ixt = E.edt2(t, torch_only=True)
         assert torch.equal(v, vt) and torch.equal(ix, ixt)
+    for p in (0.1, 0.3, 0.5):
+        m = torch.from_numpy(rng.random((3, 20, 30, 25)) < p).cuda()
+        lab = E.label(m)
+        k, E._TRITON = E._TRITON, False
+        try:
+            lt = E.label(m)
+        finally:
+            E._TRITON = k
+        assert torch.equal(lab, lt)                  # both: each component's largest 1 + index
     x = torch.from_numpy((rng.random((19, 23, 29)) * 40 - 20).astype(np.float32)).cuda()
     g = E.gaussian3(x, 1.5)
     k, E._TRITON = E._TRITON, False
@@ -76,12 +85,16 @@ def test_the_triton_kernels_equal_the_torch_implementations():
 def test_label_is_scipys_26_connected_partition(dev):
     rng = np.random.default_rng(1)
     for p in (0.05, 0.2, 0.3, 0.5):
-        m = rng.random((20, 30, 25)) < p
-        lab = E.label(torch.from_numpy(m).to(dev)).cpu().numpy()
-        ref = ndi.label(m, np.ones((3, 3, 3), bool))[0]
-        assert (lab[~m] == 0).all() and (lab[m] > 0).all()
-        pairs = set(zip(lab[m].tolist(), ref[m].tolist()))
-        assert len(pairs) == len(set(lab[m].tolist())) == len(set(ref[m].tolist())), p   # a bijection
+        m = rng.random((3, 20, 30, 25)) < p
+        labs = E.label(torch.from_numpy(m).to(dev)).cpu().numpy()      # a batch: volume by volume
+        for b in range(3):
+            lab = labs[b]
+            ref = ndi.label(m[b], np.ones((3, 3, 3), bool))[0]
+            assert (lab[~m[b]] == 0).all() and (lab[m[b]] > 0).all()
+            pairs = set(zip(lab[m[b]].tolist(), ref[m[b]].tolist()))
+            assert len(pairs) == len(set(lab[m[b]].tolist())) == len(set(ref[m[b]].tolist())), p
+        one = E.label(torch.from_numpy(m[1]).to(dev)).cpu().numpy()
+        assert np.array_equal(one, labs[1])
 
 
 @pytest.mark.parametrize("dev", DEVICES)
@@ -99,3 +112,42 @@ def test_filters_match_scipy(dev):
     for shape in ((16, 18, 20), (15, 17, 9)):
         v = rng.integers(0, 256, shape, dtype=np.uint8)
         assert np.array_equal(E.pool2(torch.from_numpy(v).to(dev)).cpu().numpy(), ladder.pool2(v))
+
+
+@pytest.mark.parametrize("dev", DEVICES)
+def test_the_walk_kernel_is_the_numpy_walk(dev):
+    """`walk_crossings` against the numpy loop of `targets._pair_checks` (c): the same samples (float32
+    ratio, float32 multiply and add, round half to even) and the same leave/enter rules, per segment
+    with its own block's sample count."""
+    rng = np.random.default_rng(4)
+    shape = (2, 12, 14, 16)
+    br = rng.random(shape) < 0.4
+    bv = rng.random(shape) < 0.4
+    M = 400
+    b = rng.integers(0, 2, M)
+    pa = np.stack([rng.integers(0, s, M) for s in shape[1:]])
+    pb = np.stack([rng.integers(0, s, M) for s in shape[1:]])
+    act = rng.random(M) < 0.8
+    seg = (pb - pa).astype(np.float32)
+    ln = np.sqrt((seg * seg).sum(0))
+    nblk = [max(1, int(np.ceil(2.0 * float(ln[act & (b == k)].max(initial=0))))) for k in range(2)]
+    want = np.zeros(M, bool)
+    for k in range(2):
+        w = np.flatnonzero(act & (b == k))
+        n = nblk[k]
+        a, sg = pa[:, w].astype(np.float32), seg[:, w]
+        left, inv, hit = (np.zeros(w.size, bool) for _ in range(3))
+        for i in range(n + 1):
+            qi = tuple(np.rint(a + (i / n) * sg).astype(np.int64))
+            rr, vv = br[k][qi], bv[k][qi]
+            hit |= left & rr & ~vv
+            left |= ~rr
+            hit |= inv & ~vv
+            inv |= vv
+        want[w] = hit
+    t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev)
+    V = int(np.prod(shape[1:]))
+    got = E.walk_crossings(t(pa), t(pb), t(b.astype(np.int64) * V), t(act),
+                           t(np.array(nblk, np.int32)[b]), 64, t(br), t(bv))
+    assert np.array_equal(got.cpu().numpy(), want)
+

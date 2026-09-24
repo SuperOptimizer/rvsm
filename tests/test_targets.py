@@ -619,3 +619,28 @@ def test_region_fields_on_a_device_is_deterministic(slab_region, dev):
     targets.region_fields(a.root, a.lo, a.ax, rungs=(2, 3), device=dev, **KW)
     targets.region_fields(b.root, b.lo, b.ax, rungs=(2, 3), device=dev, **KW)
     _same_stores(a, b)
+
+
+@pytest.mark.parametrize("dev", TORCH_DEVICES)
+def test_the_device_batch_size_does_not_change_the_bytes(slab_region, tmp_path, monkeypatch, dev):
+    """Blocks go through the device `FIELD_BATCH` at a time; each is computed on its own (per-volume
+    operators, per-block offsets and walk sample counts), so any batch size writes the same stores --
+    including a batch mixing a block with faces and blocks without."""
+    lo = (0, 0, 0)
+    roots = []
+    for B in (1, 3, 8):
+        root = str(tmp_path / f"b{B}")
+        ax = _curved_region(root)
+        monkeypatch.setattr(targets, "FIELD_BATCH", B)
+        targets.region_fields(root, lo, ax, rungs=(2, 3), device=dev, **KW)
+        roots.append(root)
+    import types
+    for r in roots[1:]:
+        _same_stores(types.SimpleNamespace(root=roots[0], lo=lo), types.SimpleNamespace(root=r, lo=lo))
+    a = slab_region(name="e1", n=128, recto_x=-100, verso_x=70)       # no recto face anywhere
+    b = slab_region(name="e3", n=128, recto_x=-100, verso_x=70)
+    monkeypatch.setattr(targets, "FIELD_BATCH", 1)
+    targets.region_fields(a.root, a.lo, a.ax, rungs=(2,), device=dev, **KW)
+    monkeypatch.setattr(targets, "FIELD_BATCH", 3)
+    targets.region_fields(b.root, b.lo, b.ax, rungs=(2,), device=dev, **KW)
+    _same_stores(a, b, rungs=(2,))

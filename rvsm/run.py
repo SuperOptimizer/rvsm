@@ -711,7 +711,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
     frungs = field_rungs(cfg)
     # the distance fields: on the producer's own GPU when it has one (`targets.block_fields_torch`,
-    # ~1 GB of extra VRAM at peak, inside the memory fraction), else a CPU pool of
+    # ~2.5 GB of extra VRAM at peak, inside the memory fraction), else a CPU pool of
     # every core at low priority
     fdev = str(device) if device is not None and str(device).startswith("cuda") else None
     jobs = 1 if fdev is not None else max(int(os.cpu_count() or 1), 1)
