@@ -513,9 +513,12 @@ class StudentSlot:
             return teacher if teacher and os.path.exists(teacher) else None
         return self.path if os.path.exists(self.path) else None
 
-    def get(self, round_=0, teacher=None):
+    def get(self, round_=0, teacher=None, path=None):
+        """The student for this round -- or, with `path`, exactly that checkpoint file (the FROZEN
+        checkpoint a verso regeneration runs from)."""
         from rvsm import infer
-        p = self.source(round_, teacher)
+        p = (path if path and os.path.exists(path) else None) if path is not None else \
+            self.source(round_, teacher)
         if p is None:
             return None
         m = os.path.getmtime(p)
@@ -685,7 +688,23 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                           "backend": str(backend), "field_rungs": list(frungs), "jobs": jobs})
 
     bank, slot = None, StudentSlot(out, device=device, compile=cfg.compile)
+    rslot = StudentSlot(out, device=device, compile=cfg.compile)   # the frozen regeneration student
     keys = {}
+    backlog_keys = set()                        # regions fetched for the regeneration backlog
+
+    def release_backlog():
+        """A backlog region sits outside the walk (no position), so `_release_passed` never gives its
+        CT back: it is released here once it needs nothing more."""
+        rg = read_state(out).get("verso_regen")
+        c0 = RG.Catalog(out, 0, ttl=1.0)
+        for lo in list(backlog_keys):
+            with lock:
+                if lo in busy:
+                    continue
+            if _next_job(c0, lo, 0, True, out, rungs=frungs, regen=rg) is None:
+                backlog_keys.discard(lo)
+                if lo in keys:
+                    cache.release(keys.pop(lo))
     # a restart: the inventory charged every shard an earlier process left, and nothing is held yet --
     # the regions the trainer's workers are reading are re-held (and re-fetched if they lost shards)
     # BEFORE the first eviction, which then honours the budget at once
@@ -845,6 +864,28 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if job is not None:
                     units.append((lo, job))
             gpu_units = [u for u in units if u[1] != "fields"]
+            regen = st.get("verso_regen")
+            if round_ == 0 and regen and not st.get("verso_regen_done") and not gpu_units:
+                # the regeneration BACKLOG, worked through when the lookahead window has nothing for
+                # the GPU (never ahead of the trainer's own regions): one region per pass
+                rem = regen_remaining(out)
+                if rem == []:
+                    write_state(out, verso_regen_done=True)
+                    jlog(out, "produce", {"kind": "verso_regen_done", "regions": regen.get("backlog")})
+                for lo in (rem or []):
+                    with lock:
+                        if lo in busy:
+                            continue
+                    job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs, regen=regen)
+                    if job == "fields":
+                        with lock:
+                            busy.add(lo)
+                            pend.append(fielder.submit(fields, lo, round_, time.time(), cursor))
+                        backlog_keys.add(lo)
+                    elif job is not None:
+                        gpu_units.append((lo, job))
+                        backlog_keys.add(lo)
+                        break
             did = False
             for lo, job in units:               # the CPU units go straight to their own pool
                 if job == "fields" and not stopping():
@@ -862,7 +903,10 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if job == "teacher" and bank is None:
                     bank = TeacherBank(cfg, out, device=device, backend=backend)
                     pre.pop((lo, job), None)        # read before the bank existed: no CT in it
-                if job in ("verso", "self") and slot.get(round_, st.get("teacher")) is None:
+                _rg = st.get("verso_regen") or {}
+                _frozen = _rg.get("ckpt") if (job == "verso" and round_ == 0 and cat.done("verso", lo)) else None
+                if job in ("verso", "self") and (rslot.get(path=_frozen) if _frozen else
+                                                 slot.get(round_, st.get("teacher"))) is None:
                     break
                 t0 = time.time()
                 stamp({"phase": f"round{round_}", "job": job,
@@ -892,13 +936,19 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                 ("rw", W.cpu().numpy(), 8, "prob_u8")]
                         del P, W
                     else:
-                        stu = slot.get(round_, st.get("teacher"))
+                        rg = st.get("verso_regen") or {}
+                        regen_unit = job == "verso" and round_ == 0 and cat.done("verso", lo) \
+                            and bool(rg.get("ckpt"))
+                        # a REGENERATION runs from the frozen qualifying checkpoint, never the live one
+                        use = rslot if regen_unit else slot
+                        stu = use.get(path=rg["ckpt"]) if regen_unit else use.get(round_, st.get("teacher"))
                         heads = "verso" if job == "verso" else "all"
                         sign = -1.0 if job == "verso" else 1.0
                         want = [str(stu.layout.channels[0])] if heads == "verso" else "all"
                         planes = _student_planes(stu, ct_local, ax, lo, size, sign, want, meta5, pyr)
                         attrs = {"producer": "student", "ckpt": stu.ckpt, "step": int(stu.step),
-                                 "ckpt_sha256": slot.sha, "frozen_teacher": bool(round_ >= 1),
+                                 "ckpt_sha256": use.sha, "frozen_teacher": bool(round_ >= 1),
+                                 "regeneration": bool(regen_unit),
                                  # a round-0 verso that already has a finished generation is the ONE
                                  # regeneration: it goes to the next generation, beside the old one
                                  "gen": (stores.store_gen(out, "verso", lo, 0) + 1
@@ -925,12 +975,14 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 with clock:
                     _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs,
                                     leased=leased)
+                    release_backlog()
             for k in [k for k in pre if k not in gpu_units]:
                 pre.pop(k)                          # a read for a unit this pass no longer wants
             if not did:
                 with clock:
                     _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs,
                                     leased=leased)
+                    release_backlog()
                 time.sleep(IDLE_S)
                 if read_phase(out, "") == "produce" and not busy:
                     write_phase(out, "train")     # the window is drained: give the card back
@@ -1247,10 +1299,62 @@ def maybe_regen_verso(cfg, out, step):
     need = float(cfg.verso_min_dice) + float(getattr(cfg, "verso_regen_gain", 0.15))
     if not pair_ or pair_[1] < need:
         return False
-    write_state(out, verso_regen={"step": int(step), GATE_METRIC: float(pair_[1])})
+    # FREEZE the qualifying checkpoint (a hard link: the live student.pt is replaced by rename, the
+    # link keeps these bytes) and its hash: the whole regeneration runs from this one network
+    import hashlib
+    src = os.path.join(str(out), "ckpt", "student.pt")
+    frozen = os.path.join(str(out), "ckpt", "verso_regen.pt")
+    if os.path.exists(frozen):
+        os.remove(frozen)
+    try:
+        os.link(src, frozen)
+    except OSError:
+        shutil.copyfile(src, frozen)
+    h = hashlib.sha256()
+    with open(frozen, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 24), b""):
+            h.update(blk)
+    backlog = regen_backlog(out, int(step))
+    write_json_atomic(backlog_path(out), {"step": int(step), "regions": [list(lo) for lo in backlog]})
+    write_state(out, verso_regen={"step": int(step), GATE_METRIC: float(pair_[1]), "ckpt": frozen,
+                                  "sha256": h.hexdigest(), "backlog": len(backlog)})
     jlog(out, "sched", {"kind": "verso_regen", "step": int(step), GATE_METRIC: float(pair_[1]),
-                        "need": need})
+                        "need": need, "ckpt_sha256": h.hexdigest(), "backlog": len(backlog)})
     return True
+
+
+def backlog_path(out):
+    return os.path.join(str(out), "stores", "round_0", "bundle", "regen_backlog.json")
+
+
+def write_json_atomic(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write_json(path, obj)
+
+
+def regen_backlog(out, step):
+    """Every region whose finished generation-0 verso was made by a checkpoint older than `step`: the
+    regeneration's whole work list, persisted, and worked through independently of the trainer's
+    lookahead window (pass-4 P4-06)."""
+    from rvsm import regions as RG, stores
+    out_ = []
+    for lo in RG.Catalog(out, 0).list_done("verso"):
+        if stores.store_gen(out, "verso", lo, 0) != 0:
+            continue
+        made = stores.read_attrs(stores.store_path(out, "verso", lo, 0)).get("step")
+        if made is None or int(made) < int(step):
+            out_.append(tuple(int(v) for v in lo))
+    return out_
+
+
+def regen_remaining(out):
+    """The backlog regions whose regenerated bundle is not committed yet ([] = the regeneration is
+    complete; None = there is no regeneration)."""
+    from rvsm import stores
+    b = _read_json(backlog_path(out))
+    if not b:
+        return None
+    return [tuple(lo) for lo in b.get("regions", []) if stores.bundle_gen(out, tuple(lo), 0) < 1]
 
 
 def _complete_rows(rows, keys=("precision", "betti0_err")):

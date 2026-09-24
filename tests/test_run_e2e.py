@@ -1262,6 +1262,9 @@ def test_the_verso_is_regenerated_once_as_a_new_generation(tmp_path, small_cfg):
     for f in fields:
         _fake_store(f)
     RUN.write_state(out, round=0, verso_on=True, verso_on_step=10000)
+    os.makedirs(os.path.join(out, "ckpt"))
+    with open(os.path.join(out, "ckpt", "student.pt"), "wb") as f:
+        f.write(b"the qualifying weights")
     cat = RG.Catalog(out, 0, ttl=0.0)
     assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4)) is None
     sch = {"eval_schema": TR.EVAL_SCHEMA}
@@ -1271,7 +1274,16 @@ def test_the_verso_is_regenerated_once_as_a_new_generation(tmp_path, small_cfg):
     RUN.jlog(out, "eval", {"step": 22000, RUN.GATE_METRIC: 0.47, **sch}, echo=False)
     assert RUN.maybe_regen_verso(cfg, out, 22000)
     regen = RUN.read_state(out)["verso_regen"]
-    assert regen == {"step": 22000, RUN.GATE_METRIC: 0.47}
+    assert regen["step"] == 22000 and regen[RUN.GATE_METRIC] == 0.47
+    # P4-06: the qualifying checkpoint is FROZEN (its own file and hash) and the backlog persisted
+    import hashlib
+    assert open(regen["ckpt"], "rb").read() == b"the qualifying weights"
+    assert regen["sha256"] == hashlib.sha256(b"the qualifying weights").hexdigest()
+    with open(os.path.join(out, "ckpt", "student.pt.tmp"), "wb") as f:
+        f.write(b"later weights")
+    os.replace(os.path.join(out, "ckpt", "student.pt.tmp"), os.path.join(out, "ckpt", "student.pt"))
+    assert open(regen["ckpt"], "rb").read() == b"the qualifying weights"  # training moved on; not it
+    assert regen["backlog"] == 1 and RUN.regen_remaining(out) == [lo]
     RUN.jlog(out, "eval", {"step": 24000, RUN.GATE_METRIC: 0.6, **sch}, echo=False)
     assert not RUN.maybe_regen_verso(cfg, out, 24000), "the regeneration fires once"
     assert RUN._next_job(cat, lo, 0, True, out, rungs=(2, 3, 4), regen=regen) == "verso"
@@ -1291,6 +1303,7 @@ def test_the_verso_is_regenerated_once_as_a_new_generation(tmp_path, small_cfg):
     assert RG.Catalog(out, 0).path("midline", lo).endswith(".zarr") and \
         not RG.Catalog(out, 0).path("midline", lo).endswith(".g1.zarr")  # not committed yet
     stores.commit_bundle(out, lo, 0, 1)                                  # the producer commits it
+    assert RUN.regen_remaining(out) == []                                 # the backlog is complete
     c2 = RG.Catalog(out, 0)
     assert c2.path("verso", lo) == g1                                    # every reader moves ...
     assert all(c2.path(TG.channel(kind, k), lo).endswith(".g1.zarr")    # ... to the whole bundle
