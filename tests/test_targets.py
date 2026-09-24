@@ -666,3 +666,43 @@ def test_device_fields_wait_for_the_gpu_lock(slab_region):
     th.join(120)
     assert done.is_set() and targets.fields_current(r.root, r.lo, rungs=(2,), reach=12)
     assert lk.holder() is None
+
+
+@pytest.mark.parametrize("dev", TORCH_DEVICES)
+def test_fields_that_yield_between_batches_write_the_same_bytes(slab_region, monkeypatch, dev):
+    """The producer's fields give the card back between batches to a blocking pass
+    (`run.GpuGate.fields_hold`): `_fields_torch` calls the lock's `yield_point(flush)` before every batch
+    but the first, and a yield in every gap -- the lock released, someone else on the card, the lock
+    taken back -- leaves the stores byte-identical."""
+    import threading
+    from rvsm import run as RUN
+    monkeypatch.setattr(targets, "FIELD_BATCH", 1)
+    a = slab_region(name="y1", n=128, recto_x=80, verso_x=70)
+    b = slab_region(name="y2", n=128, recto_x=80, verso_x=70)
+    targets.region_fields(a.root, a.lo, a.ax, rungs=(2, 3), device=dev, **KW)
+
+    lk = RUN.TracedLock("gpu")
+    others = []
+
+    class Always:
+        """A hold that yields at every batch boundary, and checks it holds the lock whenever it works."""
+        def __enter__(self):
+            lk.acquire()
+            return self
+
+        def __exit__(self, *e):
+            lk.release()
+
+        def yield_point(self, flush):
+            assert lk.holder()["thread"] == threading.current_thread().name
+            flush()
+            lk.release()
+            th = threading.Thread(target=lambda: (lk.acquire(), others.append(1), lk.release()))
+            th.start()
+            th.join(10)
+            lk.acquire()
+            return True
+    targets.region_fields(b.root, b.lo, b.ax, rungs=(2, 3), device=dev, gpu_lock=Always(), **KW)
+    n_batches = 8 + 1                                  # 128^3 at block 64: 8 rung-2 blocks, 1 rung-3
+    assert len(others) == n_batches - 1 and lk.holder() is None
+    _same_stores(a, b)

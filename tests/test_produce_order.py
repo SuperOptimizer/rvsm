@@ -14,3 +14,101 @@ def test_blocking_passes_first_walk_order_kept():
 def test_empty_and_single():
     assert _gpu_order([]) == []
     assert _gpu_order([((1, 2, 3), "verso")]) == [((1, 2, 3), "verso")]
+
+
+# --------------------------------------------------------------------------- the GPU gate (fields vs passes)
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from rvsm import run as RUN  # noqa: E402
+
+
+class _Fields(threading.Thread):
+    """A fake GPU fields job: `n` batches of `dt` s each under `gate.fields_hold`, calling its yield
+    point between batches (as `targets._fields_torch` does); records when each batch ran."""
+
+    def __init__(self, gate, n=40, dt=0.02, since=None):
+        super().__init__(daemon=True)
+        self.gate, self.n, self.dt = gate, n, dt
+        self.since = time.time() if since is None else since
+        self.runs, self.started = [], threading.Event()
+
+    def run(self):
+        with self.gate.fields_hold(self.since, tag={"region": [0, 0, 0]}) as h:
+            self.started.set()
+            for i in range(self.n):
+                if i:
+                    h.yield_point(lambda: None)
+                assert self.gate.holds()
+                t = time.time()
+                time.sleep(self.dt)
+                self.runs.append((t, time.time()))
+
+
+def _gate(**kw):
+    logs = []
+    return RUN.GpuGate(RUN.TracedLock("gpu"), log=logs.append, **kw), logs
+
+
+def test_a_blocking_pass_waits_at_most_one_fields_batch():
+    """Fields in flight, then a teacher pass arrives: the fields yield at their next batch boundary, the
+    pass gets the card at once, no fields batch overlaps it, the fields resume after it and log the
+    yield."""
+    gate, logs = _gate()
+    f = _Fields(gate, n=40, dt=0.02)
+    f.start()
+    assert f.started.wait(5)
+    time.sleep(0.1)
+    gate.set_pending(["teacher", "verso"])
+    t0 = time.time()
+    gate.pass_acquire("teacher")
+    waited = time.time() - t0
+    p0 = time.time()
+    time.sleep(0.2)                                 # the pass
+    p1 = time.time()
+    gate.set_pending(["verso"])                     # only a verso left: the fields' job is young ...
+    gate.release()
+    time.sleep(0.2)
+    assert not any(a < p1 and b > p0 for a, b in f.runs), "a fields batch ran beside the pass"
+    n_mid = len(f.runs)
+    assert n_mid < 40 and f.is_alive(), "the fields must not resume while a verso is pending"
+    gate.set_pending(())                            # the window is drained
+    f.join(10)
+    assert not f.is_alive() and len(f.runs) == 40
+    assert waited < 0.5, f"the teacher pass waited {waited:.2f} s behind the fields"
+    y = [r for r in logs if r.get("kind") == "fields_yield"]
+    assert len(y) == 1 and y[0]["for"] == ["teacher"] and y[0]["region"] == [0, 0, 0]
+    assert gate.lock.holder() is None
+
+
+def test_fields_do_not_start_while_a_gpu_unit_is_pending():
+    """No fields while a blocking pass is pending; while only verso passes are pending, not until the
+    fields job has waited FIELDS_DEFER_S (a clock here), and then it runs to the end without yielding to
+    the verso passes."""
+    now = [1000.0]
+    gate, logs = _gate(defer_s=600.0, now=lambda: now[0])
+    gate.set_pending(["self"])
+    f = _Fields(gate, n=5, dt=0.01, since=1000.0)
+    f.start()
+    assert not f.started.wait(0.3)
+    gate.set_pending(["verso", "verso"])            # the blocking pass is done; young fields still wait
+    assert not f.started.wait(0.3)
+    now[0] = 1000.0 + 601.0                         # the fields job is old: it may run beside verso work
+    assert f.started.wait(6.0)
+    f.join(5)
+    assert len(f.runs) == 5 and not [r for r in logs if r.get("kind") == "fields_yield"]
+
+
+def test_a_pass_that_is_not_blocking_does_not_make_the_fields_yield():
+    """A verso pass registered while old fields run waits for them (verso is never blocking)."""
+    gate, logs = _gate(defer_s=0.0)
+    f = _Fields(gate, n=10, dt=0.02)
+    f.start()
+    assert f.started.wait(5)
+    gate.set_pending(["verso"])
+    gate.pass_acquire("verso")
+    assert not f.is_alive() and len(f.runs) == 10    # it got the card only when the fields were done
+    gate.set_pending(())
+    gate.release()
+    assert not [r for r in logs if r.get("kind") == "fields_yield"]

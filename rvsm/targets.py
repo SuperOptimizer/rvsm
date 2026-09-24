@@ -999,9 +999,19 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
     import concurrent.futures as cf
     if gpu_lock is None:
         gpu_lock = contextlib.nullcontext()
+    # a lock that can make way (`run.GpuGate.fields_hold`) is offered the card back between batches:
+    # nothing of the fields is left on the device there, so it only waits for its own stream first
+    yield_point = getattr(gpu_lock, "yield_point", None)
+
+    def flush():
+        if stream is not None:
+            stream.synchronize()
+            torch.cuda.empty_cache()
     with gpu_lock, torch.no_grad(), ctx, cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fcut") as cutter:
         nxt = cutter.submit(cut, 0) if groups else None
         for gi, group in enumerate(groups):
+            if gi and yield_point is not None:
+                yield_point(flush)
             rsh, rec, ver, host = nxt.result()
             nxt = cutter.submit(cut, gi + 1) if gi + 1 < len(groups) else None
             k, n = int(group[0][0]), group[0][2]
@@ -1136,8 +1146,9 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     without one, `jobs > 1` forks a pool for this call. `device` (a torch device or its name) computes
     every block with `block_fields_torch` on that device, in this process and in block order, instead
     (`_fields_torch`), `batch` blocks at a time (default `FIELD_BATCH`), holding `gpu_lock` (a lock
-    shared with whatever else uses the card in this process) for the device work; `jobs` and `pool` are
-    then unused.
+    shared with whatever else uses the card in this process) for the device work -- and, when it has a
+    `yield_point(flush)` (`run.GpuGate.fields_hold`), calling it between batches, where it may hand
+    the card to someone else and take it back; `jobs` and `pool` are then unused.
 
     A pooled rung whose shape is not a multiple of 128 is padded up to one, because a store's shape must
     be; the padding is code 0, i.e. no data. For the production region (1024 at rung 2) rungs 3 and 4 are

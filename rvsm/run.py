@@ -743,6 +743,9 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     # the GPU fields never run beside a network pass: a pass holds this for its whole forward, the
     # fields hold it for a region's device work, and both empty the allocator's cache after
     gpu_lock = TracedLock("gpu", log=lambda rec: jlog(out, "produce", rec, echo=False))
+    # ... and by priority: the fields start only when no pass is pending (verso-only: after
+    # FIELDS_DEFER_S) and give the card back between batches to a blocking pass (`GpuGate`)
+    gate = GpuGate(gpu_lock, log=lambda rec: jlog(out, "produce", rec, echo=False))
     jlog(out, "produce", {"kind": "start", "pid": os.getpid(), "device": str(device),
                           "regions": len(route), "heldout": len(held), "pinned": pinned,
                           "backend": str(backend), "field_rungs": list(frungs), "jobs": jobs,
@@ -883,7 +886,9 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     def fields(lo, round_, t0, cursor):
         try:
             TG.region_fields(out, lo, ax, round_=round_, rungs=frungs, jobs=jobs, pool=fpool,
-                             device=fdev, batch=fbatch, gpu_lock=gpu_lock if fdev else None)
+                             device=fdev, batch=fbatch,
+                             gpu_lock=gate.fields_hold(t0, tag={"region": list(lo), "round": round_})
+                             if fdev else None)
             g = TG.source_verso(out, lo, round_)[0]
             if g > stores.bundle_gen(out, lo, round_) and TG.fields_current(out, lo, round_, frungs):
                 # the new verso AND all of its fields are finished: only now do readers move to them
@@ -963,6 +968,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         gpu_units.append((lo, job))
                         backlog_keys.add(lo)
                         break
+            gate.set_pending(j for _, j in gpu_units)   # the fields make way for these
             did = False
             for lo, job in units:               # the CPU units go straight to their own pool
                 if job == "fields" and not stopping():
@@ -1016,6 +1022,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     jlog(out, "produce", {"kind": "fetch_failed", "region": list(lo), "job": job,
                                           "shards": len(e.paths),
                                           "failed_units": int(getattr(cache, "failed_units", 0))})
+                    gate.set_pending(j for _, j in gpu_units[i + 1:])
                     continue
                 t_in = time.time() - t0
                 if i + 1 < len(gpu_units):
@@ -1023,7 +1030,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 wslots.acquire()                    # backpressure: never more than two units unwritten
                 with lock:
                     busy.add(lo)
-                gpu_lock.acquire()                  # no GPU fields beside the pass (and none cached)
+                gate.pass_acquire(job)              # no GPU fields beside the pass (and none cached)
                 try:
                     _vram_check(out, job, lo, vram_cap)
                     t1 = time.time()
@@ -1071,7 +1078,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         del planes
                         pooled = None
                     t_gpu = time.time() - t1
-                    gpu_lock.release()
+                    gate.set_pending(j for _, j in gpu_units[i + 1:])
+                    gate.release()
                     _unit_done(unit_now)
                     g1 = _compiled_graphs()
                     if g1 > g0:                     # this pass compiled (or recompiled) something
@@ -1084,9 +1092,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         pend.append(writer.submit(finish, job, lo, round_, t0, rows, attrs,
                                                   pooled, extra))
                 except BaseException:
-                    if gpu_lock.holder() is not None and gpu_lock.holder()["thread"] == \
-                            threading.current_thread().name:
-                        gpu_lock.release()
+                    if gate.holds():
+                        gate.release()
                     _unit_done(unit_now)
                     with lock:
                         busy.discard(lo)
@@ -1097,6 +1104,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     _release_passed(cache, keys, pos, cursor, cat, round_, verso_on, out, frungs,
                                     leased=leased)
                     release_backlog()
+            gate.set_pending(())                    # recomputed on the next pass over the window
             for k in [k for k in pre if k not in gpu_units]:
                 pre.pop(k)                          # a read for a unit this pass no longer wants
             if not did:
@@ -1108,6 +1116,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if read_phase(out, "") == "produce" and not busy:
                     write_phase(out, "train")     # the window is drained: give the card back
     finally:
+        gate.set_pending(())                        # nothing left to make way for: the fields finish
         readers["ex"].shutdown(wait=False, cancel_futures=True)
         for ex in (writer, fielder):
             ex.shutdown(wait=True)
@@ -1328,6 +1337,131 @@ class TracedLock:
     def __exit__(self, *exc):
         self.release()
         return False
+
+
+BLOCKING_JOBS = ("teacher", "self")   # the passes a sampler worker is blocked on (`_gpu_order`)
+FIELDS_DEFER_S = 600.0   # GPU fields that have waited this long may start while only verso passes are pending
+
+
+class GpuGate:
+    """Who gets the producer's card: its network passes, or its GPU distance fields.
+
+    `lock` is the one `gpu_lock` (a `TracedLock`): nothing else ever runs beside a pass. A pass takes
+    it outright (`pass_acquire`, `release`). The fields take it only through `fields_hold(since)` and
+    by priority rules, because a fields region is up to ~75 s of device work and a pass that a
+    sampler worker is waiting on (a BLOCKING pass, `BLOCKING_JOBS`: teacher in round 0, self in
+    round >= 1) must never queue behind it:
+
+    - the fields START only when no GPU unit is pending in the window (`set_pending`, kept by the pass
+      loop), or when the pending units are all verso passes and the fields job was queued at least
+      `FIELDS_DEFER_S` ago (verso passes are never blocking, and they must not starve the fields);
+    - between batches (`_FieldsHold.yield_point`) the fields give the lock back as soon as a blocking
+      pass is pending, and start again under the same rule; each yield logs a `fields_yield` line.
+
+    The rules decide only WHEN the fields' batches run, never what they compute: the stores are the
+    same bytes."""
+
+    def __init__(self, lock, log=None, defer_s=None, now=None):
+        import threading
+        self.lock, self.log = lock, log
+        self.defer_s = FIELDS_DEFER_S if defer_s is None else float(defer_s)
+        self.now = now or time.time
+        self.cv = threading.Condition()
+        self.pending = ()                   # the GPU jobs still to run in this pass over the window
+        self.waiting = 0                    # blocking passes inside `pass_acquire`
+
+    def set_pending(self, jobs):
+        with self.cv:
+            self.pending = tuple(str(j) for j in jobs)
+            self.cv.notify_all()
+
+    def blocking(self):
+        """Is a blocking pass pending (in the window, or waiting for the lock)?"""
+        return self.waiting > 0 or any(j in BLOCKING_JOBS for j in self.pending)
+
+    def fields_may_start(self, since):
+        if self.blocking():
+            return False
+        return not self.pending or self.now() - float(since) >= self.defer_s
+
+    def pass_acquire(self, job):
+        blk = str(job) in BLOCKING_JOBS
+        if blk:
+            with self.cv:
+                self.waiting += 1
+        try:
+            self.lock.acquire()
+        finally:
+            if blk:
+                with self.cv:
+                    self.waiting -= 1
+                    self.cv.notify_all()
+        return True
+
+    def release(self):
+        self.lock.release()
+        with self.cv:
+            self.cv.notify_all()
+
+    def holds(self):
+        """Does the calling thread hold the lock?"""
+        import threading
+        h = self.lock.holder()
+        return h is not None and h["thread"] == threading.current_thread().name
+
+    def _fields_acquire(self, since):
+        """Wait until the fields may start, then take the lock -- and, when a pass became pending
+        while this thread waited for the lock, give it straight back and wait again."""
+        while True:
+            with self.cv:
+                while not self.fields_may_start(since):
+                    self.cv.wait(timeout=5.0)       # the age rule is a clock, not an event
+            self.lock.acquire()
+            if self.fields_may_start(since):
+                return
+            self.release()
+
+    def fields_hold(self, since, tag=None):
+        """The `gpu_lock` a fields job hands to `targets.region_fields`: a context manager that takes the
+        card by the rules above, with the `yield_point` `_fields_torch` calls between batches.
+        `since` is when the job was queued."""
+        return _FieldsHold(self, since, tag)
+
+
+class _FieldsHold:
+    def __init__(self, gate, since, tag=None):
+        self.gate, self.since, self.tag = gate, float(since), dict(tag or {})
+        self.yields = 0
+
+    def __enter__(self):
+        self.gate._fields_acquire(self.since)
+        return self
+
+    def __exit__(self, *exc):
+        self.gate.release()
+        return False
+
+    def yield_point(self, flush=None):
+        """Between two batches: when a blocking pass is pending, finish the device work in flight
+        (`flush`), release the card, and take it back once the fields may start again. True when it
+        yielded."""
+        g = self.gate
+        if not g.blocking():
+            return False
+        if flush is not None:
+            flush()
+        why = [j for j in g.pending if j in BLOCKING_JOBS] or ["waiting"]
+        t0 = time.time()
+        g.release()
+        g._fields_acquire(self.since)
+        self.yields += 1
+        if g.log is not None:
+            try:
+                g.log({"kind": "fields_yield", **self.tag, "for": why, "n": self.yields,
+                       "waited_s": round(time.time() - t0, 2)})
+            except Exception:  # noqa: BLE001
+                pass
+        return True
 
 
 def _unit_done(unit):
