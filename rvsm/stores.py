@@ -120,15 +120,48 @@ def read_attrs(path):
         return {}
 
 
+ENCODE_THREADS = max(int(os.environ.get("RVSM_ENCODE_THREADS", "4")), 0)
+_ENC = {}
+
+
+def _codec(q):
+    """The volcomp serializer a store is written with: `VolcompCodec(q)`, whose chunk encodes run on a
+    pool of `ENCODE_THREADS` threads (RVSM_ENCODE_THREADS; 0 = the codec as it is).
+
+    The codec's `_encode_single` is a coroutine that makes a blocking ctypes call, so under zarr's one
+    event loop every chunk of a store was encoded one after another (a 1024^3 q=0 field store: ~9 s on
+    the laptop, and two stores on two Python threads took exactly as long as in turn). Here the SAME
+    coroutine runs to completion on a pool thread (ctypes releases the GIL), so zarr's concurrent map
+    encodes chunks in parallel (laptop, 1024^3: a q=0 field store 8.2 -> 3.0 s, a q=8 probability
+    store 3.8 -> 2.75 s with 4 threads; 8 were no faster). The chunk bytes are the codec's own and
+    the sharding codec lays them out by chunk index, not completion order: byte-identical stores, the
+    same zarr.json (the subclass serialises as "volcomp")."""
+    from volcomp_zarr import VolcompCodec
+    if ENCODE_THREADS <= 0:
+        return VolcompCodec(q=int(q))
+    cls = _ENC.get("cls")
+    if cls is None:
+        import asyncio
+        import concurrent.futures as cf
+        pool = _ENC["pool"] = cf.ThreadPoolExecutor(ENCODE_THREADS, thread_name_prefix="rvsm-enc")
+        base = VolcompCodec._encode_single
+
+        class PooledVolcompCodec(VolcompCodec):
+            async def _encode_single(self, chunk_array, chunk_spec):
+                return await asyncio.get_running_loop().run_in_executor(
+                    pool, lambda: asyncio.run(base(self, chunk_array, chunk_spec)))
+        cls = _ENC["cls"] = PooledVolcompCodec
+    return cls(q=int(q))
+
+
 def out_array(path, shape, origin, rung=2, channels=("recto",), q=8, volume="", umbilicus="", attrs=None):
     """Create the store (overwriting); returns the zarr array. Shape must be multiples of 128."""
     import zarr
     ladder.require_volcomp()
-    from volcomp_zarr import VolcompCodec
     shape = tuple(int(s) for s in shape)
     assert all(s % CHUNK == 0 for s in shape), f"store shape must be multiples of {CHUNK}: {shape}"
     z = zarr.create_array(path, shape=shape, chunks=(CHUNK,) * 3, shards=shard_shape(shape), dtype="uint8",
-                          fill_value=0, overwrite=True, serializer=VolcompCodec(q=int(q)), compressors=None)
+                          fill_value=0, overwrite=True, serializer=_codec(q), compressors=None)
     z.attrs.update({"channels": [str(c) for c in channels], "voxel_um": ladder.rung_um(rung), "rung": int(rung),
                     "volcomp_q": int(q), "origin_zyx": [int(v) for v in origin], "scale": 1.0,
                     "volume": str(volume), "umbilicus": str(umbilicus), "volcomp_build": volcomp_build(),
