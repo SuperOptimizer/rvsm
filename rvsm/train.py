@@ -38,6 +38,7 @@ from rvsm import aug as A
 from rvsm import config as CFG
 from rvsm import losses as L
 from rvsm import model as M
+from rvsm import overlap as OV
 from rvsm import prep
 
 # --------------------------------------------------------------------------- the schedule
@@ -1076,6 +1077,26 @@ class _Phases:
         return out
 
 
+def _sync_net(net, ema):
+    """Copy the EMA state into `net` in place (one pair of foreach kernels, as `Cascade.sync`)."""
+    pairs = [(v, ema[k]) for k, v in net.state_dict().items() if k in ema]
+    if pairs:
+        torch._foreach_copy_([a for a, _ in pairs], [b for _, b in pairs])
+
+
+def _ov_log(acc, w):
+    """The overlap term's train.jsonl fields over the microbatches since the last row: `overlap` (the
+    unweighted term's mean over the microbatches that had one), its parts, the scored voxel share,
+    `overlap_n` (how many had one) and the weight. Nothing when the term is off."""
+    if w <= 0:
+        return {}
+    n = int(acc.get("n", 0))
+    out = {"overlap_n": n, "w_overlap": w}
+    if n:
+        out.update({k: round(acc[k] / n, 6) for k in ("overlap", "overlap_kl", "overlap_l1", "overlap_vox")})
+    return out
+
+
 def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=None, val_items=None,
           steps=None, accum=1, hook=None, ckpt=None, stop_now=None):
     """Train the student. Returns the checkpoint path.
@@ -1169,6 +1190,20 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                           noise=False, net=evnet, fwd=(evfwd if evfwd is not evnet else None))
     casmask = prep.Cascade("mask", self_p=0.0, drop=0.0, noise=False) \
         if cfg.cascade in ("self", "mix") else None
+    # OVERLAP-CROP CONSISTENCY (`rvsm.overlap`, off unless `loss_overlap` > 0): the EMA forward of an
+    # overlap draw's second window. It is the cascade's self net when there is one (already on the EMA
+    # weights every step, and compiled); otherwise its own copy, synced when used.
+    ov_w = float(getattr(cfg, "loss_overlap", 0.0) or 0.0)
+    ovnet = ovfwd = None
+    if ov_w > 0:
+        if casnet is not None:
+            ovnet, ovfwd = casnet, (casfwd if casfwd is not None else casnet)
+        else:
+            ovnet = M.build(cfg.size, cin=layout.cin, cout=layout.cout, gn_bf16=gnb, verbose=False).to(dev)
+            ovnet.eval()
+            ovfwd = torch.compile(ovnet, mode="max-autotune-no-cudagraphs", dynamic=False) \
+                if cfg.compile and dev.type == "cuda" else ovnet
+    ov_acc = {}
 
     acfg = _aug_cfg(cfg, out)
     cmode = train_compile_mode() if cfg.compile else None
@@ -1298,14 +1333,27 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             cas.self_p = self_p_at(cfg, step, nsteps) if cas.mode == "mix" else \
                 (1.0 if cas.mode == "self" else 0.0)
         cas.clock = ph.on
+        ov_now = ovnet is not None and "ov_ct" in b
+        cas.keep_coarse = ov_now
         ct, tg, wt = prep.prepare(b, dev, cascade=cas, layout=layout)
         ph.mark("prepare+cascade")
         ph.note(cas.take_clock())
+        ovE = None
+        if ov_now:
+            if ovnet is not casnet:
+                _sync_net(ovnet, ema)
+            ovE = OV.teacher_batch(b, ovfwd, layout, dev, cas=cas if cas.on else None,
+                                   q=int(getattr(cfg, "overlap_sub", 0) or 0))
+            ph.mark("overlap_ema")
+        cas.last_coarse = {}
         casch = ct[:, layout.i_cas:layout.i_cas + 1].detach().clone() if cas.on else None
         # the weights ride along as extra target channels, so the geometric augs transform them
-        # identically to the fields they weigh
-        ct, tgw = A.apply(ct, torch.cat([tg, wt], 1), acfg, nimg=layout.i_cas, rung=ks)
-        tg, wt = tgw[:, :layout.cout_t], tgw[:, layout.cout_t:]
+        # identically to the fields they weigh -- and so does an overlap draw's EMA field
+        ct, tgw = A.apply(ct, torch.cat([tg, wt] + ([ovE] if ovE is not None else []), 1), acfg,
+                          nimg=layout.i_cas, rung=ks)
+        T_ = layout.cout_t
+        tg, wt = tgw[:, :T_], tgw[:, T_:2 * T_]
+        ovE = tgw[:, 2 * T_:] if ovE is not None else None
         ct = ct.to(memory_format=M.memfmt())
         ph.mark("aug")
         nvox += int(np.prod(ct.shape[2:])) * ct.shape[0]
@@ -1353,6 +1401,16 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         reg_log.update(reg_extra)
 
         ph.mark("sdist+eikonal+thick+pair")
+        # ---- OVERLAP-CROP CONSISTENCY against the EMA's view of the second window (`rvsm.overlap`)
+        if ovE is not None:
+            o = L.overlap_loss(y0, ovE, wd, L.dist_weight(wt[:, layout.i_thick:layout.i_thick + 1]),
+                               layout=layout)
+            loss = loss + ov_w * o["overlap"]
+            for k_, v_ in o.items():
+                ov_acc[k_] = ov_acc.get(k_, 0.0) + float(v_.detach())
+            ov_acc["n"] = ov_acc.get("n", 0) + 1
+            del ovE
+            ph.mark("overlap")
         # ---- the topology pilot, at ONE rung, on interior sub-blocks only
         if cfg.loss_ect:
             sel = [i for i, k in enumerate(ks) if k == int(cfg.ect_rung)]
@@ -1431,8 +1489,9 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                   # loader starvation); fetch_s: the helper's mean seconds per batch (loader + H2D);
                   # step_s: wall seconds per optimizer step over the row
                   "train_wait_s": round(src.take_wait_s(), 3), "fetch_s": _r3(src.take_fetch_s()),
-                  "step_s": round(dt / max(step - s0, 1), 3), **ph.take()})
+                  "step_s": round(dt / max(step - s0, 1), 3), **_ov_log(ov_acc, ov_w), **ph.take()})
             rung_n, nvox, t0, s0 = {}, 0, time.time(), step
+            ov_acc = {}
         at_eval = step % max(int(cfg.eval_every), 1) == 0 or step >= nsteps
         at_ckpt = ckpt_every > 0 and step % ckpt_every == 0
         if at_eval or at_ckpt:

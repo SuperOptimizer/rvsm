@@ -417,6 +417,62 @@ def decode_unsigned(u):
     return u * 255.0 * UNIT
 
 
+def encode_signed(d):
+    """`decode_signed`'s inverse, unquantised: voxels -> the 0..1 channel, clamped to +-CAP."""
+    return (d.clamp(-CAP, CAP) / UNIT + OFF) / 255.0
+
+
+def encode_unsigned(t):
+    """`decode_unsigned`'s inverse, unquantised: voxels -> the 0..1 channel."""
+    return (t / UNIT).clamp(0.0, 255.0) / 255.0
+
+
+# ------------------------------------------------------------------------ overlap-crop consistency
+
+OVERLAP_DIST_SCALE = 0.1   # the distance L1 (voxels) enters the term at this weight: 1 voxel ~ 0.1 nat
+
+
+def overlap_loss(logit, field, w_mid=None, w_thick=None, layout=None):
+    """The overlap-crop consistency term (`rvsm.overlap`): the student's heads on the first window
+    against the EMA's on the same voxels seen from the second window, where the EMA sees more.
+
+    `field` (B, nprob + 3, Z, Y, X) is `overlap.teacher_batch`'s, after the augmentation: the teacher
+    probabilities, its midline / thickness in the store's 0..1 code, and the mask (gated at `WMIN`, as a
+    distance weight is: a warp interpolates it at its edge, and a voxel half inside is not inside).
+
+      probabilities   one-way binary KL(teacher || student) = BCE(student logit, teacher p) - H(teacher p),
+                      so the term is 0 exactly when they agree and its gradient is the soft-target BCE's;
+                      averaged over the probability heads (recto, verso)
+      distances       L1 in voxels of the midline and of the thickness (after `soft_thickness`), only
+                      where the first window's DISTANCE weight is > 0 (`w_mid`, `w_thick`, already
+                      `dist_weight`-gated): the distance heads are unconstrained elsewhere, and the
+                      teacher's values there are extrapolation. L1 rather than a KL: they are regressions,
+                      and L1 is the robust choice against a teacher that is itself wrong in places.
+                      Scaled by `OVERLAP_DIST_SCALE`.
+
+    The teacher side carries no gradient (it is a tensor of values). Returns {overlap, overlap_kl,
+    overlap_l1, overlap_vox}: the term, its parts, and the scored share of the voxels."""
+    np_ = layout.nprob
+    f = field.float()
+    m = (f[:, np_ + 2:np_ + 3] >= WMIN).to(logit.dtype)
+    den = m.sum().clamp_min(1.0)
+    pt = f[:, :np_].clamp(1e-6, 1 - 1e-6)
+    z = logit[:, :np_].float()
+    ent = -(pt * pt.log() + (1 - pt) * (1 - pt).log())
+    kl = ((F.binary_cross_entropy_with_logits(z, pt, reduction="none") - ent) * m).sum() / (den * np_)
+    l1 = logit.new_zeros(())
+    for w_, pred, tgt in ((w_mid, logit[:, layout.i_mid:layout.i_mid + 1].float(),
+                           decode_signed(f[:, np_:np_ + 1])),
+                          (w_thick, soft_thickness(logit[:, layout.i_thick:layout.i_thick + 1].float()),
+                           decode_unsigned(f[:, np_ + 1:np_ + 2]))):
+        if w_ is None:
+            continue
+        ww = m * (w_ > 0).to(m.dtype)
+        l1 = l1 + ((pred - tgt).abs() * ww).sum() / ww.sum().clamp_min(1.0)
+    tot = kl + OVERLAP_DIST_SCALE * l1
+    return {"overlap": tot, "overlap_kl": kl, "overlap_l1": l1, "overlap_vox": m.mean()}
+
+
 def dist_weight(w):
     """The per-voxel weight of a DISTANCE channel: the loader's weight, hard-gated at `WMIN`.
 

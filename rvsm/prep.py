@@ -56,6 +56,15 @@ def sym_apply_t(sym, x, tg):
     return torch.cat([x.narrow(d - 1, 0, ni), v], d - 1).contiguous(), tg.contiguous()
 
 
+def sym_field_t(sym, t):
+    """The cube symmetry `sym` applied to a (B,C,Z,Y,X) stack of plain spatial FIELDS (no vector part):
+    `sym_apply_t`'s permutation and flips, which is what it does to the target."""
+    perm, flip = sym_decode(sym)
+    t = t.permute((0, 1) + tuple(2 + int(q) for q in perm))
+    dims = [2 + i for i, f in enumerate(flip) if f]
+    return (t.flip(dims) if dims else t).contiguous()
+
+
 def radial_t(cyx, lo, shape, dtype=torch.float32, out=None):
     """`axis.radial` on the device: (B,3,Z,Y,X) unit vectors pointing away from the scroll axis in the xy
     plane (z component 0). `cyx` (B,2,Z) is the axis (y, x) at each z of the cube and `lo` (B,3) its
@@ -224,6 +233,32 @@ def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade
     return x.contiguous(), tgt, w
 
 
+def overlap_input(b, i, dev, cas=None, dtype=torch.float32):
+    """The model input of sample i's SECOND window (an overlap draw, `sample.OV_KEYS`), (1, cin, Z, Y, X)
+    in the PHYSICAL frame (no cube symmetry, no augmentation: the EMA's clean view). Built exactly as
+    `prepare` builds the first window -- its own per-patch z-score, its own radius plane and radial
+    vector from `ov_lo` / `ov_cyx`, the first window's rung, norm, r_max and scan planes -- except the
+    CASCADE channel, which is `cas` (already computed: `Cascade.shifted`) or zero."""
+    to = lambda t: t.to(dev, non_blocking=True)  # noqa: E731
+    ct = to(b["ov_ct"][i:i + 1])
+    C, S = ct.shape[1], ct.shape[2:]
+    casc = 1 if b.get("cm") is not None else 0
+    npl = n_planes_b(b)
+    x = torch.empty((1, C + 4 + casc + npl) + tuple(S), dtype=dtype, device=dev)
+    x[:, :C].copy_(ct)
+    zscore_cubes_(x[:, :C], to(b["norm"][i:i + 1]), dtype)
+    if casc:
+        x[:, C:C + 1] = 0 if cas is None else cas.to(dtype)
+    lo, cyx = to(b["ov_lo"][i:i + 1]), to(b["ov_cyx"][i:i + 1])
+    if npl:
+        fill_planes_(x, C + casc, cyx, lo, dtype=dtype,
+                     rmax=(to(b["rmax"][i:i + 1]).reshape(-1) if b.get("rmax") is not None else None),
+                     meta=(to(b["meta"][i:i + 1]) if "meta" in b else None))
+    x[:, C + casc + npl] = (float(int(b["rung"].reshape(-1)[i])) - 2) / 9.0
+    radial_t(cyx, lo, S, dtype, out=x[:, C + casc + npl + 1:])
+    return x
+
+
 class Cascade:
     """The source of the CASCADE input channel.
 
@@ -266,6 +301,11 @@ class Cascade:
         # consistency term against it would be a second, blurrier copy of the supervised loss, and a
         # dropped channel is all zeros.
         self.last_self = None
+        # (B,) the source the last `channel()` call took per sample: "off" (the mode, the top rung or a
+        # dropped channel: all zeros), "self" or "mask". With `keep_coarse` the self pass also keeps its
+        # whole rung-(k+1) probability (`last_coarse[i]`, (1,1,Z,Y,X)), so an overlap draw's second
+        # window can slice its own cascade from it (`shifted`) without a second coarse forward.
+        self.last_src, self.keep_coarse, self.last_coarse = [], False, {}
 
     def _tick(self, name, t0):
         if self.clock:
@@ -350,7 +390,29 @@ class Cascade:
         self.net.train(was)
         y = y[0] if isinstance(y, (list, tuple)) else y
         p = torch.sigmoid(y.float())[:, :1].to(dtype)
+        if self.keep_coarse:
+            self.last_coarse[i] = p
         sl = tuple(slice(int(s) // 4, int(s) // 4 + max(int(s) // 2, 1)) for s in S)
+        return M.up2x(p[(slice(None), slice(None)) + sl], tuple(S))
+
+    def shifted(self, i, shift, S):
+        """Sample i's cascade channel for a window shifted by `shift` (even, |shift| <= S/2 per axis) from
+        the one the last `channel()` call built it for: the same source, from the same coarse pass.
+        "off" -> None (a zero channel), "self" -> the kept rung-(k+1) prediction's slice at
+        S/4 + shift/2, upsampled 2x (the first window's own slice is at S/4). "mask" -> None too, and
+        the caller skips the sample: the coarse target block covers only the first window's footprint.
+        Near the second window's faces the trilinear edge clamp differs from what a coarse pass centred
+        on it would give; the channel is an INPUT of the EMA's view, so that is a small input change."""
+        src = self.last_src[i] if i < len(self.last_src) else "off"
+        if src != "self":
+            return None
+        p = self.last_coarse.get(i)
+        assert p is not None, "Cascade.shifted: the self pass kept no coarse prediction (keep_coarse)"
+        P = p.shape[2:]
+        a = [int(P[j]) // 4 + int(shift[j]) // 2 for j in range(3)]
+        n = [max(int(q) // 2, 1) for q in P]
+        assert all(0 <= a[j] and a[j] + n[j] <= int(P[j]) for j in range(3)), (a, n, tuple(P))
+        sl = tuple(slice(a[j], a[j] + n[j]) for j in range(3))
         return M.up2x(p[(slice(None), slice(None)) + sl], tuple(S))
 
     def channel(self, b, x, norm, dtype=torch.float32, norad=False, non_blocking=True):
@@ -362,6 +424,7 @@ class Cascade:
         rung = b["rung"].reshape(-1).tolist()
         sel = torch.zeros(B, dtype=dtype, device=dev)
         self.last_self = sel
+        self.last_src, self.last_coarse = ["off"] * B, {}
         for i in range(B):
             if int(rung[i]) + 1 >= ladder.NRUNGS:   # the top rung: no rung above it, no coarse prediction
                 continue
@@ -374,8 +437,10 @@ class Cascade:
                 out[i:i + 1] = self._self(b, i, dev, dtype, S)
                 self._tick("self", t0)
                 sel[i] = 1
+                self.last_src[i] = "self"
             else:
                 t0 = time.perf_counter()
                 out[i:i + 1] = self._mask(b, i, dev, dtype, S)
                 self._tick("mask", t0)
+                self.last_src[i] = "mask"
         return out

@@ -184,11 +184,14 @@ FINGERPRINT_EXCLUDE = ("infer_margin", "steps", "eval_every", "workers", "gpus",
                        # recorded in config.json and in every checkpoint's cfg, but a resume may flip it
                        # as a deliberate mid-run switch, like the cascade change; the resume logs a
                        # `precision_switch` sched line (`run.log_switches`)
-                       "gn_bf16")
+                       "gn_bf16",
+                       # the overlap-crop consistency term (docs/recipe.md): off by default, and switched
+                       # on / retuned on a resume as a deliberate mid-run change (`loss_switch` line)
+                       "overlap_p", "overlap_sub", "loss_overlap")
 
 # The loss weights a resume may retune (`run.log_switches` logs a `loss_switch` line when one moved).
 LOSS_SWITCH_FIELDS = ("loss_prob_dice", "loss_pair", "loss_skel", "loss_affinity", "loss_ect",
-                      "loss_selfcons", "loss_skel_prec")
+                      "loss_selfcons", "loss_skel_prec", "loss_overlap")
 
 
 @dataclass
@@ -281,6 +284,14 @@ class Config:
     ect_blocks: int = 1                # interior ECT blocks per sample, drawn at random (seeded by step)
     ect_rung: int = 2                  # the rung the ECT term applies at
     ect_block: int = 64                # ECT block edge
+    # the OVERLAP-CROP CONSISTENCY term (`losses.overlap_loss`, docs/recipe.md "Overlap-crop
+    # consistency"): with probability `overlap_p` a training draw also carries a SECOND window of the same
+    # visit, shifted by p/4..p/2 (even) along one or more axes; the trainer runs the EMA net on it (no
+    # grad, bf16) and scores the student's crop against it on the shared voxels where the EMA window sees
+    # MORE context than the student's. Off by default (both 0).
+    overlap_p: float = 0.0             # probability that a draw carries the second window
+    overlap_sub: int = 0               # EMA forward on a q^3 sub-crop of the second window (0 = all of it)
+    loss_overlap: float = 0.0          # weight of the term (0 = not computed, even with overlap_p > 0)
 
     # ------------------------------------------------------------------ fixed recipe: rounds + inference
     verso_source: str = "flip"         # verso stores come from the student run with the radial sign flipped

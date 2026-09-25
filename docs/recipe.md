@@ -300,6 +300,82 @@ labels, so this is how stale stores get rebuilt.
   regions' labels would recover it.
 - The source digest identifies stores by metadata and shard sizes, not content.
 
+### Overlap-crop consistency (off by default: `overlap_p` 0, `loss_overlap` 0)
+
+No other loss compares two crops of the same rung. The student's receptive field (~450 voxels) is
+larger than its 256 patch, so near a patch face it predicts a sheet from half its usual context, and
+at inference the halo only hides part of that. This term makes the student's prediction at a voxel
+near its face agree with the EMA's prediction of the same physical voxel, seen from a window that
+extends past that face.
+
+| field | default | what |
+|---|---|---|
+| `overlap_p` | 0.0 | probability that a training draw also carries a second window (`sample.OV_KEYS`) |
+| `overlap_sub` | 0 | EMA forward on a `q`^3 sub-crop of the second window (0 = the whole window) |
+| `loss_overlap` | 0.0 | weight of the term (0 = not computed, whatever `overlap_p` says) |
+
+All three are in `FINGERPRINT_EXCLUDE`, and `loss_overlap` is in `LOSS_SWITCH_FIELDS`, so a resume may
+switch the term on or off and the change is logged.
+
+- **Second window** (`sample.Patches._overlap`, `overlap_shift`). It comes from the same visit, shifted
+  along one or more axes (each axis with room with probability 1/2, at least one). The shift is even
+  and between p/4 and p/2 (64 to 128 at p 256), so the two windows share at least p/2 on every axis. It
+  stays inside the visit's draw box, so its context cubes come from the same super-cube. It carries
+  only the input cubes, the corner and the axis; there is no target and no weight.
+- **EMA view** (`rvsm/overlap.py`). The EMA net runs in eval mode, under `no_grad` and bf16 autocast,
+  before the student's forward. It is the cascade's self net when one exists (already synced every
+  step and compiled), otherwise its own synced copy. The input is clean: no cube symmetry, no
+  augmentation, and the window's own per-patch z-score. Its cascade channel has the same source as the
+  first window's. It is zero if that channel was dropped or off. If it was the self source, it is a
+  slice of the same rung-(k+1) prediction at S/4 + s/2, so there is no second coarse pass. If the first
+  window took the `mask` source (`mix` mode), the sample gets no term.
+- **Where it is scored.** The shared voxels where the EMA window's margin (distance to its nearest
+  face) is larger than the student's. With a one-way, stop-gradient term, scoring voxels where the
+  student sees more would teach it the teacher's truncation. On a full-crop shift this is about 15 % of
+  the patch: the band next to the face that the second window extends past.
+- **Frame.** The EMA heads are pasted onto the first window's voxels in the physical frame, then given
+  the first window's cube symmetry. They are appended to the target stack, so every spatial
+  augmentation moves them exactly as it moves the targets. Distances are carried in the store's 0..1
+  code (`losses.encode_signed` / `encode_unsigned`), because the warp clamps target channels to 0..1.
+- **Loss** (`losses.overlap_loss`, stop-gradient on the EMA side, like `self_consistency`).
+  - Probability heads (recto, verso): one-way binary KL(EMA || student) = BCE(student logit, EMA p)
+    minus H(EMA p). It is zero exactly when they agree, and its gradient is the soft-target BCE's.
+  - Midline and thickness: L1 in voxels, only where the first window's distance weight is > 0. The
+    distance heads are unconstrained elsewhere. They are regressions, and L1 is robust to a teacher
+    that is locally wrong.
+  - The distance part is scaled by `OVERLAP_DIST_SCALE` = 0.1 (1 voxel of disagreement is about 0.1).
+- **Log.** `train.jsonl` rows carry `overlap` (the unweighted term's mean over the microbatches that had
+  one), `overlap_kl`, `overlap_l1`, `overlap_vox` (the scored share of the voxels), `overlap_n` and
+  `w_overlap`. Profiled runs (`RVSM_PROFILE=1`) add the `overlap_ema` and `overlap` phases.
+
+**Cost** (laptop RTX 5080 16 GB, 30m6, batch 1 x accum 2, bf16, `gn_bf16` off, compile default, the
+synthetic full-recipe items of the trainer bench, 60 steps, `RVSM_PROFILE=1`). The host was shared
+with other test runs, so wall times drift by up to 30 % between runs. The within-run `overlap_ema` share
+is the steadier number.
+
+| patch | overlap_p | EMA crop | step s (baseline) | overlap_ema ms/step | share of step | scored voxels | peak alloc, backward phase |
+|---|---|---|---|---|---|---|---|
+| 144 | 0 | - | 0.761 / 0.769 | - | - | - | 6.24 GB |
+| 144 | 0.25 | full 144 | 0.804 | 34 | 4 % | 15 % | 6.32 GB |
+| 144 | 0.5 | full 144 | 0.831 | 52 | 7 % | 15 % | 6.35 GB |
+| 144 | 1.0 | full 144 | 0.964 | 169 | 18 % | 15 % | 6.35 GB |
+| 144 | 1.0 | sub 72 | 0.901 | 37 | 4 % | 1.4 % | 6.17 GB |
+| 144 | 1.0 | sub 128 | 1.025 | 119 | 12 % | 10 % | 6.17 GB |
+| 160 | 0 | - | 0.982 / 0.998 | - | - | - | 7.59 GB |
+| 160 | 0.25 | full 160 | 1.046 (+6 %) | 45 | 4 % | 15 % | 7.71 GB |
+| 160 | 0.5 | full 160 | 1.107 (+12 %) | 70 | 7 % | 15 % | 7.75 GB |
+| 160 | 1.0 | full 160 | 1.229 (+24 %) | 203 | 17 % | 15 % | 7.74 GB |
+| 160 | 1.0 | sub 80 | 1.262 (+27 %) | 44 | 4 % | 1.4 % | 7.99 GB |
+
+The full-crop EMA pass costs about one cascade self pass: ~10 % of a step per microbatch that has one.
+So the added step time is about 2 x `overlap_p` x 10 %, plus the extra target channels through the
+augmentation. The sub-crop is **not** worth it. A half-edge sub-crop scores ~10x fewer voxels, with a
+teacher margin of at most q/2. Every sub-crop run also slowed the student's own forward by 70-120 ms,
+consistent with a second input shape on the `UNet.forward` code object that the training net and the
+cascade net share. Peak allocated memory grows by the five-channel field: +0.1 to +0.16 GB at 144-160,
+about +0.6 to +0.9 GB at 256. The EMA pass's own transient peak is the cascade pass's, and it runs at
+the same point in the step.
+
 ---
 
 ## 7. Rounds and inference

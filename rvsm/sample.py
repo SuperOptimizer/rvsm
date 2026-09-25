@@ -143,9 +143,7 @@ def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None
     ct = np.ascontiguousarray(ct)
     p = np.array(ct.shape[-3:], np.int64)
     lo = np.asarray(lo, np.int64)
-    a = AX.axis_at(ax, k)
-    z = np.arange(int(p[0])) + lo[0]
-    cyx = np.stack([np.interp(z, a[0], a[1]), np.interp(z, a[0], a[2])])
+    cyx = axis_cyx(ax, k, lo, int(p[0]))
     nm = (0.0, 0.0) if (norm or NORM) is None else tuple(float(v) for v in (norm or NORM))
     hp = np.maximum(p // 2, 1)
     cm = np.zeros(tuple(hp), np.uint8) if cm is None else np.asarray(cm, np.uint8)
@@ -175,6 +173,60 @@ def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None
             "cyx1": torch.from_numpy(np.ascontiguousarray(cyx1)),
             "rmax": torch.tensor(float(rmax), dtype=torch.float32),
             "meta": torch.as_tensor(meta)}
+
+
+# --------------------------------------------------------------------------- the overlap pair
+
+# The keys of the SECOND window an overlap draw carries (`Patches._overlap`), beside `RUNG_ITEM_KEYS`:
+# its CT + context cubes (uint8, as `ct`), its corner (rung-k voxels) and its scroll axis per z (as `cyx`).
+# Everything else it needs -- rung, norm, rmax, meta -- is the first window's. `collate` drops them from a
+# batch whose items do not ALL carry them.
+OV_KEYS = ("ov_ct", "ov_lo", "ov_cyx")
+
+
+def overlap_shift(rng, p, lo, lo_min, lo_max):
+    """The (3,) shift of an overlap draw's second window, or None when no axis has room for one.
+
+    Per shifted axis the magnitude is EVEN and in [p/4, p/2] (64..128 at p 256, so the two windows share
+    at least p/2 = 128 voxels on every axis), with a sign that keeps the second corner inside the visit's
+    draw box [lo_min, lo_max] -- which is what the visit's context super-cube covers (`_ctx_cube`). Even,
+    because the second window's cascade is sliced from the first one's rung-(k+1) prediction at s/2
+    (`prep.Cascade.shifted`); at most p/2, because that prediction covers the first window's centre +-p
+    at rung k. Each axis with room is shifted with probability 1/2, and at least one is."""
+    p, lo = ladder.shape3(p).astype(np.int64), np.asarray(lo, np.int64)
+    room = (np.asarray(lo_max, np.int64) - lo, lo - np.asarray(lo_min, np.int64))   # (+, -)
+    opts = []
+    for a in range(3):
+        hlo, hhi = max(-(-int(p[a] // 4) // 2), 1), int(p[a] // 2) // 2        # half-magnitudes
+        signs = [(sg, min(hhi, int(r[a]) // 2)) for sg, r in ((1, room[0]), (-1, room[1]))]
+        opts.append((hlo, [(sg, h) for sg, h in signs if h >= hlo]))
+    ok = [a for a in range(3) if opts[a][1]]
+    if not ok:
+        return None
+    pick = [a for a in ok if rng.random() < 0.5] or [ok[int(rng.integers(len(ok)))]]
+    s = np.zeros(3, np.int64)
+    for a in pick:
+        hlo, signs = opts[a]
+        sg, hmax = signs[int(rng.integers(len(signs)))]
+        s[a] = sg * 2 * int(rng.integers(hlo, hmax + 1))
+    return s
+
+
+def axis_cyx(ax, k, lo, n):
+    """(2, n) float64: the scroll axis (y, x) at each of the n z-slices of a rung-k cube at corner `lo`
+    (what `rung_item` stores as `cyx`)."""
+    a = AX.axis_at(ax, k)
+    z = np.arange(int(n)) + int(lo[0])
+    return np.stack([np.interp(z, a[0], a[1]), np.interp(z, a[0], a[2])])
+
+
+def collate(items):
+    """`default_collate`, except that the overlap keys (`OV_KEYS`) are kept only when EVERY item of the
+    batch carries them: items with and without a second window do not stack (batch 1 always does)."""
+    items = list(items)
+    if any(OV_KEYS[0] in q for q in items) and not all(OV_KEYS[0] in q for q in items):
+        items = [{k: v for k, v in q.items() if k not in OV_KEYS} for q in items]
+    return torch.utils.data.default_collate(items)
 
 
 # --------------------------------------------------------------------------- the dataset
@@ -601,8 +653,27 @@ class Patches(torch.utils.data.IterableDataset):
         tg, w = self._rung_target(k, lo, ct)
         sym = int(draw_sym(rng, tuple(p))) if self.sym else 0
         cx = [self._ctx_cube(rec, k, d, lo, ct.shape) for d in self.ctx] if self.ctx else ()
-        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, self.ax, sym, compact=self.compact,
+        item = rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, self.ax, sym, compact=self.compact,
                          **self._plane_extras(k), **self._cascade_extras(k, lo, ct.shape, rec=rec, lean=True))
+        op = float(getattr(self.cfg, "overlap_p", 0.0) or 0.0)
+        if op > 0 and not self.label_free and rng.random() < op:   # off: no extra draw, the same stream
+            item.update(self._overlap(rng, rec, k, lo, np.minimum(rlo, hi), hi))
+        return item
+
+    def _overlap(self, rng, rec, k, lo, lo_min, lo_max):
+        """The second window of an overlap draw (`OV_KEYS`), shifted by `overlap_shift` inside the same
+        draw box, or {} when the box has no room. It is only an INPUT (the EMA net's): no target, no
+        weight, no cascade extra -- its cascade is sliced from the first window's (`prep.Cascade`)."""
+        s = overlap_shift(rng, self.patch, lo, lo_min, lo_max)
+        if s is None:
+            return {}
+        lo2 = np.asarray(lo, np.int64) + s
+        p = self.patch
+        ct = ladder.read_rung(self.pyr, k, lo2, p, dtype=np.uint8)
+        cx = [self._ctx_cube(rec, k, d, lo2, ct.shape) for d in self.ctx] if self.ctx else ()
+        return {"ov_ct": torch.from_numpy(np.ascontiguousarray(np.stack([ct] + list(cx)))),
+                "ov_lo": torch.from_numpy(np.ascontiguousarray(lo2)),
+                "ov_cyx": torch.from_numpy(np.ascontiguousarray(axis_cyx(self.ax, k, lo2, int(p[0]))))}
 
     def _dead(self, rec):
         """A rung 3-6 visit whose HOME region is held out, or is not a rung-2 region of the walk (its
@@ -1048,7 +1119,7 @@ def loader(patches, workers=0, batch=1, pin_memory=True):
     collate."""
     if isinstance(patches, Patches):
         patches.compact = int(batch) == 1
-    return torch.utils.data.DataLoader(patches, batch_size=batch, num_workers=int(workers),
+    return torch.utils.data.DataLoader(patches, batch_size=batch, num_workers=int(workers), collate_fn=collate,
                                        pin_memory=bool(pin_memory), persistent_workers=workers > 0,
                                        prefetch_factor=2 if workers else None,
                                        multiprocessing_context="forkserver" if workers else None)
