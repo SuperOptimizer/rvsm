@@ -68,6 +68,32 @@ def margin_box(lo, size, margin, shape):
     return a, b - a
 
 
+def spread_starts(n, core, window, halo):
+    """Window starts along one axis of a PADDED extent `n` around a box of `core` voxels: as many
+    windows as the box alone takes (`starts(max(core, w), w, w - 2 halo)`), spread evenly over
+    [0, n - w], adding one only while the spread stride would exceed `w - halo`.
+
+    Why this is enough: the blend weights the WHOLE window (a Gaussian, sigma w/6); the halo only sets
+    the regular tiling's stride. Spread over the padded extent the same windows still overlap by at
+    least `halo`, every box voxel keeps full coverage, and the face voxels sit at least the margin
+    inside the outermost window -- so the margin costs no windows (1024 at 256/32: 5 per axis at
+    margins 0..64, stride 200..224), where the regular tiling of the padded extent took 6."""
+    n, w, h = int(n), int(window), int(halo)
+    L = n - w
+    if L <= 0:
+        return [0]
+    k = max(len(starts(max(int(core), w), w, w - 2 * h)), 2)
+    while -(-L // (k - 1)) > w - h:
+        k += 1
+    return sorted({int(round(i * L / (k - 1))) for i in range(k)})
+
+
+def spread_offsets(shape, window, halo, size):
+    """`spread_starts` on every axis: the windows of a padded region around a box of `size`."""
+    ss = [spread_starts(int(shape[a]), int(size[a]), window, halo) for a in range(3)]
+    return [(z, y, x) for z in ss[0] for y in ss[1] for x in ss[2]]
+
+
 def core_offsets(offs, window, core, size, halo=0):
     """The window starts of `offs` that matter for the box [core, core + size): per axis, those whose
     KEPT core [o + halo, o + w - halo) meets the box. A window only its halo reaches into the box is
@@ -115,6 +141,7 @@ class Inputs:
     window: int
     dev: torch.device
     core: tuple = (0, 0, 0)     # where the OUTPUT box starts inside `roi` (the fine-CT margin before it)
+    spread: bool = False        # the roi carries a margin: windows are `spread_offsets`, not `offsets`
 
     def prep(self, o):
         raise NotImplementedError
@@ -133,9 +160,10 @@ class TeacherInputs(Inputs):
     `ct` when the block carries a context margin (`teacher_read(..., margin=)`); `run_region` crops there.
     """
 
-    def __init__(self, ct, normalizer, window, device="cpu", core=(0, 0, 0)):
+    def __init__(self, ct, normalizer, window, device="cpu", core=(0, 0, 0), spread=False):
         self.dev = torch.device(device)
         self.core = tuple(int(v) for v in core)
+        self.spread = bool(spread)
         self.window = int(window)
         self.norm = normalizer or teachers.Normalizer("none")
         a = ct.detach().cpu().numpy() if torch.is_tensor(ct) else np.asarray(ct)
@@ -224,7 +252,10 @@ class StudentInputs(Inputs):
             roi = np.pad(roi, [(0, max(w - s, 0)) for s in roi.shape])
         self.roi = torch.from_numpy(np.ascontiguousarray(roi)).to(self.dev)
         self.shape = tuple(self.roi.shape)
-        self.offs = core_offsets(offsets(self.shape, w, self.halo), w, self.core, self.core_size, self.halo)
+        self.spread = self.margin > 0
+        tile = (spread_offsets(self.shape, w, self.halo, self.core_size) if self.spread
+                else offsets(self.shape, w, self.halo))
+        self.offs = core_offsets(tile, w, self.core, self.core_size, self.halo)
 
         # ---- ONE context super-cube per context rung, covering every window's context box
         cs = [sorted({self.lo[a] + int(o[a]) + w // 2 for o in self.offs}) for a in range(3)]
@@ -344,7 +375,8 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     windows tile the whole padded grid, but the accumulators are the (Z, Y, X) BOX and nothing more --
     a window reaching past it adds only its in-box part (its output and its Gaussian clipped alike), so
     the accumulator VRAM of a region is the same at every margin; only the inputs grow. With `offs`
-    None, windows whose kept core misses the box are dropped here (`core_offsets`; a caller's own
+    None the windows are `spread_offsets` when `inputs.spread` (a margin: as many windows as the box
+    alone, spread over the padded extent), and windows whose kept core misses the box are dropped here (`core_offsets`; a caller's own
     `offs` is used as given). `stats`, a dict, gets the accumulator shape and the forwarded windows."""
     w, dev = int(window), inputs.dev
     Z, Y, X = (int(v) for v in size)
@@ -358,7 +390,9 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     g32 = gauss_t(w, dev, torch.float32)
     g16 = (g32 * GAUSS_SCALE).to(torch.float16) if ib else None
     if offs is None:
-        offs = core_offsets(offsets(inputs.shape, w, halo), w, c, (Z, Y, X), halo)
+        tile = (spread_offsets(inputs.shape, w, halo, (Z, Y, X)) if getattr(inputs, "spread", False)
+                else offsets(inputs.shape, w, halo))
+        offs = core_offsets(tile, w, c, (Z, Y, X), halo)
     todo = [o for o in offs if inputs.window_any(o)]
     box = (Z, Y, X)
     acc_b = torch.zeros((len(ib),) + box, dtype=torch.float16, device=dev) if ib else None
@@ -582,7 +616,8 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
     odt = torch.float16 if as_tensor else torch.float32
     if lvl == 0:
         inp = TeacherInputs(blk, spec.normalizer, w, device=dev,
-                            core=tuple(int(v) for v in lo - np.asarray(a, np.int64)))
+                            core=tuple(int(v) for v in lo - np.asarray(a, np.int64)),
+                            spread=tuple(blk.shape) != tuple(int(v) for v in size))
         p = run_region(fn, inp, tuple(size), w, h, batch=batch, planes=1, acc_dtype=acc_dtype,
                        out_dtype=odt)[0]
         return p if as_tensor else p.float().cpu().numpy()

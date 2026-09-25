@@ -12,6 +12,7 @@ import os
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from rvsm import cli, export, infer, ladder, stores, teachers, trt
 from tests.teachers_fixture import PATCH, slab_block
@@ -1020,28 +1021,55 @@ def test_margin_geometry_and_the_zero_margin_is_the_old_pass(student_env):
     assert torch.allclose(pm[0], ref, atol=1e-6)
 
 
-def _face_err(e, st, margin, depth=0):
-    """max |A - B| on A's +x face slab, where A = x [0, 64) and B = x [0, 128) of the same rows: the
-    fixture's slab runs across x, so A's neighbour at x >= 64 is bright right across the face."""
-    kw = dict(sign=1.0, heads=["recto"], meta=e.meta, device="cpu", window=WIN, halo=HALO,
-              cascade_depth=depth, margin=margin)
-    A = infer.student_region(st, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 64), **kw)["recto"]
-    B = infer.student_region(st, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 128), **kw)["recto"]
+def _blur_head(x):
+    """A window function whose ONLY window dependence is its edge: a 9^3 box mean of the slab
+    indicator with zero padding. The z-scored CT channel is > 0 exactly on the slab in any window that
+    holds both slab and air, so away from a window's edge the output is the same wherever the window
+    sits -- unlike an untrained student, whose per-window z-score and GroupNorm make every voxel depend
+    on the whole window, which is window-grid noise and not a seam."""
+    return F.avg_pool3d((x[:, :1] > 0).float(), 9, stride=1, padding=4, count_include_pad=True)
+
+
+def _face_err(e, margin, stats=None, w=64, h=8):
+    """(max |A - B| on A's +x face slab, max |A - B| over A's interior slab), A = x [0, 64) and
+    B = x [0, 128) of the same rows: the fixture's slab runs across x, so A's neighbour at x >= 64 is
+    bright right across the face."""
+    def run(size):
+        inp = infer.StudentInputs(e.cfg.ct, e.ax, (0, 64, 0), size, e.layout, meta=e.meta, rung=2,
+                                  ctx=e.cfg.ctx, window=w, halo=h, cascade_depth=0, margin=margin)
+        return infer.run_region(_blur_head, inp, size, w, h, offs=inp.offs, stats=stats,
+                                acc_dtype=torch.float32)[0].numpy()
+    A, B = run((64, 64, 64)), run((64, 64, 128))
     ct = ladder.read_rung(e.pyr, 2, (0, 64, 56), (64, 64, 8), dtype=np.uint8)
     assert (ct > 0).sum() > 1000                      # the face really cuts the slab
-    return float(np.abs(A[..., 56:] - B[..., 56:64]).max()), A
+    d = np.abs(A - B[..., :64])
+    return float(d[..., 56:].max()), float(d[..., 8:48].max())
 
 
-def test_margin_removes_the_region_face_seam(student_env, student_ckpt):
-    """THE SEAM. With no margin, A's face is predicted from CT that stops at the face (the conv padding
-    past it is zeros) while B sees the slab go on: the two disagree there. With a margin, A reads the
-    slab past its face and its face is B's prediction up to the blend of a different window grid."""
+def test_margin_removes_the_region_face_seam(student_env):
+    """THE SEAM. With no margin, A's face is predicted from CT that stops at the face (the padding past
+    it is zeros) while B sees the slab go on: the two disagree there. With the default margin A reads
+    the slab past its face, its windows are spread over the padded extent (no more of them), and its
+    face is B's prediction as closely as its interior is."""
     e = student_env
-    st = infer.student_fn(student_ckpt, device="cpu", compile=False)
-    e0, _ = _face_err(e, st, 0)
-    em, A = _face_err(e, st, 16)           # the default `infer_margin`
-    assert A.shape == (64, 64, 64)
-    assert em < 0.25 * e0 and em < 0.02, (e0, em)
+    st = {}
+    f0, i0 = _face_err(e, 0)
+    f16, i16 = _face_err(e, 16, st)
+    assert st["acc_shape"] == (64, 64, 128)            # the accumulators are the box, margin or not
+    assert f0 > 0.2 and f16 < 0.05 * f0 and f16 <= 2 * max(i16, 0.01), (f0, i0, f16, i16)
+
+
+def test_spread_windows_make_the_margin_free():
+    """A 1024^3 region at window 256 / halo 32 takes 125 windows at margins 0 through 64: the windows are
+    spread over the padded extent (stride <= w - halo) instead of re-tiled at the halo stride."""
+    for m in (0, 16, 32, 48, 64):
+        shp = (1024 + 2 * m,) * 3
+        tile = infer.offsets(shp, 256, 32) if m == 0 else infer.spread_offsets(shp, 256, 32, (1024,) * 3)
+        assert len(infer.core_offsets(tile, 256, (m,) * 3, (1024,) * 3, 32)) == 125, m
+    ss = infer.spread_starts(1056, 1024, 256, 32)
+    assert ss == [0, 200, 400, 600, 800]
+    assert infer.spread_starts(1300, 1024, 256, 32)[-1] == 1300 - 256    # stride > 224: one more window
+    assert len(infer.spread_starts(1300, 1024, 256, 32)) == 6
 
 
 def test_margin_is_recorded_and_the_store_is_unchanged(tmp_path, student_env, student_ckpt):
