@@ -918,3 +918,39 @@ def test_fields_graphs_stop_capturing_past_the_cap_with_the_same_bytes(slab_regi
     _same_stores(roots[False], roots[True])
     st = reps[True]["graphs"]
     assert st["captured"] <= 1 and st["refused"] > 0 and st["rss_gb"] is not None
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="no CUDA device")
+def test_fused_stage_c_is_the_torch_stage_c(monkeypatch):
+    """Rule 5 and the counts as one kernel (`_stage5`) against the op-by-op torch steps, on random
+    codes, bands and distances (pair voxels at the volume borders, a core that touches them, midline
+    differences around the gradient bounds): the same float32 bits of the midline and thickness, the
+    same valid mask and counts, and the same encoded core window."""
+    import torch
+    g = torch.Generator().manual_seed(3)
+    dev = torch.device("cuda")
+    for B, shape in ((1, (9, 13, 11)), (3, (20, 17, 24)), (2, (5, 40, 7))):
+        full = (B,) + shape
+        reason = torch.where(torch.rand(full, generator=g) < 0.85, 0,
+                             torch.randint(1, 8, full, generator=g)).to(torch.uint8)
+        ev = torch.rand(full, generator=g) < 0.95
+        core = torch.rand(full, generator=g) < 0.8
+        z = torch.arange(shape[0], dtype=torch.float32).view(1, -1, 1, 1)
+        dr = (-3.0 + 0.9 * z + torch.randn(full, generator=g) * 0.3).to(torch.float32)
+        dv = (dr + 6.0 + torch.randn(full, generator=g) * 2).to(torch.float32)
+        dv[0, 0, 0, :3] = torch.tensor([40.0, -40.0, 1e-3])
+        t = (dv - dr).contiguous()
+        h = (2, 1, 3)
+        sl = (slice(None),) + tuple(slice(a, n - a) for a, n in zip(h, shape))
+        outs = {}
+        for fused in (False, True):
+            monkeypatch.setattr(targets, "PAIR_FUSED", fused)
+            S = lambda: dict(reason=reason.clone().to(dev), ev=ev.to(dev), t=t.to(dev),  # noqa: E731
+                             dr=dr.to(dev), dv=dv.to(dev))
+            m, tt, ok, cnt = targets._stage_c(S(), core.to(dev), dev)
+            e, c2 = targets._stage_c(S(), core.to(dev), dev, enc=(sl, 20.0))
+            outs[fused] = (m.view(torch.int32).cpu(), tt.view(torch.int32).cpu(), ok.cpu(), cnt.cpu(), e.cpu(),
+                           c2.cpu())
+        for a, b in zip(outs[False], outs[True]):
+            assert torch.equal(a, b), (B, shape)
+        assert outs[True][2].any() and (outs[True][3][:, 7:9] > 0).all()     # stencil and gradient fails seen

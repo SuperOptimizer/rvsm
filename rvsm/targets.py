@@ -748,22 +748,82 @@ def _pair_kernels():
                 tl.store(REASON + s, tl.full([BLOCK], C_CROSS, tl.uint8), mask=act & hit)
 
             @triton.jit
-            def _counts(R, C, CNT, V, NR: tl.constexpr, BLOCK: tl.constexpr):
-                # the support row of volume b over its core voxels: voxels, reasons 1..NR-1, valid
-                # (reason 0); one reduced atomic add per value and program (integer sums: any order)
+            def _nbpair(R, EV, i, z, y, x, m, Z, Y, X, dz: tl.constexpr, dy: tl.constexpr,
+                        dx: tl.constexpr):
+                # is the six-neighbour (dz, dy, dx) of voxel i inside the volume and a pair voxel
+                inb = m & (z + dz >= 0) & (z + dz < Z) & (y + dy >= 0) & (y + dy < Y) & \
+                    (x + dx >= 0) & (x + dx < X)
+                j = i + ((dz * Y + dy) * X + dx)
+                return inb & (tl.load(R + j, mask=inb, other=1) == 0) & (tl.load(EV + j, mask=inb, other=0) != 0)
+
+            @triton.jit
+            def _mid(DR, DV, j, m):
+                # the midline 0.5 * (dr + dv) of a pair voxel, rounded as torch rounds it
+                return ld.mul_rn(0.5, ld.add_rn(tl.load(DR + j, mask=m, other=0.0),
+                                                tl.load(DV + j, mask=m, other=0.0)))
+
+            @triton.jit
+            def _stage5(R, EV, CORE, DR, DV, T, MOUT, TOUT, OKOUT, ENC, CNT, V, Z, Y, X, H0, H1, H2,
+                        N0, N1, N2, EPL, G0, G1, CAP, C_STEN: tl.constexpr, C_GRAD: tl.constexpr,
+                        NR: tl.constexpr, WRITE_F: tl.constexpr, WRITE_E: tl.constexpr,
+                        BLOCK: tl.constexpr):
+                # rule 5 and the support counts of volume b (`_stage_c`'s torch steps in one pass): the
+                # pair voxels (reason 0 inside ev), the six-neighbour stencil, the midline's central
+                # differences at the full-stencil voxels (their neighbours are pair voxels, so the
+                # midline there is 0.5 * (dr + dv)), the gradient rule, valid, the masked midline and
+                # thickness (WRITE_F) and / or the encoded core window (WRITE_E), and the counts row.
+                # REASON is only read: the rules of every voxel see the codes before rule 5.
                 b = tl.program_id(1)
                 offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
                 ok = offs < V
                 base = b.to(tl.int64) * V
-                c = (tl.load(C + base + offs, mask=ok, other=0) != 0) & ok
-                r = tl.load(R + base + offs, mask=ok, other=0).to(tl.int32)
+                i = base + offs
+                z = offs // (Y * X)
+                y = (offs // X) % Y
+                x = offs % X
+                r = tl.load(R + i, mask=ok, other=1).to(tl.int32)
+                pair = ok & (r == 0) & (tl.load(EV + i, mask=ok, other=0) != 0)
+                full = pair & _nbpair(R, EV, i, z, y, x, pair, Z, Y, X, -1, 0, 0) & \
+                    _nbpair(R, EV, i, z, y, x, pair, Z, Y, X, 1, 0, 0) & \
+                    _nbpair(R, EV, i, z, y, x, pair, Z, Y, X, 0, -1, 0) & \
+                    _nbpair(R, EV, i, z, y, x, pair, Z, Y, X, 0, 1, 0) & \
+                    _nbpair(R, EV, i, z, y, x, pair, Z, Y, X, 0, 0, -1) & \
+                    _nbpair(R, EV, i, z, y, x, pair, Z, Y, X, 0, 0, 1)
+                gz = ld.mul_rn(0.5, ld.sub_rn(_mid(DR, DV, i + Y * X, full), _mid(DR, DV, i - Y * X, full)))
+                gy = ld.mul_rn(0.5, ld.sub_rn(_mid(DR, DV, i + X, full), _mid(DR, DV, i - X, full)))
+                gx = ld.mul_rn(0.5, ld.sub_rn(_mid(DR, DV, i + 1, full), _mid(DR, DV, i - 1, full)))
+                gn = ld.sqrt_rn(ld.add_rn(ld.add_rn(ld.mul_rn(gz, gz), ld.mul_rn(gy, gy)), ld.mul_rn(gx, gx)))
+                r = tl.where(pair & ~full, C_STEN, r)
+                r = tl.where(full & ((gn < G0) | (gn > G1)), C_GRAD, r)
+                c = ok & (tl.load(CORE + i, mask=ok, other=0) != 0)
+                valid = c & (r == 0)
+                mv = tl.where(valid & pair, _mid(DR, DV, i, valid & pair), 0.0)     # (core is inside ev)
+                tv = tl.where(valid, tl.load(T + i, mask=valid, other=0.0), 0.0)
+                if WRITE_F:
+                    tl.store(MOUT + i, mv, mask=ok)
+                    tl.store(TOUT + i, tv, mask=ok)
+                    tl.store(OKOUT + i, valid.to(tl.int8), mask=ok)
+                if WRITE_E:
+                    # `_encode_torch` of the core window [H, H + N) per axis: clip, / UNIT (0.25:
+                    # exact), round half to even, + OFF, clip to 1..255, 0 where not valid
+                    zc = z - H0
+                    yc = y - H1
+                    xc = x - H2
+                    inw = ok & (zc >= 0) & (zc < N0) & (yc >= 0) & (yc < N1) & (xc >= 0) & (xc < N2)
+                    e = ((b.to(tl.int64) * N0 + zc) * N1 + yc) * N2 + xc
+                    cm = ld.rint(ld.div_rn(tl.minimum(tl.maximum(mv, -CAP), CAP), 0.25)) + 128.0
+                    mu = tl.where(valid, tl.minimum(tl.maximum(cm, 1.0), 255.0), 0.0)
+                    ct = ld.rint(ld.div_rn(tl.minimum(tl.maximum(tv, 0.25), 63.75), 0.25))
+                    tu = tl.where(valid, tl.minimum(tl.maximum(ct, 1.0), 255.0), 0.0)
+                    tl.store(ENC + e, mu.to(tl.uint8), mask=inw)
+                    tl.store(ENC + EPL + e, tu.to(tl.uint8), mask=inw)
                 row = CNT + b * (NR + 1)
                 tl.atomic_add(row, tl.sum(c.to(tl.int64)))
                 for q in tl.static_range(1, NR):
                     tl.atomic_add(row + q, tl.sum((c & (r == q)).to(tl.int64)))
-                tl.atomic_add(row + NR, tl.sum((c & (r == 0)).to(tl.int64)))
+                tl.atomic_add(row + NR, tl.sum(valid.to(tl.int64)))
 
-            _PAIR_K = (_rec, _normal, _walk, _counts)
+            _PAIR_K = (_rec, _normal, _walk, _stage5)
         except Exception:  # noqa: BLE001
             _PAIR_K = False
     return _PAIR_K
@@ -940,15 +1000,53 @@ def _stage_b(S, dy, dx, reach, dev, sel=None):
             reason.view(-1)[sel] = _pair_checks_torch(*args)
 
 
-def _stage_c(S, core, dev, drop=False):
-    """Rule 5 and the support counts of a batch (fixed-shape): (midline, thickness, valid, counts).
-    `drop`: S's distances are released as soon as the midline is formed."""
+def _stage_c(S, core, dev, drop=False, enc=None):
+    """Rule 5 and the support counts of a batch (fixed-shape): (midline, thickness, valid, counts), or
+    with `enc` = (sl, cap) (encoded core `_encode_torch(m[sl], t[sl], ok[sl], cap)`, counts).
+    `drop`: S's distances are released as soon as the midline is formed (the torch steps).
+
+    On CUDA (RVSM_FIELDS_FUSED) one kernel (`_stage5`) does it all -- the stencil, the gradient, both
+    fails, valid, the outputs or the encoding and the counts -- with torch's float32 steps each rounded
+    on its own (`*_rn`), so the same bits (tested); elsewhere the op-by-op torch steps below."""
     import torch
     from rvsm import edt as E
     reason, ev, t = S["reason"], S["ev"], S["t"]
     shape = tuple(int(v) for v in reason.shape)
     B = shape[0]
     core = torch.ones(shape, dtype=torch.bool, device=dev) if core is None else core.expand(shape)
+    k = _pair_kernels() if (dev.type == "cuda" and PAIR_FUSED) else False
+    if k:
+        V = shape[1] * shape[2] * shape[3]
+        counts = torch.zeros((B, NCOUNT), dtype=torch.int64, device=dev)
+        dr, dv, t = S["dr"].contiguous(), S["dv"].contiguous(), t.contiguous()
+        if enc is not None:
+            sl, cap = enc
+            h = [q.start for q in sl[1:]]
+            n = [q.stop - q.start for q in sl[1:]]
+            out = torch.empty((2, B) + tuple(n), dtype=torch.uint8, device=dev)
+            mo = to = oko = out                      # not written (WRITE_F off)
+        else:
+            h, n, cap = [0, 0, 0], [1, 1, 1], CAP
+            mo = torch.empty(shape, dtype=torch.float32, device=dev)
+            to = torch.empty(shape, dtype=torch.float32, device=dev)
+            oko = torch.empty(shape, dtype=torch.bool, device=dev)
+            out = mo
+        f32 = lambda v: float(np.float32(v))           # noqa: E731
+        try:
+            k[3][(-(-V // 1024), B)](reason.contiguous(), ev.contiguous().view(torch.uint8),
+                                     core.contiguous().view(torch.uint8), dr, dv, t, mo, to,
+                                     oko.view(torch.uint8), out, counts, V, *shape[1:], *h, *n,
+                                     B * n[0] * n[1] * n[2], f32(GRAD[0]), f32(GRAD[1]), f32(cap),
+                                     C_STEN=_REASON["stencil"], C_GRAD=_REASON["gradient"],
+                                     NR=NCOUNT - 1, WRITE_F=enc is None, WRITE_E=enc is not None,
+                                     BLOCK=1024)
+        except Exception as e:  # noqa: BLE001  -- the torch steps below
+            _pair_failed(e)
+            k = False
+        if k:
+            if drop:
+                del S["dr"], S["dv"]
+            return (out, counts) if enc is not None else (mo, to, oko, counts)
 
     def fail(bad, key):
         reason.masked_fill_((reason == 0) & ev & bad, _REASON[key])
@@ -974,14 +1072,6 @@ def _stage_c(S, core, dev, drop=False):
     fail(full & ((gn < GRAD[0]) | (gn > GRAD[1])), "gradient")
     del gn, full, pair
     valid = (reason == 0) & core
-    k = _pair_kernels() if (dev.type == "cuda" and PAIR_FUSED) else False
-    if k:
-        # the counts in one kernel: a scatter-add of every voxel onto ten bins was 4.7 ms of atomics
-        counts = torch.zeros((B, NCOUNT), dtype=torch.int64, device=dev)
-        V = shape[1] * shape[2] * shape[3]
-        k[3][(-(-V // 4096), B)](reason, core.contiguous().view(torch.uint8), counts, V, NR=NCOUNT - 1,
-                                 BLOCK=4096)
-        return torch.where(valid, m, zero), torch.where(valid, t, zero), valid, counts
     bidx = torch.arange(B, device=dev, dtype=torch.int64).view(B, 1, 1, 1)
     nr = NCOUNT - 1                                # reason codes 0..9
     cnt = torch.zeros(B * nr + 1, dtype=torch.int64, device=dev)      # a scatter, not a (syncing) bincount
@@ -990,15 +1080,20 @@ def _stage_c(S, core, dev, drop=False):
     cnt = cnt[:-1].view(B, nr)
     counts = torch.cat((core.reshape(B, -1).sum(1, keepdim=True), cnt[:, 1:],
                         valid.reshape(B, -1).sum(1, keepdim=True)), 1)
-    return torch.where(valid, m, zero), torch.where(valid, t, zero), valid, counts
+    m, t = torch.where(valid, m, zero), torch.where(valid, t, zero)
+    if enc is not None:
+        sl, cap = enc
+        return _encode_torch(m[sl], t[sl], valid[sl], cap), counts
+    return m, t, valid, counts
 
 
-def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, dev):
+def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, dev, enc=None):
     """The tensor core of `block_fields_torch` for a batch: `recto` / `verso` (B,Z,Y,X) uint8 (verso
     may be None), `dy` / `dx` / `core` / `cover` broadcastable to it. Returns (midline, thickness,
     valid) tensors and a (B, len(SUPPORT)) int64 tensor of support counts in `SUPPORT` order, all on
     the device. Three stages: `_stage_a` (rules 1-3), `_stage_b` (rule 4, data-dependent), `_stage_c`
-    (rule 5, the counts); `_FieldGraphs` replays a and c as CUDA graphs."""
+    (rule 5, the counts); `_FieldGraphs` replays a and c as CUDA graphs. With `enc` = (sl, cap): (the
+    encoded cores `_encode_torch(m[sl], t[sl], ok[sl], cap)`, counts) instead."""
     import torch
     rec = _tt(recto, dev)
     ver = None if verso is None else _tt(verso, dev)
@@ -1010,7 +1105,7 @@ def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, d
     _stage_b(S, dy, dx, reach, dev)
     for key in ("ixr", "ixv", "br", "bv", "cand"):
         del S[key]
-    return _stage_c(S, core, dev, drop=True)
+    return _stage_c(S, core, dev, drop=True, enc=enc)
 
 
 def _support(row):
@@ -1501,9 +1596,7 @@ class _FieldGraphs:
             S = _stage_a(i[0], i[1], dy, dx, thr, rk, tn, tx, core, cover, dev, flagged=True)
             self.sat = S.pop("sat")            # a device flag, read after the batch's sync
         with torch.cuda.graph(gc, pool=pool, capture_error_mode="thread_local"):
-            m, t, ok, cnt = _stage_c(S, core, dev)
-            enc = _encode_torch(m[sl], t[sl], ok[sl], cap)
-            del m, t, ok
+            enc, cnt = _stage_c(S, core, dev, enc=(sl, cap))
         self.g = (ga, gc)
         self.S, self.io = S, (dy, dx, core, cover, enc, cnt)
         self.par = (thr, rk, tn, tx, sl, cap)
@@ -1520,9 +1613,8 @@ class _FieldGraphs:
         if bool(self.sat.item()):             # the stream is idle after `nonzero`: a 1-byte read
             self.stats["saturated"] += 1                                # recompute uncapped, eagerly
             thr, rk, tn, tx, sl, cap = self.par
-            m, t, ok, c = _block_fields_t(self.inp[0], self.inp[1], dy, dx, thr, rk, tn, tx, core, cover,
-                                          self.dev)
-            return _encode_torch(m[sl], t[sl], ok[sl], cap), c
+            return _block_fields_t(self.inp[0], self.inp[1], dy, dx, thr, rk, tn, tx, core, cover, self.dev,
+                                   enc=(sl, cap))
         _stage_b(self.S, dy, dx, rk, self.dev, sel=sel)
         gc.replay()
         self.stats["replayed"] += 1
@@ -1618,11 +1710,8 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
             else:
                 dy, dx, core, cover = _block_inputs_torch(host, rsh, axr, halo, dev)
                 if full.all() or not SKIP_FACELESS:
-                    m, t, ok, cnt = _block_fields_t(_to_dev(rec, dev),
-                                                    None if ver is None else _to_dev(ver, dev),
-                                                    dy, dx, thr, rk, tn, tx, core, cover, dev)
-                    enc = _encode_torch(m[sl], t[sl], ok[sl], cap)
-                    del m, t, ok
+                    enc, cnt = _block_fields_t(_to_dev(rec, dev), None if ver is None else _to_dev(ver, dev),
+                                               dy, dx, thr, rk, tn, tx, core, cover, dev, enc=(sl, cap))
                 else:
                     enc, cnt = _faceless(rec, ver, hr, hv, dy, dx, core, cover, thr, rk, tn, tx, cap, sl, n,
                                          dev)
@@ -1679,11 +1768,11 @@ def _faceless(rec, ver, hr, hv, dy, dx, core, cover, thr, rk, tn, tx, cap, sl, n
     full = np.flatnonzero(hr & hv)
     if full.size:
         ti = torch.as_tensor(full, device=dev)
-        m, t, ok, c = _block_fields_t(_to_dev(rec[full], dev), _to_dev(ver[full], dev), dy[ti], dx[ti],
-                                      thr, rk, tn, tx, core[ti], cover[ti], dev)
-        enc[:, ti] = _encode_torch(m[sl], t[sl], ok[sl], cap)
+        e, c = _block_fields_t(_to_dev(rec[full], dev), _to_dev(ver[full], dev), dy[ti], dx[ti],
+                               thr, rk, tn, tx, core[ti], cover[ti], dev, enc=(sl, cap))
+        enc[:, ti] = e
         cnt[ti] = c
-        del m, t, ok, c
+        del e, c
     ro = np.flatnonzero(hr & ~hv)
     if ro.size:
         ti = torch.as_tensor(ro, device=dev)
