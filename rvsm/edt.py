@@ -357,9 +357,9 @@ def _triton_kernels():
                 src = base + bi.to(tl.int64)
                 iz = tl.load(IZ + src, mask=ok)
                 iy = tl.load(IY + src, mask=ok)
-                tl.store(OZ + off, iz, mask=ok)
-                tl.store(OY + off, iy, mask=ok)
-                tl.store(OX + off, bi, mask=ok)
+                tl.store(OZ + off, iz.to(OZ.dtype.element_ty), mask=ok)
+                tl.store(OY + off, iy.to(OY.dtype.element_ty), mask=ok)
+                tl.store(OX + off, bi.to(OX.dtype.element_ty), mask=ok)
                 yy = o % YD
                 zb = o // YD
                 zz = zb % ZD
@@ -508,7 +508,7 @@ def edt(surf):
 
 
 def face_edt(surf, dy, dx, cap=None, reason=None, ev=None, reach=None, code=0, torch_only=False):
-    """`targets.face_distance_torch`'s transform of a (B,Z,Y,X) bool batch: (d, u, ix int32 (3,B,Z,Y,X))
+    """`targets.face_distance_torch`'s transform of a (B,Z,Y,X) bool batch: (d, u, ix (3,B,Z,Y,X))
     with u the distance to the nearest True voxel (`edt2(cap=)` then sqrt), ix that voxel, and d = -u
     where the displacement from it, dotted with the radial direction (dy, dx) (float32, broadcastable
     to the batch), is negative, u elsewhere. `code` > 0: the uint8 `reason` codes that are still 0
@@ -516,10 +516,13 @@ def face_edt(surf, dy, dx, cap=None, reason=None, ev=None, reach=None, code=0, t
 
     On CUDA the last pass does all of that in its epilogue (`_pass_face`: the same rounding, one
     rounded product per term and a rounded sum, no contraction) and writes the indices into their
-    planes directly; elsewhere, and on CUDA without Triton, the torch steps. The same bits (tested)."""
+    planes directly; elsewhere, and on CUDA without Triton, the torch steps. The same bits (tested).
+    The index planes are int16 (int32 for a side of 2^15 or more): they are the largest arrays a
+    block's fields hold between the transforms and the pair checks."""
     assert surf.dim() == 4 and surf.dtype == torch.bool
     assert 3 * max(surf.shape[-3:]) ** 2 < 2 ** 24, "squared distances must stay exact in float32"
     B, Z, Y, X = (int(v) for v in surf.shape)
+    idt = torch.int16 if max(Z, Y, X) < 2 ** 15 else torch.int32
     k = _triton_kernels() if (surf.is_cuda and not torch_only) else False
     if k:
         cap2 = INF if cap is None else float(cap) * float(cap)
@@ -529,7 +532,7 @@ def face_edt(surf, dy, dx, cap=None, reason=None, ev=None, reach=None, code=0, t
         k = _triton_kernels()                 # a failing pass above falls back and disables them
     if k:
         dev = surf.device
-        ix = torch.empty((3, B, Z, Y, X), dtype=torch.int32, device=dev)
+        ix = torch.empty((3, B, Z, Y, X), dtype=idt, device=dev)
         u = torch.empty(surf.shape, dtype=torch.float32, device=dev)
         d = torch.empty_like(u)
         dye = dy.to(torch.float32).expand(B, Z, Y, X)
@@ -556,7 +559,7 @@ def face_edt(surf, dy, dx, cap=None, reason=None, ev=None, reach=None, code=0, t
     d = torch.where(side < 0, -u, u)
     if code:
         reason.masked_fill_((reason == 0) & ev & (u > reach), int(code))
-    return d, u, ix
+    return d, u, ix.to(idt)
 
 
 def max_filter3(x):
@@ -648,7 +651,7 @@ def _weights_on(sigma, truncate, dev):
 BOX_EMPTY = 1 << 30   # an entry of an empty `gaussian3_box` box: min = BOX_EMPTY, -max = BOX_EMPTY
 
 
-def gaussian3_box(xs, box, sigma, truncate=4.0, margin=1):
+def gaussian3_box(xs, box, sigma, truncate=4.0, margin=1, out=None):
     """`gaussian3` of each (B,Z,Y,X) float32 CUDA tensor of `xs` (all one shape), wanted only near some
     points: `box` (len(xs), B, 6) int32 on the device holds, per field and volume, the points' extent
     (zmin, -zmax, ymin, -ymax, xmin, -xmax; `BOX_EMPTY` everywhere for no point), and the result is
@@ -662,7 +665,9 @@ def gaussian3_box(xs, box, sigma, truncate=4.0, margin=1):
     the same float64 expression as `gaussian3`'s kernel, and the clamping ("nearest") is to the whole
     volume, so every voxel the final box needs sees exactly the values the whole-volume filter
     would. The box lives on the device (no synchronisation): the grid covers the whole volume and the
-    voxels outside the box do nothing. One launch per pass for all of `xs`."""
+    voxels outside the box do nothing. One launch per pass for all of `xs`. `out`: the two
+    (len(xs), B, Z, Y, X) float32 buffers the passes alternate between (the result is the first),
+    instead of two new ones -- e.g. static buffers of a CUDA graph, or dead memory of another dtype."""
     k = _triton_kernels()
     if not k:
         return None
@@ -678,7 +683,10 @@ def gaussian3_box(xs, box, sigma, truncate=4.0, margin=1):
     din = 0 if nf == 1 else (xs[1].data_ptr() - x0.data_ptr()) // 4
     for i, x in enumerate(xs):
         assert x.data_ptr() - x0.data_ptr() == 4 * i * din
-    out = [torch.empty((nf, B, Z, Y, X), dtype=torch.float32, device=x0.device) for _ in range(2)]
+    if out is None:
+        out = [torch.empty((nf, B, Z, Y, X), dtype=torch.float32, device=x0.device) for _ in range(2)]
+    for o in out:
+        assert o.dtype == torch.float32 and o.is_contiguous() and tuple(o.shape) == (nf, B, Z, Y, X)
     BLOCK = 1024
     grid = (-(-V // BLOCK), nf * B)
     try:

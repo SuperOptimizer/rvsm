@@ -442,7 +442,8 @@ def _medial_flagged(band, cap):
 
 
 def face_distance_torch(surf, dy, dx, cap=None, fail=None):
-    """`face_distance` of a bool (B,Z,Y,X) batch: (d, u, ix int32 (3,B,Z,Y,X)). A block with no surface
+    """`face_distance` of a bool (B,Z,Y,X) batch: (d, u, ix (3,B,Z,Y,X) int16 -- int32 for a side of
+    2^15 or more). A block with no surface
     voxel has u = +inf (and d = +-inf) everywhere instead of `None`. With `cap` (`edt_cap`), a voxel
     further than `cap` from the surface has u = +inf and an unspecified index; every other voxel's
     d, u and ix are exactly the uncapped ones. `fail` = (reason, ev, reach, code): the reach rule
@@ -487,9 +488,9 @@ def _pair_checks_torch(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n):
     loc = sel - b * V
     boff = b * V
     ir, iv = ixr.reshape(3, -1), ixv.reshape(3, -1)
-    pr, pv = ir[:, sel], iv[:, sel]                      # int32 coordinates: half the memory
+    pr, pv = ir[:, sel].int(), iv[:, sel].int()          # int32 coordinates (the planes may be int16)
     fr, fv = boff + _ravel(pr, shape), boff + _ravel(pv, shape)
-    back_r, back_v = ir[:, fv], iv[:, fr]
+    back_r, back_v = ir[:, fv].int(), iv[:, fr].int()
     fbr, fbv = boff + _ravel(back_r, shape), boff + _ravel(back_v, shape)
 
     def near(q, p):
@@ -563,20 +564,20 @@ def _pair_kernels():
                 s = tl.load(SEL + offs, mask=ok, other=0)
                 b = s // V
                 boff = b * V
-                r0 = tl.load(IXR + s, mask=ok, other=0)
-                r1 = tl.load(IXR + BV + s, mask=ok, other=0)
-                r2 = tl.load(IXR + 2 * BV + s, mask=ok, other=0)
-                v0 = tl.load(IXV + s, mask=ok, other=0)
-                v1 = tl.load(IXV + BV + s, mask=ok, other=0)
-                v2 = tl.load(IXV + 2 * BV + s, mask=ok, other=0)
+                r0 = tl.load(IXR + s, mask=ok, other=0).to(tl.int32)
+                r1 = tl.load(IXR + BV + s, mask=ok, other=0).to(tl.int32)
+                r2 = tl.load(IXR + 2 * BV + s, mask=ok, other=0).to(tl.int32)
+                v0 = tl.load(IXV + s, mask=ok, other=0).to(tl.int32)
+                v1 = tl.load(IXV + BV + s, mask=ok, other=0).to(tl.int32)
+                v2 = tl.load(IXV + 2 * BV + s, mask=ok, other=0).to(tl.int32)
                 fr = _rav(boff, r0, r1, r2, Y, X)
                 fv = _rav(boff, v0, v1, v2, Y, X)
-                q0 = tl.load(IXR + fv, mask=ok, other=0)          # p_v's nearest recto point
-                q1 = tl.load(IXR + BV + fv, mask=ok, other=0)
-                q2 = tl.load(IXR + 2 * BV + fv, mask=ok, other=0)
-                w0 = tl.load(IXV + fr, mask=ok, other=0)          # p_r's nearest verso point
-                w1 = tl.load(IXV + BV + fr, mask=ok, other=0)
-                w2 = tl.load(IXV + 2 * BV + fr, mask=ok, other=0)
+                q0 = tl.load(IXR + fv, mask=ok, other=0).to(tl.int32)          # p_v's nearest recto point
+                q1 = tl.load(IXR + BV + fv, mask=ok, other=0).to(tl.int32)
+                q2 = tl.load(IXR + 2 * BV + fv, mask=ok, other=0).to(tl.int32)
+                w0 = tl.load(IXV + fr, mask=ok, other=0).to(tl.int32)          # p_r's nearest verso point
+                w1 = tl.load(IXV + BV + fr, mask=ok, other=0).to(tl.int32)
+                w2 = tl.load(IXV + 2 * BV + fr, mask=ok, other=0).to(tl.int32)
                 # one band component <=> one root in the band forests (recto volumes first, then verso);
                 # every point here is a face voxel, i.e. in its band
                 er = _uf_find(PAR, _rav(boff, q0, q1, q2, Y, X).to(tl.int32), ok) == \
@@ -838,7 +839,7 @@ def _ftab(nt, dev):
 PAIR_FUSED = os.environ.get("RVSM_FIELDS_FUSED", "1") not in ("0", "false", "no")
 
 
-def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, reason):
+def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, reason, ws=None):
     """`_pair_checks_torch` on CUDA in a few launches, the codes written straight into `reason` (whose
     `sel` entries are 0). True when done, False when the kernels are unusable (nothing written).
 
@@ -852,7 +853,12 @@ def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, re
         every product, sum, quotient and root rounded on its own (no contraction), and each block's
         longest walked segment (atomic max; a maximum does not depend on the order);
     (c) the walk, one kernel, each voxel with its block's sample count.
-    The reason codes are the torch version's bit for bit (tested)."""
+    The reason codes are the torch version's bit for bit (tested).
+
+    Memory: the forest (int32, both bands) is dead once (a) has run, and is the same size as one of
+    the Gaussian's two float32 buffers, so the Gaussian's middle pass writes into it. `ws` = (forest,
+    buffer) from `_stage_b_ws`: that forest already computed (graph A does) and the other buffer
+    static, so a graphed batch allocates only its per-voxel (M-sized) arrays here."""
     import torch
     from rvsm import edt as E
     k = _pair_kernels()
@@ -866,9 +872,13 @@ def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, re
     if 2 * BV >= 2 ** 31:
         return False
     # both bands' union-find forests in one batch; the reciprocal kernel finds the roots it compares
-    par = E.label_forest(torch.stack((br, bv)).view(2 * B, Z, Y, X))
-    if par is None:
-        return False
+    if ws is not None:
+        par, gbuf = ws
+    else:
+        par = E.label_forest(torch.stack((br, bv)).view(2 * B, Z, Y, X))
+        if par is None:
+            return False
+        gbuf = torch.empty((2, B, Z, Y, X), dtype=torch.float32, device=dev)
     pr = torch.empty((3, M), dtype=torch.int32, device=dev)
     pv = torch.empty((3, M), dtype=torch.int32, device=dev)
     okr = torch.empty(M, dtype=torch.int8, device=dev)
@@ -882,9 +892,9 @@ def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, re
     except Exception as e:  # noqa: BLE001
         _pair_failed(e)
         return False
-    del par
     dr, dv = dr.contiguous(), dv.contiguous()
-    g = E.gaussian3_box([dr, dv], box, NORMAL_SIGMA)
+    g = E.gaussian3_box([dr, dv], box, NORMAL_SIGMA, out=(gbuf, par.view(torch.float32).view(2, B, Z, Y, X)))
+    del par, gbuf
     if g is None:
         return False
     dye, dxe = dy.expand(B, Z, Y, X), dx.expand(B, Z, Y, X)
@@ -990,8 +1000,24 @@ def _stage_b(S, dy, dx, reach, dev, sel=None):
         shape = tuple(int(v) for v in reason.shape)
         wn = int(np.ceil(4.0 * float(reach))) + 2
         args = (sel, shape, S["br"], S["bv"], S["dr"], S["dv"], S["ixr"], S["ixv"], dy, dx, wn)
-        if not (dev.type == "cuda" and _pair_checks_triton(*args, reason.view(-1))):
+        if not (dev.type == "cuda" and _pair_checks_triton(*args, reason.view(-1), ws=S.get("ws"))):
             reason.view(-1)[sel] = _pair_checks_torch(*args)
+
+
+def _stage_b_ws(S, dev):
+    """The fixed-shape part of the pair checks' memory for `_FieldGraphs`' graph A: both bands'
+    union-find forest (`edt.label_forest`, computed in the graph) and the Gaussian's other buffer,
+    allocated at the end of the capture, where they reuse the graph pool's dead transients instead
+    of growing the eager allocator between the graphs. None where the kernels are unusable."""
+    import torch
+    from rvsm import edt as E
+    if not (dev.type == "cuda" and PAIR_FUSED and _pair_kernels()):
+        return None
+    B, Z, Y, X = (int(v) for v in S["br"].shape)
+    par = E.label_forest(torch.stack((S["br"], S["bv"])).view(2 * B, Z, Y, X))
+    if par is None:
+        return None
+    return par, torch.empty((2, B, Z, Y, X), dtype=torch.float32, device=dev)
 
 
 def _stage_c(S, core, dev, drop=False, enc=None):
@@ -1518,11 +1544,16 @@ class _FieldGraphs:
     often would otherwise capture again and again); past that, eager. The stats carry the process
     RSS at the start and end of the region (`rss0_gb`, `rss_gb`).
 
-    Memory: graph A's pool holds the eager stage's peak for the batch plus its static outputs (the
-    distances, nearest indices, bands, reason, ev, t) for as long as the graphs live -- about what the
-    eager path's caching allocator keeps reserved between batches anyway (~0.9 GB per 224^3 block,
-    measured in docs/fields_perf_notes.md), but it is not returned to the driver by
-    `torch.cuda.empty_cache()` until `clear()`."""
+    Memory: both graphs share one pool. Graph A's part is the eager stage's peak for the batch (the
+    verso face transform over the statics so far); its static outputs (the distances, int16 index
+    planes, bands, reason, ev, t) stay while the graphs live. Graph A ends with stage B's fixed-shape
+    memory (`_stage_b_ws`: the band forests, computed in the graph, and one Gaussian buffer; the other
+    Gaussian buffer is the dead forest), allocated last so that it reuses the transients' dead pool
+    memory; graph C allocates only its encoded cores and counts. Measured per 224^3 key: 0.65 GB at
+    B = 1, 1.93 GB at B = 3 (docs/fields_perf_notes.md). The eager allocator's cache is emptied
+    before a capture (the pool is not stacked on the first batch's cached blocks), and a batch of
+    another key releases the graphs at once (`drop_other`). The pool is not returned to the driver
+    by `torch.cuda.empty_cache()` until `clear()`."""
 
     def __init__(self, dev):
         import torch
@@ -1541,6 +1572,12 @@ class _FieldGraphs:
             torch.cuda.current_stream(self.dev).synchronize()
             torch.cuda.empty_cache()
 
+    def drop_other(self, key):
+        """Release the graphs (and their pool) as soon as a batch of another key comes, whether or not
+        that batch can use graphs itself."""
+        if self.g is not None and key != self.key:
+            self.clear()
+
     def run(self, key, rec, ver, host, rsh, axis_r_vox, halo, thr, rk, tn, tx, sl, cap):
         """(enc, counts) of a full batch through the graphs, or None: the caller computes it eagerly
         (the first batch of a key, or no graph could be captured)."""
@@ -1555,6 +1592,11 @@ class _FieldGraphs:
                 self.seen = key
                 return None
             try:
+                import torch
+                # the eager batches' cached blocks back to the driver first: the pool is then not on top
+                # of them (the peak is the pool plus stage B's per-voxel arrays)
+                torch.cuda.current_stream(self.dev).synchronize()
+                torch.cuda.empty_cache()
                 self._capture(key, rec, ver, host, rsh, axis_r_vox, halo, thr, rk, tn, tx, sl, cap)
             except Exception as e:  # noqa: BLE001  -- e.g. an op the capture refuses: eager from here
                 import warnings
@@ -1589,6 +1631,9 @@ class _FieldGraphs:
             dy, dx, core, cover = _block_inputs_dev(i[2], i[3], i[4], i[5], i[6:9], rsh, axis_r_vox, halo, dev)
             S = _stage_a(i[0], i[1], dy, dx, thr, rk, tn, tx, core, cover, dev, flagged=True)
             self.sat = S.pop("sat")            # a device flag, read after the batch's sync
+            ws = _stage_b_ws(S, dev)           # last: into the transients' dead pool memory
+            if ws is not None:
+                S["ws"] = ws
         with torch.cuda.graph(gc, pool=pool, capture_error_mode="thread_local"):
             enc, cnt = _stage_c(S, core, dev, enc=(sl, cap))
         self.g = (ga, gc)
@@ -1696,8 +1741,10 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
             stats["blocks"] += len(group)
             full = hr & hv
             res = None
+            key = (k, batch, rsh, axr, int(halo), thr, rk, tn, tx, cap, EDT_CAP)
+            if graphs is not None:
+                graphs.drop_other(key)     # a new rung / shape: the old key's pool goes back at once
             if graphs is not None and GRAPHS and ver is not None and full.all() and len(group) == batch:
-                key = (k, len(group), rsh, axr, int(halo), thr, rk, tn, tx, cap, EDT_CAP)
                 res = graphs.run(key, rec, ver, host, rsh, axr, halo, thr, rk, tn, tx, sl, cap)
             if res is not None:
                 enc, cnt = res

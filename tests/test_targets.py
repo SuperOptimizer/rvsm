@@ -954,3 +954,23 @@ def test_fused_stage_c_is_the_torch_stage_c(monkeypatch):
         for a, b in zip(outs[False], outs[True]):
             assert torch.equal(a, b), (B, shape)
         assert outs[True][2].any() and (outs[True][3][:, 7:9] > 0).all()     # stencil and gradient fails seen
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="no CUDA device")
+def test_fields_graphs_release_their_pool_on_another_key(slab_region, monkeypatch):
+    """A batch of another key (a new rung or window shape) releases the previous key's graphs and pool
+    at once, whether or not it can be graphed itself."""
+    monkeypatch.setattr(targets, "FIELD_BATCH", 1)
+    r = slab_region(name="gk", n=128, recto_x=80, verso_x=70)
+    seen = []
+    real = targets._FieldGraphs.drop_other
+
+    def spy(self, key):
+        had = self.g is not None
+        real(self, key)
+        if had and self.g is None:
+            seen.append(key[0])
+    monkeypatch.setattr(targets._FieldGraphs, "drop_other", spy)
+    rep = targets.region_fields(r.root, r.lo, r.ax, rungs=(2, 3), device="cuda", **KW)
+    assert rep["graphs"]["replayed"] > 0
+    assert seen == [3]                                 # rung 2's graphs dropped by rung 3's first batch

@@ -262,7 +262,7 @@ def test_the_face_pass_is_the_torch_face_distance():
                     r = r0.clone()
                     d, u, ix = E.face_edt(s, dy, dx, cap, reason=r, ev=ev, reach=2.5, code=5, torch_only=to)
                     out[to] = (d.view(torch.int32), u.view(torch.int32), ix, r)
-                    assert ix.dtype == torch.int32 and ix.shape == (3,) + tuple(batch.shape)
+                    assert ix.dtype == torch.int16 and ix.shape == (3,) + tuple(batch.shape)
                 for a, b in zip(out[False], out[True]):
                     assert torch.equal(a, b), (m.shape, cap)
                 assert (out[True][3] == 5).any()
