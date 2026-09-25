@@ -917,7 +917,7 @@ def sftp_batch(lines, tag):
         f.write("\n".join(lines + ["quit"]) + "\n")
     t = time.time()
     r = subprocess.run(["setsid", "-w", "sftp", "-q", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=no",
-                        "-o", "Compression=no", "-B", "262144", "-R", "64", "-P", "9238", "-b", bf,
+                        "-o", "Compression=no", "-R", "64", "-P", "9238", "-b", bf,
                         f"{login}@dl.ash2txt.org"], env=env, stdout=open(of, "w"), stderr=subprocess.STDOUT)
     return r.returncode, time.time() - t
 
