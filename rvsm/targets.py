@@ -441,24 +441,18 @@ def _medial_flagged(band, cap):
     return band & (d2 >= E.max_filter3(d2)), sat
 
 
-def face_distance_torch(surf, dy, dx, cap=None):
+def face_distance_torch(surf, dy, dx, cap=None, fail=None):
     """`face_distance` of a bool (B,Z,Y,X) batch: (d, u, ix int32 (3,B,Z,Y,X)). A block with no surface
     voxel has u = +inf (and d = +-inf) everywhere instead of `None`. With `cap` (`edt_cap`), a voxel
     further than `cap` from the surface has u = +inf and an unspecified index; every other voxel's
-    d, u and ix are exactly the uncapped ones."""
-    import torch
+    d, u and ix are exactly the uncapped ones. `fail` = (reason, ev, reach, code): the reach rule
+    (`code` where the reason is still 0, inside ev, u > reach), applied in place. On CUDA the signed
+    distance, the index planes and the reach rule are the transform's last pass (`edt.face_edt`)."""
     from rvsm import edt as E
-    d2, ix = E.edt2(surf, index_dtype=torch.int32, cap=cap)
-    u = torch.sqrt(d2)
-    del d2
-    Y, X = surf.shape[-2:]
-    gy = (torch.arange(Y, device=surf.device)[None, None, :, None] - ix[1]).to(torch.float32)
-    gx = (torch.arange(X, device=surf.device)[None, None, None, :] - ix[2]).to(torch.float32)
-    side = gy * dy
-    side = side + gx * dx
-    del gy, gx
-    d = torch.where(side < 0, -u, u)
-    return d, u, ix
+    if fail is None:
+        return E.face_edt(surf, dy, dx, cap)
+    reason, ev, reach, code = fail
+    return E.face_edt(surf, dy, dx, cap, reason=reason, ev=ev, reach=reach, code=code)
 
 
 def _grad_at_torch(d, b, p):
@@ -968,11 +962,11 @@ def _stage_a(rec, ver, dy, dx, thr, reach, tmin, tmax, core, cover, dev, flagged
         mm, sat = _medial_flagged(band, mcap)
         sats.append(sat)
         return mm
-    dr, ur, ixr = face_distance_torch(med(br), dy, dx, cap)
-    fail(ur > reach, "no_recto")                 # also every voxel of a block without a recto face
+    # the reach rules inside the transforms: no_recto -- also every voxel of a block without a recto
+    # face -- then no_verso (... and without a verso face)
+    dr, ur, ixr = face_distance_torch(med(br), dy, dx, cap, fail=(reason, ev, reach, _REASON["no_recto"]))
     bv = torch.zeros_like(br) if ver is None else ver >= lvl
-    dv, uv, ixv = face_distance_torch(med(bv), dy, dx, cap)
-    fail(uv > reach, "no_verso")                 # ... and without a verso face
+    dv, uv, ixv = face_distance_torch(med(bv), dy, dx, cap, fail=(reason, ev, reach, _REASON["no_verso"]))
     if cover is not None:
         fail(cover <= torch.maximum(ur, uv) + COVER_MARGIN, "coverage")
     del ur, uv

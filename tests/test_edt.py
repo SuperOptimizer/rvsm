@@ -236,3 +236,34 @@ def test_the_label_forest_roots_are_the_components():
         lab = E.label(torch.from_numpy(m).cuda()).cpu().numpy().reshape(-1)
         mf = m.reshape(-1)
         assert np.array_equal(root[mf] - (np.flatnonzero(mf) // V) * V + 1, lab[mf])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_the_face_pass_is_the_torch_face_distance():
+    """`face_edt` on CUDA (the signed distance, the index planes and the reach rule in the last pass's
+    epilogue) against its torch steps: the same bits of d and u, the same indices and reason codes, on
+    batches of the random masks (one volume empty), with full and broadcast radial directions (some
+    displacements exactly perpendicular), capped and uncapped."""
+    rng = np.random.default_rng(11)
+    for m in _masks(rng):
+        Z, Y, X = m.shape
+        batch = np.stack([m, np.zeros_like(m), np.roll(m, 3, axis=2)])
+        s = torch.from_numpy(batch).cuda()
+        full = [torch.from_numpy(rng.normal(size=batch.shape).astype(np.float32)).cuda() for _ in range(2)]
+        bcast = [torch.from_numpy((np.arange(Y, dtype=np.float32) - Y / 2)[None, None, :, None].repeat(3, 0)
+                                  .repeat(Z, 1)).cuda(),
+                 torch.from_numpy((np.arange(X, dtype=np.float32) - 3.0)[None, None, None, :]).cuda()]
+        ev = torch.from_numpy(rng.random(batch.shape) < 0.9).cuda()
+        r0 = torch.from_numpy(np.where(rng.random(batch.shape) < 0.2, 3, 0).astype(np.uint8)).cuda()
+        for dy, dx in (full, bcast):
+            for cap in (None, 4.0):
+                out = {}
+                for to in (False, True):
+                    r = r0.clone()
+                    d, u, ix = E.face_edt(s, dy, dx, cap, reason=r, ev=ev, reach=2.5, code=5, torch_only=to)
+                    out[to] = (d.view(torch.int32), u.view(torch.int32), ix, r)
+                    assert ix.dtype == torch.int32 and ix.shape == (3,) + tuple(batch.shape)
+                for a, b in zip(out[False], out[True]):
+                    assert torch.equal(a, b), (m.shape, cap)
+                assert (out[True][3] == 5).any()
+    assert E._triton_kernels()                  # the kernel path ran (no fallback)

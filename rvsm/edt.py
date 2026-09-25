@@ -322,7 +322,62 @@ def _triton_kernels():
                 base = ((offs // V) * V).to(tl.int32)
                 tl.store(OUT + offs, tl.where(m, root - base + 1, 0), mask=ok)
 
-            _TRITON = (_pass, _gauss, _first, _walk, _uf_merge, _uf_final, _gauss_box, _uf_find)
+            @triton.jit
+            def _pass_face(G, U, D, IZ, IY, OZ, OY, OX, DY, DX, SYB, SYZ, SYY, SYX, SXB, SXZ, SXY, SXX,
+                           R, EV, REACH, n, ZD, YD, CAP2, CODE: tl.constexpr, BY: tl.constexpr):
+                # `_pass` along the last axis (inner = 1) of a (B, ZD, YD, n) batch, carrying the z / y
+                # nearest coordinates, with `face_distance`'s arithmetic as its epilogue: u = sqrt(v),
+                # the side of the displacement from the nearest voxel along the radial direction
+                # (dy, dx) -- (y - iy) * dy + (x - ix) * dx, each product and the sum rounded on its own
+                # -- d = -u on the inner side, u elsewhere; the indices go straight into their (3, ...)
+                # planes OZ / OY / OX; CODE > 0: the reason codes R get CODE where still 0, inside EV
+                # and further than REACH (`_stage_a`'s no_recto / no_verso rule).
+                o = tl.program_id(0).to(tl.int64)
+                y0 = tl.program_id(1) * BY
+                y = y0 + tl.arange(0, BY)
+                ok = y < n
+                base = o * n
+                off = base + y.to(tl.int64)
+                gt = tl.load(G + off, mask=ok, other=0.0)
+                r2 = tl.minimum(tl.max(gt, axis=0), CAP2)
+                r = tl.minimum(tl.ceil(tl.sqrt(r2)), n * 1.0).to(tl.int32)
+                lo = tl.maximum(y0 - r, 0)
+                hi = tl.minimum(y0 + BY + r, n)
+                yf = y.to(tl.float32)
+                best = tl.full([BY], float("inf"), tl.float32)
+                bi = tl.zeros([BY], tl.int32)
+                for i in range(lo, hi):
+                    g = tl.load(G + base + i)
+                    d = yf - i
+                    c = g + d * d
+                    m = c < best                     # strict: the FIRST minimum along the line wins
+                    best = tl.where(m, c, best)
+                    bi = tl.where(m, i, bi)
+                best = tl.where(best > CAP2, float("inf"), best)        # beyond the cap: unknown
+                src = base + bi.to(tl.int64)
+                iz = tl.load(IZ + src, mask=ok)
+                iy = tl.load(IY + src, mask=ok)
+                tl.store(OZ + off, iz, mask=ok)
+                tl.store(OY + off, iy, mask=ok)
+                tl.store(OX + off, bi, mask=ok)
+                yy = o % YD
+                zb = o // YD
+                zz = zb % ZD
+                bb = zb // ZD
+                u = libdevice.sqrt_rn(best)
+                ry = tl.load(DY + bb * SYB + zz * SYZ + yy * SYY + y * SYX, mask=ok, other=0.0)
+                rx = tl.load(DX + bb * SXB + zz * SXZ + yy * SXY + y * SXX, mask=ok, other=0.0)
+                gy = (yy - iy.to(tl.int64)).to(tl.float32)
+                gx = (y - bi).to(tl.float32)
+                side = libdevice.add_rn(libdevice.mul_rn(gy, ry), libdevice.mul_rn(gx, rx))
+                tl.store(U + off, u, mask=ok)
+                tl.store(D + off, tl.where(side < 0, -u, u), mask=ok)
+                if CODE > 0:
+                    rc = tl.load(R + off, mask=ok, other=1)
+                    e = tl.load(EV + off, mask=ok, other=0) != 0
+                    tl.store(R + off, tl.where((rc == 0) & e & (u > REACH), CODE, rc).to(tl.uint8), mask=ok)
+
+            _TRITON = (_pass, _gauss, _first, _walk, _uf_merge, _uf_final, _gauss_box, _uf_find, _pass_face)
         except Exception:  # noqa: BLE001  -- no triton: the torch path
             _TRITON = False
     return _TRITON
@@ -450,6 +505,58 @@ def edt(surf):
     return_indices=True)` with the distances exact and ties resolved as in the module docstring."""
     d2, idx = edt2(surf)
     return torch.sqrt(d2), idx
+
+
+def face_edt(surf, dy, dx, cap=None, reason=None, ev=None, reach=None, code=0, torch_only=False):
+    """`targets.face_distance_torch`'s transform of a (B,Z,Y,X) bool batch: (d, u, ix int32 (3,B,Z,Y,X))
+    with u the distance to the nearest True voxel (`edt2(cap=)` then sqrt), ix that voxel, and d = -u
+    where the displacement from it, dotted with the radial direction (dy, dx) (float32, broadcastable
+    to the batch), is negative, u elsewhere. `code` > 0: the uint8 `reason` codes that are still 0
+    inside the bool `ev` and whose u > `reach` get `code`, in place.
+
+    On CUDA the last pass does all of that in its epilogue (`_pass_face`: the same rounding, one
+    rounded product per term and a rounded sum, no contraction) and writes the indices into their
+    planes directly; elsewhere, and on CUDA without Triton, the torch steps. The same bits (tested)."""
+    assert surf.dim() == 4 and surf.dtype == torch.bool
+    assert 3 * max(surf.shape[-3:]) ** 2 < 2 ** 24, "squared distances must stay exact in float32"
+    B, Z, Y, X = (int(v) for v in surf.shape)
+    k = _triton_kernels() if (surf.is_cuda and not torch_only) else False
+    if k:
+        cap2 = INF if cap is None else float(cap) * float(cap)
+        v, iz = _first_pass(surf, 1)
+        v, iy, c = _axis_pass(v, 2, (iz,), cap2=cap2)
+        del iz
+        k = _triton_kernels()                 # a failing pass above falls back and disables them
+    if k:
+        dev = surf.device
+        ix = torch.empty((3, B, Z, Y, X), dtype=torch.int32, device=dev)
+        u = torch.empty(surf.shape, dtype=torch.float32, device=dev)
+        d = torch.empty_like(u)
+        dye = dy.to(torch.float32).expand(B, Z, Y, X)
+        dxe = dx.to(torch.float32).expand(B, Z, Y, X)
+        f32 = float(torch.tensor(float(reach), dtype=torch.float32)) if code else 0.0
+        r_ = reason if code else u
+        e_ = ev.view(torch.uint8) if code else u
+        BY = 64
+        try:
+            k[8][(B * Z * Y, -(-X // BY))](v, u, d, c[0], iy, ix[0], ix[1], ix[2], dye, dxe, *dye.stride(),
+                                           *dxe.stride(), r_, e_, f32, X, Z, Y, cap2, CODE=int(code), BY=BY,
+                                           num_warps=2)
+            return d, u, ix
+        except Exception as e:  # noqa: BLE001
+            _triton_failed(e)
+    d2, ix = edt2(surf, index_dtype=torch.int32, cap=cap, torch_only=True)
+    u = torch.sqrt(d2)
+    del d2
+    gy = (torch.arange(Y, device=surf.device)[None, None, :, None] - ix[1]).to(torch.float32)
+    gx = (torch.arange(X, device=surf.device)[None, None, None, :] - ix[2]).to(torch.float32)
+    side = gy * dy
+    side = side + gx * dx
+    del gy, gx
+    d = torch.where(side < 0, -u, u)
+    if code:
+        reason.masked_fill_((reason == 0) & ev & (u > reach), int(code))
+    return d, u, ix
 
 
 def max_filter3(x):
