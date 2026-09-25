@@ -1070,7 +1070,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         for p_ in net.parameters():
             if p_.requires_grad and p_.grad is None:
                 p_.grad = torch.zeros_like(p_)
-    aux_on = bool(cfg.loss_excl or cfg.loss_selfcons or cfg.loss_skel or cfg.loss_affinity)
+    aux_on = bool(cfg.loss_excl or cfg.loss_selfcons or cfg.loss_skel or cfg.loss_affinity
+                  or cfg.loss_skel_prec)
     aux_dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
 
     bad_run, bad_total = 0, 0
@@ -1256,12 +1257,14 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                               w_excl=cfg.loss_excl, w_selfcons=cfg.loss_selfcons,
                               w_skel=cfg.loss_skel, w_affinity=cfg.loss_affinity,
                               skel_iters=cfg.skel_iters,
+                              w_skel_prec=cfg.loss_skel_prec, skel_prec_iters=cfg.skel_prec_iters,
+                              skel_prec_gate=cfg.skel_prec_gate,
                               cascade=cv(casch), cascade_self=cas.last_self)
             if "aux" in ax:
                 loss = loss + ax["aux"].float()
             aux_log = {k: float(v.detach()) for k, v in ax.items()}
 
-        ph.mark("aux(excl,selfcons,skel,affinity)")
+        ph.mark("aux(excl,selfcons,skel,skel_prec,affinity)")
         (loss / max(int(accum), 1)).backward()
         ph.mark("backward")
         micro += 1

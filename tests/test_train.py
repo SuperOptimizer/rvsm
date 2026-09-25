@@ -208,7 +208,7 @@ def tiny_cfg(tmp_path, ct_origin, umbilicus):
 # --------------------------------------------------------------------- end to end
 
 def test_twenty_steps_of_the_full_recipe(full_cfg):
-    cfg = full_cfg
+    cfg = replace(full_cfg, loss_skel_prec=0.05)      # the off-by-default skeleton precision too
     lay = cfg.layout()
     assert (lay.cin, lay.cout, lay.cout_t) == (21, 14, 4)
     val = [_item(cfg, k=2, seed=900), _item(cfg, k=3, seed=901)]
@@ -228,7 +228,7 @@ def test_twenty_steps_of_the_full_recipe(full_cfg):
     assert steps, "no step was logged"
     for r in steps:                       # every term of the full recipe is there and finite
         for k in ("loss", "bce", "dice", "sdist", "eikonal", "thick", "pair_bce", "pair_dice",
-                  "ect", "excl", "selfcons", "skel", "affinity"):
+                  "ect", "excl", "selfcons", "skel", "skel_prec", "affinity"):
             assert k in r, f"{k} missing from {sorted(r)}"
             assert math.isfinite(r[k]), f"{k} is {r[k]}"
         assert r["rung"] and r["train_wait_s"] >= 0 and r["vox_s"] > 0

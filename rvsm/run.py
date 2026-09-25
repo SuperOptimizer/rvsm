@@ -2715,8 +2715,10 @@ def log_switches(out, old, cfg):
         got.append(rec)
     moved = {}
     for k in CFG.LOSS_SWITCH_FIELDS:
-        if k in d and float(d[k]) != float(getattr(cfg, k)):
-            moved[k] = {"old": float(d[k]), "new": float(getattr(cfg, k))}
+        # a config.json that predates a weight ran it at its default (`loss_skel_prec` is new and 0)
+        ov = float(d[k]) if k in d else (float(getattr(CFG.Config(), k)) if d else None)
+        if ov is not None and ov != float(getattr(cfg, k)):
+            moved[k] = {"old": ov, "new": float(getattr(cfg, k))}
     if moved:
         rec = {"kind": "loss_switch", "step": step, "weights": moved}
         jlog(out, "sched", rec)

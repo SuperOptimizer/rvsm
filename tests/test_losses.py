@@ -267,7 +267,7 @@ def test_no_auxiliary_loss_reads_a_zero_weight_label():
     wv[:, :, :, :, 20:26] = 0                                      # an unknown stripe through both
     logit = torch.randn(1, lay.cout, S, S, S)
     kw = dict(w_excl=0.1, w_selfcons=0.1, w_skel=0.1, w_affinity=0.1, cascade=torch.rand(1, 1, S, S, S),
-              cascade_self=torch.ones(1), skel_iters=4)
+              cascade_self=torch.ones(1), skel_iters=4, w_skel_prec=0.1)
     base = L.aux_losses(logit, tgt, wv, lay, **kw)
     for seed in range(3):
         g = torch.Generator().manual_seed(seed)
@@ -275,5 +275,68 @@ def test_no_auxiliary_loss_reads_a_zero_weight_label():
         noise = (torch.rand(tgt.shape, generator=g) > 0.5).float()
         mut = torch.where(wv > 0, mut, noise)                      # only the unknown labels change
         got = L.aux_losses(logit, mut, wv, lay, **kw)
-        for k in ("skel", "affinity", "excl", "selfcons"):
+        for k in ("skel", "skel_prec", "affinity", "excl", "selfcons"):
             assert float(got[k]) == pytest.approx(float(base[k]), abs=1e-6), (k, seed)
+
+
+# ----------------------------------------------------------------------- skeleton precision (L8b)
+
+def _slab(S=32, lo=12, hi=17, x1=None):
+    t = torch.zeros(1, 1, S, S, S)
+    t[:, :, :, lo:hi, :x1] = 1.0
+    return t
+
+
+def test_skeleton_precision_of_the_target_itself_is_perfect():
+    t = _slab()
+    assert float(L.skel_precision(t, t)) == pytest.approx(0.0, abs=1e-5)               # precision 1
+    assert float(L.skel_precision(0.95 * t, t)) == pytest.approx(0.0, abs=1e-5)        # a soft copy too
+    s = L.soft_skeleton(t, iters=3)
+    assert float(s.sum()) > 0 and float((s * (1 - t)).sum()) == 0.0                   # inside the band
+
+
+def test_skeleton_precision_charges_a_spur_outside_the_band():
+    t = _slab()
+    spur = t.clone()
+    spur[:, :, 10:15, 17:28, 8:12] = 1.0          # a fin sticking 11 voxels out of the band
+    base, bad = float(L.skel_precision(t, t)), float(L.skel_precision(spur, t))
+    assert bad > base + 0.02, (base, bad)
+    shift = torch.roll(t, 1, dims=3)               # one voxel off: inside the dilated band, not charged
+    assert float(L.skel_precision(shift, t)) == pytest.approx(0.0, abs=1e-5)
+    p = spur.clone().requires_grad_()              # and the gradient pushes the spur down
+    L.skel_precision(p, t).backward()
+    assert torch.isfinite(p.grad).all() and float(p.grad[:, :, 10:15, 20:28, 8:12].sum()) > 0
+
+
+def test_skeleton_precision_does_not_charge_a_sheet_that_stops_short():
+    """Stopping short is RECALL's job: a prediction that covers only half the target keeps its whole
+    skeleton inside the band, so precision stays ~1 while the skeleton recall charges the gap."""
+    t = _slab()
+    short = _slab(x1=16)
+    assert float(L.skel_precision(short, t)) == pytest.approx(0.0, abs=1e-5)
+    assert float(L.skel_recall(short, t)) > 0.3
+
+
+def test_skeleton_precision_gates_haze_and_unknown_labels():
+    t = _slab()
+    haze = torch.full_like(t, 0.2)                 # early-training haze below the gate: nothing scored
+    assert float(L.skel_precision(haze, t)) == 0.0
+    spur = t.clone()
+    spur[:, :, 10:15, 17:28, 8:12] = 1.0
+    wv = torch.ones_like(t)
+    wv[:, :, :, 17:, :] = 0                        # the spur's region is unknown: it may not be charged
+    assert float(L.skel_precision(spur, t, wv)) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_aux_losses_adds_the_skeleton_precision_only_when_weighted():
+    lay = _layout(channels=("recto", "verso"), aff_offsets=(8,))
+    torch.manual_seed(0)
+    logit = torch.randn(1, lay.cout, 16, 16, 16)
+    tgt = torch.zeros(1, lay.cout_t, 16, 16, 16)
+    tgt[:, 0, :, :, 6:9] = 1.0
+    w = torch.ones_like(tgt)
+    out = L.aux_losses(logit, tgt, w, lay, w_skel=0.05, w_skel_prec=0.2)
+    assert set(out) == {"skel", "skel_prec", "aux"}
+    assert float(out["aux"]) == pytest.approx(0.05 * float(out["skel"]) + 0.2 * float(out["skel_prec"]),
+                                              rel=1e-5)
+    assert "skel_prec" not in L.aux_losses(logit, tgt, w, lay, w_skel=0.05)        # default: off

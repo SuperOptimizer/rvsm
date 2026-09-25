@@ -11,7 +11,7 @@ Three groups:
                            with the `live` rule (a channel with no weight anywhere in the batch is not
                            averaged in) and deep supervision over the decoder's multi-resolution outputs
   the auxiliary terms      `aux_losses`: exclusivity (recto/verso may not both fire), cross-rung
-                           self-consistency, skeleton recall, long-range affinity
+                           self-consistency, skeleton recall and precision, long-range affinity
   the field terms          signed midline distance (`sdist_loss`), thickness, the Eikonal regulariser,
                            normals derived from the field, construction-based pairing (`pair_bands`) and
                            the Euler-characteristic-transform topology term (`ect_loss`)
@@ -185,6 +185,68 @@ def skel_recall(p, tgt, wv=None, iters=4, thr=0.5):
     return 1.0 - (rec * live).sum() / live.sum().clamp_min(1.0)
 
 
+# ------------------------------------------------------------------- L8b skeleton precision
+
+def dilate(x, k=3):
+    """One 26-connected dilation (a 3^3 max-pool); outside the patch is background (zero padding)."""
+    return F.max_pool3d(F.pad(x, (1,) * 6, value=0.0), k, stride=1)
+
+
+def soft_skeleton(p, iters=3):
+    """clDice's `soft_skel` (Shit et al., CVPR 2021) of a probability field, differentiable in `p`.
+
+    Soft morphological thinning with min/max pooling: at each scale `j` the voxels an opening removes,
+    `relu(e_j - dilate(erode(e_j)))` with `e_j = erode^j(p)`, join the skeleton through the soft union
+    `s + relu(delta - s * delta)`. `open(e_j) = dilate(e_{j+1})` reuses the next scale's erosion, so the
+    whole thing is `2 * (iters + 1)` 3^3 pooling ops (clDice's own form spends three per scale). The
+    erosion is `erode`'s (outside = background). `iters` must reach about half the predicted band's
+    thickness for the skeleton to be thin; the band is 3-9 voxels, so 3-4 is enough -- a thicker blob
+    keeps a residual core, which still lies inside the blob and so costs no precision wherever the blob
+    itself is inside the target band.
+    """
+    e = erode(p)
+    s = F.relu(p - dilate(e))
+    for _ in range(int(iters)):
+        q, e = e, erode(e)
+        d = F.relu(q - dilate(e))
+        s = s + F.relu(d - s * d)
+    return s
+
+
+def skel_precision(p, tgt, wv=None, iters=3, thr=0.5, gate=0.3):
+    """1 - soft-clDice PRECISION: the fraction of the PREDICTION's soft skeleton that lies inside the
+    target band dilated by one voxel, averaged over the channels with any gated skeleton in the batch.
+
+        prec = sum(S * B * m) / (sum(S * m) + eps),   S = soft_skeleton(p),   B = dilate(tgt >= thr),
+        m    = wv * known_within(wv, 1) * [p >= gate]
+
+    The complement of `skel_recall`: recall asks that the target's skeleton be covered (a GAP costs),
+    precision asks that the prediction's skeleton be backed by the target (a SPUR, or a merge BRIDGE
+    outside the band, costs). A prediction that STOPS SHORT keeps its skeleton inside the band and
+    scores ~1 here: stopping short is recall's job, not this term's.
+
+    The band is the target dilated by one voxel so a skeleton a voxel off the target's medial surface
+    (a thin or tilted band) is not charged. `B` is a function of the target within one voxel, so a
+    voxel counts only where that neighbourhood is known (`known_within(wv, 1)`, as `skel_recall` does
+    for its own radius). The GATE `p >= gate` (a hard, detached mask) keeps early-training haze out: a
+    diffuse low-probability field has a large, meaningless soft skeleton everywhere, and scoring it
+    would make this a second, noisy background BCE. A spur above the gate is pushed down until it drops
+    below it, after which the supervised BCE owns it. A channel with no gated skeleton (nothing
+    confident predicted, or no weight) is not averaged in, and a batch with none scores 0.
+    """
+    s = soft_skeleton(p, iters=iters)
+    band = dilate((tgt >= thr).to(p.dtype))
+    m = (p.detach() >= gate).to(p.dtype)
+    if wv is not None:
+        m = m * wv * known_within(wv, 1)
+    sm = s * m
+    d = (0, 2, 3, 4)
+    num, den = (sm * band).sum(d), sm.sum(d)
+    live = (den > 1e-6).to(p.dtype)
+    prec = num / (den + 1e-6)
+    return ((1.0 - prec) * live).sum() / live.sum().clamp_min(1.0)
+
+
 # ------------------------------------------------------------------------ O12 long-range affinity
 
 def _offsets(offsets):
@@ -295,17 +357,20 @@ def affinity_loss(logit, tgt, wv=None, offsets=(8, 16, 32), thr=0.5, fg_only=Tru
 
 # --------------------------------------------------------------------------------- the dispatcher
 
-KEYS = ("excl", "selfcons", "skel", "affinity")
+KEYS = ("excl", "selfcons", "skel", "skel_prec", "affinity")
 
 
 def aux_losses(logit, tgt, wv, layout, w_excl=0.0, w_selfcons=0.0, w_skel=0.0, w_affinity=0.0,
-               cascade=None, cascade_self=None, skel_iters=4, aff_fg_only=True):
+               cascade=None, cascade_self=None, skel_iters=4, aff_fg_only=True, w_skel_prec=0.0,
+               skel_prec_iters=3, skel_prec_gate=0.3):
     """{name: unweighted loss} for every term whose weight is non-zero, plus `aux` = their weighted sum.
 
     `logit` is the FULL head output and `layout` says where each head lives: the probability heads are
     `[:layout.nprob]` and the affinity block is `[layout.i_aff : layout.i_aff + layout.n_aff]`. `tgt` /
     `wv` are the loader's target and weight (the `cout_t` field channels). `cascade` is the CASCADE input
     channel of this step and `cascade_self` (B,) the mask of samples that took the SELF source.
+    `w_skel_prec` weighs the skeleton PRECISION term (`skel_precision`), on the same probability heads,
+    the same level-0 output and so the same rungs as the skeleton recall.
     """
     out, total, np_ = {}, None, layout.nprob
     p = None
@@ -318,10 +383,15 @@ def aux_losses(logit, tgt, wv, layout, w_excl=0.0, w_selfcons=0.0, w_skel=0.0, w
     if w_skel > 0:
         p = torch.sigmoid(logit[:, :np_]) if p is None else p
         out["skel"] = skel_recall(p, tgt[:, :np_], wv[:, :np_] if wv is not None else None, iters=skel_iters)
+    if w_skel_prec > 0:
+        p = torch.sigmoid(logit[:, :np_]) if p is None else p
+        out["skel_prec"] = skel_precision(p, tgt[:, :np_], wv[:, :np_] if wv is not None else None,
+                                          iters=skel_prec_iters, gate=skel_prec_gate)
     if w_affinity > 0 and layout.n_aff:
         out["affinity"] = affinity_loss(logit[:, layout.i_aff:layout.i_aff + layout.n_aff], tgt, wv,
                                         offsets=layout.aff_offsets, fg_only=aff_fg_only)
-    for k, v in (("excl", w_excl), ("selfcons", w_selfcons), ("skel", w_skel), ("affinity", w_affinity)):
+    for k, v in (("excl", w_excl), ("selfcons", w_selfcons), ("skel", w_skel), ("skel_prec", w_skel_prec),
+                 ("affinity", w_affinity)):
         if k in out:
             total = v * out[k] if total is None else total + v * out[k]
     if total is not None:

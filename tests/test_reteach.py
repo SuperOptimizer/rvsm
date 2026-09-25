@@ -281,7 +281,8 @@ def test_the_teacher_set_and_the_continuity_weights_are_not_in_the_fingerprint(s
     base = small_cfg.fingerprint()
     assert replace(small_cfg, teacher_ckpts={"m7": "/w/m7.pth"}).fingerprint() == base
     assert replace(small_cfg, teacher_ckpts={"recto": "a", "m7": "b"}).fingerprint() == base
-    for k in ("loss_skel", "loss_affinity", "loss_ect", "loss_selfcons"):
+    for k in ("loss_skel", "loss_affinity", "loss_ect", "loss_selfcons", "loss_skel_prec", "skel_prec_iters",
+              "skel_prec_gate"):
         assert replace(small_cfg, **{k: 0.5}).fingerprint() == base, k
     assert replace(small_cfg, loss_excl=0.5).fingerprint() != base      # not every loss is free
     # the defaults did not move
@@ -308,6 +309,21 @@ def test_a_resume_logs_the_teacher_and_the_loss_switch(tmp_path, small_cfg):
     o2 = replace(small_cfg).to_json()
     got = RUN.log_switches(out, o2, replace(small_cfg, teacher_ckpts={"m7": "p"}))
     assert got[0]["old"] == ["recto", "m7"] and got[0]["new"] == ["m7"]
+
+
+def test_enabling_the_skeleton_precision_on_a_resume_logs_a_loss_switch(tmp_path, small_cfg):
+    """`loss_skel_prec` is off by default and newer than paris4's config.json: switching it on at a
+    resume is a `loss_switch` from its default 0, also against a config that predates the field."""
+    out = str(tmp_path / "sp")
+    os.makedirs(out)
+    RUN.write_state(out, step=100)
+    old = small_cfg.to_json()
+    assert CFG.Config().loss_skel_prec == 0.0
+    del old["config"]["loss_skel_prec"]                                 # a config.json from before it
+    got = RUN.log_switches(out, old, replace(small_cfg, loss_skel_prec=0.05))
+    assert [r["weights"] for r in got if r["kind"] == "loss_switch"] == \
+        [{"loss_skel_prec": {"old": 0.0, "new": 0.05}}]
+    assert RUN.log_switches(out, old, small_cfg) == []                 # still off: nothing moved
     # the gn_bf16 precision switch; a config.json that predates the field was float32
     o3 = small_cfg.to_json()
     o3["config"].pop("gn_bf16")

@@ -176,6 +176,9 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        # 2026-09-25, paris4: values unchanged for now); the trainer reads them from the
                        # live config and the resume logs a `loss_switch` sched line naming any that moved
                        "loss_skel", "loss_affinity", "loss_ect", "loss_selfcons",
+                       # the skeleton PRECISION term (off by default) and its two knobs: switchable on a
+                       # resume like the continuity terms above (a `loss_switch` line when the weight moves)
+                       "loss_skel_prec", "skel_prec_iters", "skel_prec_gate",
                        # the GroupNorm+SiLU outputs in bf16 under autocast (model.NormAct): it changes
                        # the numerics (the stored activations and the upsample round to bf16), so it is
                        # recorded in config.json and in every checkpoint's cfg, but a resume may flip it
@@ -185,7 +188,7 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
 
 # The loss weights a resume may retune (`run.log_switches` logs a `loss_switch` line when one moved).
 LOSS_SWITCH_FIELDS = ("loss_prob_dice", "loss_pair", "loss_skel", "loss_affinity", "loss_ect",
-                      "loss_selfcons")
+                      "loss_selfcons", "loss_skel_prec")
 
 
 @dataclass
@@ -264,6 +267,10 @@ class Config:
     loss_selfcons: float = 0.1         # cross-rung self-consistency
     loss_skel: float = 0.05            # soft-skeleton (clDice) term
     skel_iters: int = 4                # soft-skeleton erosion iterations
+    loss_skel_prec: float = 0.0        # soft-clDice PRECISION of the prediction's skeleton vs the target
+                                       # band + 1 voxel (spurs / bridges); 0 = off (`losses.skel_precision`)
+    skel_prec_iters: int = 3           # its soft-thinning iterations (2 * (iters + 1) pooling ops)
+    skel_prec_gate: float = 0.3        # only predicted voxels with p >= this are scored (early-training haze)
     loss_affinity: float = 0.1         # multi-offset affinity term
     loss_sdist: float = 1.0            # signed midline distance + thickness
     loss_eikonal: float = 0.1          # |grad d| = 1 on the distance head
