@@ -6,7 +6,8 @@
    5398,
    5057,
    5057
-  ]
+  ],
+  "tier": 0
  },
  {
   "sample": "PHerc0009B",
@@ -15,7 +16,238 @@
    9598,
    7837,
    7837
-  ]
+  ],
+  "tier": 0
+ },
+ {
+  "sample": "PHerc1203",
+  "name": "20250820131727-9.362um-1.2m-113keV-masked",
+  "shape": [
+   18977,
+   6844,
+   6844
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0358",
+  "name": "20250821151737-9.362um-1.2m-113keV-masked",
+  "shape": [
+   14744,
+   7783,
+   7783
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0813",
+  "name": "20250821151723-9.362um-1.2m-113keV-masked",
+  "shape": [
+   16993,
+   7947,
+   7947
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0826",
+  "name": "20250821151701-9.362um-1.2m-113keV-masked",
+  "shape": [
+   16920,
+   8169,
+   8169
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc1545",
+  "name": "20250821151648-9.362um-1.2m-113keV-masked",
+  "shape": [
+   20961,
+   7506,
+   7506
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0211",
+  "name": "20250821151803-9.362um-1.2m-113keV-masked",
+  "shape": [
+   19416,
+   7948,
+   7948
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0257",
+  "name": "20250821151750-9.362um-1.2m-113keV-masked",
+  "shape": [
+   18872,
+   8388,
+   8388
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0191",
+  "name": "20250821151635-9.362um-1.2m-113keV-masked",
+  "shape": [
+   18977,
+   8387,
+   8387
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc1218",
+  "name": "20250521120456-8.640um-1.2m-116keV-masked",
+  "shape": [
+   23247,
+   7593,
+   7593
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0125",
+  "name": "20250821151825-9.362um-1.2m-113keV-masked",
+  "shape": [
+   20840,
+   8387,
+   8387
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc1447",
+  "name": "20250521151220-8.640um-1.2m-116keV-masked",
+  "shape": [
+   24297,
+   8343,
+   8343
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0268",
+  "name": "20251110183117-8.640um-1.2m-116keV-masked",
+  "shape": [
+   14833,
+   12145,
+   12145
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0800",
+  "name": "20250521135224-8.640um-1.2m-116keV-masked",
+  "shape": [
+   24298,
+   9867,
+   9867
+  ],
+  "tier": 1
+ },
+ {
+  "sample": "PHerc0490B",
+  "name": "20250521151215-8.640um-1.2m-116keV-masked",
+  "shape": [
+   10648,
+   8343,
+   8343
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0483B",
+  "name": "20251124083638-8.640um-1.2m-116keV-masked",
+  "shape": [
+   11880,
+   8343,
+   8343
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0846A",
+  "name": "20250728152254-9.362um-1.2m-113keV-masked",
+  "shape": [
+   14019,
+   7726,
+   7726
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0846B",
+  "name": "20250804142305-9.362um-1.2m-113keV-masked",
+  "shape": [
+   13926,
+   7859,
+   7859
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0490A",
+  "name": "20250521151210-8.640um-1.2m-116keV-masked",
+  "shape": [
+   11698,
+   9101,
+   9101
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0175A",
+  "name": "20250521115057-8.640um-1.2m-116keV-masked",
+  "shape": [
+   12748,
+   9363,
+   9363
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0306B",
+  "name": "20250521133212-8.640um-1.2m-116keV-masked",
+  "shape": [
+   15898,
+   8849,
+   8849
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0483A",
+  "name": "20250521140913-8.640um-1.2m-116keV-masked",
+  "shape": [
+   15898,
+   8849,
+   8849
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0343",
+  "name": "20250521140437-8.640um-1.2m-116keV-masked",
+  "shape": [
+   17998,
+   8595,
+   8595
+  ],
+  "tier": 2
+ },
+ {
+  "sample": "PHerc0175B",
+  "name": "20250521125822-8.640um-1.2m-116keV-masked",
+  "shape": [
+   15897,
+   9613,
+   9613
+  ],
+  "tier": 2
  },
  {
   "sample": "PHerc1451",
@@ -24,7 +256,8 @@
    17998,
    5815,
    5815
-  ]
+  ],
+  "tier": 3
  },
  {
   "sample": "PHerc0172",
@@ -33,6 +266,527 @@
    20820,
    6700,
    9100
-  ]
+  ],
+  "tier": 3
+ },
+ {
+  "sample": "PHerc0814",
+  "name": "20250804134230-9.362um-1.2m-113keV-masked",
+  "shape": [
+   19390,
+   5784,
+   5784
+  ],
+  "tier": 3
+ },
+ {
+  "sample": "PHerc0139",
+  "name": "20250728140407-9.362um-1.2m-113keV-masked",
+  "shape": [
+   20974,
+   6621,
+   6621
+  ],
+  "tier": 3
+ },
+ {
+  "sample": "PHerc0841",
+  "name": "20250821151531-9.366um-1.2m-113keV-masked",
+  "shape": [
+   19400,
+   7703,
+   7703
+  ],
+  "tier": 3
+ },
+ {
+  "sample": "PHerc0500P2",
+  "name": "20250820143440-9.362um-1.2m-113keV-masked",
+  "shape": [
+   7057,
+   4196,
+   4196
+  ],
+  "tier": 3
+ },
+ {
+  "sample": "PHerc0139",
+  "name": "20260413113053-1.129um-0.2m-59keV-masked",
+  "shape": [
+   19297,
+   35971,
+   32318
+  ],
+  "level": 3,
+  "shape_level": [
+   2413,
+   4497,
+   4040
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0139",
+  "name": "20250822062710-2.403um-0.2m-77keV-masked",
+  "shape": [
+   15137,
+   26061,
+   26061
+  ],
+  "level": 2,
+  "shape_level": [
+   3785,
+   6516,
+   6516
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0139",
+  "name": "20260319133050-2.403um-0.2m-77keV-masked",
+  "shape": [
+   15137,
+   26061,
+   26061
+  ],
+  "level": 2,
+  "shape_level": [
+   3785,
+   6516,
+   6516
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0139",
+  "name": "20260319133554-2.403um-0.2m-77keV-masked",
+  "shape": [
+   19368,
+   26105,
+   26105
+  ],
+  "level": 2,
+  "shape_level": [
+   4842,
+   6527,
+   6527
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0139",
+  "name": "20250820105138-2.403um-0.2m-77keV-masked",
+  "shape": [
+   19393,
+   26105,
+   26105
+  ],
+  "level": 2,
+  "shape_level": [
+   4849,
+   6527,
+   6527
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0139",
+  "name": "20260102150214-2.399um-0.2m-78keV-masked",
+  "shape": [
+   76953,
+   26511,
+   26511
+  ],
+  "level": 2,
+  "shape_level": [
+   19239,
+   6628,
+   6628
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc1203",
+  "name": "20260319130212-2.403um-0.2m-77keV-masked",
+  "shape": [
+   15137,
+   26493,
+   26493
+  ],
+  "level": 2,
+  "shape_level": [
+   3785,
+   6624,
+   6624
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0846A",
+  "name": "20260319102732-2.403um-0.2m-77keV-masked",
+  "shape": [
+   15137,
+   29587,
+   29587
+  ],
+  "level": 2,
+  "shape_level": [
+   3785,
+   7397,
+   7397
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0343P",
+  "name": "20260304131111-2.215um-0.4m-111keV-masked",
+  "shape": [
+   20714,
+   13155,
+   13155
+  ],
+  "level": 2,
+  "shape_level": [
+   5179,
+   3289,
+   3289
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0500P2",
+  "name": "20250821110041-0.550um-0.1m-65keV-masked",
+  "shape": [
+   12320,
+   10813,
+   3891
+  ],
+  "level": 4,
+  "shape_level": [
+   770,
+   676,
+   244
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0500P2",
+  "name": "20250526151718-2.215um-0.4m-111keV-masked",
+  "shape": [
+   28096,
+   18209,
+   18209
+  ],
+  "level": 2,
+  "shape_level": [
+   7024,
+   4553,
+   4553
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0500P2",
+  "name": "20250528085330-4.317um-1.2m-111keV-masked",
+  "shape": [
+   15838,
+   9423,
+   9423
+  ],
+  "level": 1,
+  "shape_level": [
+   7919,
+   4712,
+   4712
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc1451",
+  "name": "20260319101107-2.399um-0.2m-78keV-masked",
+  "shape": [
+   59944,
+   20811,
+   20811
+  ],
+  "level": 2,
+  "shape_level": [
+   14986,
+   5203,
+   5203
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHercParis4",
+  "name": "20260323153942-2.400um-0.2m-137keV-masked",
+  "shape": [
+   6625,
+   8431,
+   8431
+  ],
+  "level": 2,
+  "shape_level": [
+   1657,
+   2108,
+   2108
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHercParis4",
+  "name": "20260608103018-1.129um-0.2m-78keV-masked",
+  "shape": [
+   59969,
+   36006,
+   32354
+  ],
+  "level": 3,
+  "shape_level": [
+   7497,
+   4501,
+   4045
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHercParis4",
+  "name": "20260411134726-2.400um-0.2m-78keV-masked",
+  "shape": [
+   75784,
+   32693,
+   32693
+  ],
+  "level": 2,
+  "shape_level": [
+   18946,
+   8174,
+   8174
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHercMANBp",
+  "name": "20260427100434-1.129um-0.2m-59keV-masked",
+  "shape": [
+   35024,
+   22137,
+   20286
+  ],
+  "level": 3,
+  "shape_level": [
+   4378,
+   2768,
+   2536
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc1667",
+  "name": "20260323082859-1.129um-0.2m-59keV-masked",
+  "shape": [
+   42209,
+   22122,
+   20276
+  ],
+  "level": 3,
+  "shape_level": [
+   5277,
+   2766,
+   2535
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0814",
+  "name": "20260521123630-1.129um-0.2m-59keV-masked",
+  "shape": [
+   46721,
+   22078,
+   20284
+  ],
+  "level": 3,
+  "shape_level": [
+   5841,
+   2760,
+   2536
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHercMANBp",
+  "name": "20251216152116-2.399um-0.2m-78keV-masked",
+  "shape": [
+   17148,
+   12577,
+   12577
+  ],
+  "level": 2,
+  "shape_level": [
+   4287,
+   3145,
+   3145
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0332",
+  "name": "20251211183505-2.399um-0.2m-78keV-masked",
+  "shape": [
+   33592,
+   15761,
+   15761
+  ],
+  "level": 2,
+  "shape_level": [
+   8398,
+   3941,
+   3941
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc1667",
+  "name": "20251217075048-2.399um-0.2m-78keV-masked",
+  "shape": [
+   37076,
+   15229,
+   15229
+  ],
+  "level": 2,
+  "shape_level": [
+   9269,
+   3808,
+   3808
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHercMAN5",
+  "name": "20260311104824-2.399um-0.2m-78keV-masked",
+  "shape": [
+   31640,
+   17495,
+   17495
+  ],
+  "level": 2,
+  "shape_level": [
+   7910,
+   4374,
+   4374
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0841",
+  "name": "20260319124803-2.403um-0.2m-77keV-masked",
+  "shape": [
+   15121,
+   30469,
+   30469
+  ],
+  "level": 2,
+  "shape_level": [
+   3781,
+   7618,
+   7618
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc1299",
+  "name": "20260309130042-2.399um-0.2m-78keV-masked",
+  "shape": [
+   49233,
+   20579,
+   20579
+  ],
+  "level": 2,
+  "shape_level": [
+   12309,
+   5145,
+   5145
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0009B",
+  "name": "20250820154339-2.401um-0.3m-77keV-masked",
+  "shape": [
+   29112,
+   28259,
+   28259
+  ],
+  "level": 2,
+  "shape_level": [
+   7278,
+   7065,
+   7065
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0009B",
+  "name": "20260319104112-2.401um-0.3m-77keV-masked",
+  "shape": [
+   29112,
+   28259,
+   28259
+  ],
+  "level": 2,
+  "shape_level": [
+   7278,
+   7065,
+   7065
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHerc0814",
+  "name": "20260309142202-2.399um-0.2m-78keV-masked",
+  "shape": [
+   74568,
+   23891,
+   23891
+  ],
+  "level": 2,
+  "shape_level": [
+   18642,
+   5973,
+   5973
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHercMANB",
+  "name": "20260323091048-2.399um-0.2m-78keV-masked",
+  "shape": [
+   72681,
+   26723,
+   26723
+  ],
+  "level": 2,
+  "shape_level": [
+   18171,
+   6681,
+   6681
+  ],
+  "tier": 4
+ },
+ {
+  "sample": "PHercParis3",
+  "name": "20260427095331-2.400um-0.2m-78keV-masked",
+  "shape": [
+   68417,
+   42403,
+   42403
+  ],
+  "level": 2,
+  "shape_level": [
+   17105,
+   10601,
+   10601
+  ],
+  "tier": 4
  }
 ]

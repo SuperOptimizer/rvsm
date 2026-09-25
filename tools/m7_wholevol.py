@@ -76,15 +76,20 @@ def load_vols(path=None):
     path = path or os.path.join(HOME, "volumes.json")
     out = []
     for v in json.load(open(path)):
-        sample, name, shape = v["sample"], v["name"], [int(s) for s in v["shape"]]
-        pitch = float(name.split("-")[1].replace("um", ""))
-        out.append(dict(sample=sample, name=name, shape=shape, pitch=pitch, stem=f"{sample}_{name.split('-')[0]}",
+        sample, name = v["sample"], v["name"]
+        k = int(v.get("level", 0))            # the CT pyramid level m7 runs at (0 for the ~8-9 um scans)
+        shape0 = [int(s) for s in v["shape"]]
+        shape = [int(s) for s in v.get("shape_level", shape0)]
+        native = float(name.split("-")[1].replace("um", ""))
+        stem = f"{sample}_{name.split('-')[0]}" + (f"_L{k}" if k else "")
+        out.append(dict(sample=sample, name=name, level=k, shape=shape, shape0=shape0, native_pitch=native,
+                        pitch=native * (1 << k), stem=stem, tier=v.get("tier"),
                         url=f"{BASE_URL}/{sample}/volumes/{name}.zarr"))
     return out
 
 
 def store_name(v):
-    return f"{v['name'].split('-')[0]}-surface-{RUN_TS}-surface-m7-L0-prob.zarr"
+    return f"{v['name'].split('-')[0]}-surface-{RUN_TS}-surface-m7-L{v.get('level', 0)}-prob.zarr"
 
 
 def remote_dir(v):
@@ -124,9 +129,17 @@ class Codec:
         self.bound = int(L.ENCODE_BOUND)
         self.tls = threading.local()
 
-    def decode_into(self, src: np.ndarray, dst: np.ndarray):
+    def decode_into(self, src: np.ndarray, dst: np.ndarray, smooth: float = 0.0):
+        """plain decode, or (smooth > 0) volcomp's decode-only deblocking at that strength, gated face
+        filter with the zero guard (masked-air zeros kept) -- what VolcompCodec does under
+        set_read_smoothing(smooth); a no-op below q4 by volcomp's own rule."""
         assert dst.flags.c_contiguous and dst.nbytes == CH ** 3
-        st = self._L.volcomp_shim_decode(src.ctypes.data, src.nbytes, dst.ctypes.data, dst.nbytes)
+        if smooth > 0:
+            flags = int(self.L.DEBLOCK_ZERO_GUARD) | int(self.L.SMOOTH_GATED)
+            st = self._L.volcomp_shim_decode_smooth(src.ctypes.data, src.nbytes, dst.ctypes.data, dst.nbytes,
+                                                    ctypes.c_float(smooth), flags)
+        else:
+            st = self._L.volcomp_shim_decode(src.ctypes.data, src.nbytes, dst.ctypes.data, dst.nbytes)
         if st != 0:
             raise RuntimeError(f"volcomp decode status {st}")
 
@@ -141,6 +154,14 @@ class Codec:
         if st != 0:
             raise RuntimeError(f"volcomp encode status {st}")
         return buf.raw[:got.value]
+
+
+def _vc_version():
+    try:
+        L = _vc()
+        return L._L.volcomp_shim_version().decode()
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
 def volcomp_build():
@@ -205,7 +226,7 @@ def write_shard(path, block: np.ndarray, side: int, codec: Codec, pool: ThreadPo
     return off + len(ib) + 4
 
 
-def read_block(arr_dir, shape, side, lo, hi, codec: Codec, pool=None, out=None):
+def read_block(arr_dir, shape, side, lo, hi, codec: Codec, pool=None, out=None, smooth=0.0):
     """Decode the voxel box [lo, hi) of a local sharded volcomp array (missing shard/chunk = 0)."""
     lo, hi = np.asarray(lo), np.asarray(hi)
     out = np.zeros(tuple(hi - lo), np.uint8) if out is None else out
@@ -240,7 +261,7 @@ def read_block(arr_dir, shape, side, lo, hi, codec: Codec, pool=None, out=None):
         if o == EMPTY:
             return
         tmp = np.empty((CH, CH, CH), np.uint8)
-        codec.decode_into(buf[int(o):int(o) + int(nb)], tmp)
+        codec.decode_into(buf[int(o):int(o) + int(nb)], tmp, smooth)
         g0 = np.array([a, b, c]) * CH
         s0 = np.maximum(lo, g0)
         s1 = np.minimum(hi, g0 + CH)
@@ -281,11 +302,12 @@ class CTSource:
     """Level-0 CT shards of one volume, downloaded per shard row into WORK/ct/<stem>/c/z/y/x (404 -> an
     `.absent` marker), decoded per 128-z slab, evicted once the window rows have passed them."""
 
-    def __init__(self, v, codec: Codec, pool: ThreadPoolExecutor, conns=16):
+    def __init__(self, v, codec: Codec, pool: ThreadPoolExecutor, conns=16, smooth=0.0):
         self.v, self.codec, self.pool = v, codec, pool
+        self.smooth = float(smooth)
         self.shape = v["shape"]
         self.dir = os.path.join(WORK, "ct", v["stem"])
-        self.url = v["url"] + "/0"
+        self.url = v["url"] + f"/{v.get('level', 0)}"
         self.tls = threading.local()
         self.conns = conns
         self.slabs = {}          # slab index -> np.uint8 (128, Y, X)
@@ -359,7 +381,7 @@ class CTSource:
         z0, z1 = i * CH, min((i + 1) * CH, Z)
         t = time.time()
         a = read_block(os.path.join(self.dir), self.shape, SH, (z0, 0, 0), (z1, self.shape[1], self.shape[2]),
-                       self.codec, self.pool)
+                       self.codec, self.pool, smooth=self.smooth)
         self.dec_s += time.time() - t
         with self.lock:
             self.projs[i] = a.max(axis=0) > 0
@@ -529,7 +551,7 @@ def write_row_shards(v, r, stage, codec, pool, stats):
     return nbytes
 
 
-def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
+def run_unit(v, r0, r1, m7, codec, pool, stride, wstat, ct_smooth=0.0):
     """One unit = shard rows [r0, r1) of volume v (only the not-done tail of them).
 
     Per window row s (z extent [s, s+W)), y-row by y-row: windows add p * w into G (W, W, X) fp32 on the
@@ -552,17 +574,39 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
     cap = max(s + W - nxt[s] for s in zs if nxt[s] < s + W) if len(zs) > 1 else 1
     wyt = {t: torch.from_numpy(wy[t]).to(dev) for t in ys}
     wxt = {u: torch.from_numpy(wx[u]).to(dev) for u in xs}
-    ct = CTSource(v, codec, pool)
+    ct = CTSource(v, codec, pool, smooth=ct_smooth)
     G = torch.zeros((W, W, X), dtype=torch.float32, device=dev)
     c_bytes = cap * Y * X * 2
     cdev = dev if c_bytes <= int(os.environ.get("M7W_CARRY_GPU_MAX", str(8 << 30))) else torch.device("cpu")
-    C = torch.zeros((cap, Y, X), dtype=torch.float16, device=cdev)
-    if cdev.type == "cpu":
-        C = C.pin_memory()
+    # the z-carry, one contiguous block per y-row (so a slice [:k] is contiguous and its host <-> GPU
+    # copies are truly asynchronous when the carry lives in pinned host memory)
+    dys = [(ys[j + 1] if j + 1 < len(ys) else ys[j] + W) - ys[j] for j in range(len(ys))]
+    pin = cdev.type == "cpu"
+    Cj = [torch.zeros((cap, dys[j], X), dtype=torch.float16, device=cdev, pin_memory=pin) for j in range(len(ys))]
+    # pinned staging for the CT strips (in) and the finished uint8 slices (out), double-buffered
+    pin_in = [torch.empty((W, W, X), dtype=torch.uint8, pin_memory=True) for _ in (0, 1)]
+    ev_in = [None, None]
+    pin_out = [torch.empty((W * W * X,), dtype=torch.uint8, pin_memory=True) for _ in (0, 1)]
+    pending = []                               # (event, pinned view, za, zb, t, d) not yet in the stage
+    nout = [0]
     clen = 0                                   # C holds z in [s, s + clen)
     c_live = np.zeros(len(ys), bool)           # C[:, y-slice j] may be non-zero (else it is exactly 0)
     gid = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
-    stages = [np.memmap(os.path.join(WORK, f"stage_{gid}_{b}.u8"), np.uint8, "w+", shape=(SH, Y, X)) for b in (0, 1)]
+    stage_path = [os.path.join(WORK, f"stage_{gid}_{b}.u8") for b in (0, 1)]
+    stages = [None, None]
+    stage_row = [None, None]
+
+    def stage_for(r):
+        """the staging buffer of shard row r: a FRESH sparse file per row (holes read as 0, so air is never
+        written and the disk holds only the scroll's footprint)."""
+        b = r % 2
+        if stage_row[b] != r:
+            stages[b] = None
+            if os.path.exists(stage_path[b]):
+                os.remove(stage_path[b])
+            stages[b] = np.memmap(stage_path[b], np.uint8, "w+", shape=(SH, Y, X))
+            stage_row[b] = r
+        return stages[b]
     writer = [None]
     stats = dict(win=0, skip=0, gpu_s=0.0, host_s=0.0, fin_s=0.0, enc_s=0.0, strip_wait_s=0.0, wait_writer_s=0.0,
                  t0=time.time(), vox=0)
@@ -573,11 +617,17 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
 
     def put_stage(z0, z1, t, d, arr):
         """host uint8 (z1-z0, d, X) for z in [z0, z1) (inside the unit), y in [t, t+d)."""
+        nz_x = np.flatnonzero(arr.any(axis=(0, 1)))
+        if nz_x.size == 0:
+            for r in range(z0 // SH, -(-z1 // SH)):
+                stage_for(r)                       # the row's buffer exists (and is fresh) even if all air
+            return
+        xa, xb = int(nz_x[0]), int(nz_x[-1]) + 1
         z = z0
         while z < z1:
             r = z // SH
             e = min(z1, (r + 1) * SH)
-            stages[r % 2][z - r * SH:e - r * SH, t:t + d, :] = arr[z - z0:e - z0]
+            stage_for(r)[z - r * SH:e - r * SH, t:t + d, xa:xb] = arr[z - z0:e - z0, :, xa:xb]
             z = e
 
     def row_done_check(zb):
@@ -589,11 +639,20 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
                 if writer[0] is not None:
                     writer[0].join()
                 stats["wait_writer_s"] += time.time() - tw
-                writer[0] = threading.Thread(target=flush_row, args=(r, stages[r % 2]), daemon=True)
+                writer[0] = threading.Thread(target=flush_row, args=(r, stage_for(r)), daemon=True)
                 writer[0].start()
                 flushed.add(r)
     flushed = set()
     strip_ex = ThreadPoolExecutor(1)
+
+    def drain(keep):
+        """write finished slices to the stage until at most `keep` are outstanding (oldest first)."""
+        while len(pending) > keep:
+            ev, po, a_, b_, t_, d_ = pending.pop(0)
+            tw = time.time()
+            ev.synchronize()
+            stats["drain_s"] = stats.get("drain_s", 0.0) + time.time() - tw
+            put_stage(a_, b_, t_, d_, po.numpy())
     wstat.update(vol=v["stem"], unit=[r0, r1], rows_total=len(rows), row_i=0, started=time.time())
     log(f"[unit] {v['stem']} rows {r0}..{r1 - 1} (from {ra}): z {Z0}..{Z1}, {len(rows)} window rows, "
         f"{len(ys)}x{len(xs)} windows per row, carry {cap} slices on {cdev.type} ({c_bytes / 2**30:.1f} GiB)")
@@ -616,10 +675,18 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
         def row_windows(t):
             return [u for u in xs if ii[t + W, u + W] - ii[t, u + W] - ii[t + W, u] + ii[t, u] > 0]
 
-        def get_strip(t):
-            return np.ascontiguousarray(ct.block(s, s + W, t, t + W, 0, X))
+        def get_strip(k, t):
+            """CT strip of y-row t into pinned buffer k % 2, and its per-column any prefix sum (CPU)."""
+            b = k % 2
+            if ev_in[b] is not None:
+                ev_in[b].synchronize()          # that buffer's previous upload has finished
+            a = pin_in[b].numpy()
+            np.copyto(a, ct.block(s, s + W, t, t + W, 0, X))
+            anyx = a.any(axis=(0, 1))
+            cs = np.concatenate([[0], np.cumsum(anyx, dtype=np.int64)])
+            return b, cs
         live = [t for t in ys if row_windows(t)]
-        fut = strip_ex.submit(get_strip, live[0]) if live else None
+        fut = strip_ex.submit(get_strip, 0, live[0]) if live else None
         for j, t in enumerate(ys):
             t_next = ys[j + 1] if j + 1 < len(ys) else t + W
             d = t_next - t
@@ -628,13 +695,13 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
             sg = None
             if cand:
                 tw = time.time()
-                strip = fut.result()
+                b, cs = fut.result()
                 stats["strip_wait_s"] += time.time() - tw
                 k = live.index(t)
-                fut = strip_ex.submit(get_strip, live[k + 1]) if k + 1 < len(live) else None
-                sg = torch.from_numpy(strip).to(dev)
-                anyx = (sg.amax(dim=(0, 1)) > 0).int()
-                cs = torch.cat([torch.zeros(1, dtype=torch.int64, device=dev), torch.cumsum(anyx, 0)]).cpu()
+                sg = pin_in[b].to(dev, non_blocking=True)
+                ev_in[b] = torch.cuda.Event()
+                ev_in[b].record(m7.stream)
+                fut = strip_ex.submit(get_strip, k + 1, live[k + 1]) if k + 1 < len(live) else None
                 for u in xs:
                     if int(cs[u + W]) - int(cs[u]) == 0:
                         nskip += 1
@@ -652,28 +719,36 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
             if t < g_end or (clen and c_live[j]):
                 blk = G[:, :d, :]
                 if clen and c_live[j]:
-                    blk[:clen] += C[:clen, t:t + d, :].to(dev, torch.float32)
+                    blk[:clen] += Cj[j][:clen].to(dev, torch.float32, non_blocking=True)
                 if zb > za:
                     if sg is not None:
                         q = (blk[za - s:zb - s] * 255.0).round_().clamp_(0, 255).to(torch.uint8)
                         q.masked_fill_(sg[za - s:zb - s, :d, :] == 0, 0)
-                        put_stage(za, zb, t, d, q.cpu().numpy())
+                        drain(1)                   # the pinned buffer about to be reused is written out
+                        po = pin_out[nout[0] % 2][:q.numel()].view(q.shape)
+                        nout[0] += 1
+                        po.copy_(q, non_blocking=True)
+                        ev = torch.cuda.Event()
+                        ev.record(m7.stream)
+                        pending.append((ev, po, za, zb, t, d))
                     else:
                         put_stage(za, zb, t, d, np.zeros((zb - za, d, X), np.uint8))
                 if dz < W:
-                    C[:W - dz, t:t + d, :] = blk[dz:].to(cdev, torch.float16)
+                    Cj[j][:W - dz].copy_(blk[dz:].to(torch.float16), non_blocking=True)
                     c_live[j] = True
             else:
                 if zb > za:
                     put_stage(za, zb, t, d, np.zeros((zb - za, d, X), np.uint8))
                 if dz < W and c_live[j]:
-                    C[:W - dz, t:t + d, :] = 0
+                    m7.stream.synchronize()        # no copy into this block is in flight
+                    Cj[j][:W - dz].zero_()
                 c_live[j] = False
             if j + 1 < len(ys):
                 G[:, :W - d] = G[:, d:].clone()
                 G[:, W - d:] = 0
             stats["host_s"] += time.time() - th
         clen = W - dz
+        drain(0)
         m7.stream.synchronize()
         tf = time.time()
         if zb > za:
@@ -690,14 +765,17 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
                      ct_dl_s=ct.dl_s, ct_dec_s=ct.dec_s, ct_bytes=ct.bytes, t=time.time())
         log(f"[zrow] {v['stem']} {i + 1}/{len(rows)} z={s}: {nwin} win {nskip} air in {time.time() - tr:.0f}s "
             f"({nwin / max(time.time() - tr, 1e-9):.2f} win/s); unit {stats['vox'] / max(el, 1e-9) / 1e6:.1f} "
-            f"Mvox/s out, gpu {stats['gpu_s']:.0f}s blend {stats['host_s']:.0f}s strip_wait "
+            f"Mvox/s out, enqueue {stats['gpu_s']:.0f}s fin {stats['host_s']:.0f}s gpu_wait {stats.get('drain_s', 0):.0f}s strip_wait "
             f"{stats['strip_wait_s']:.0f}s writer_wait {stats['wait_writer_s']:.0f}s (enc {stats['enc_s']:.0f}) "
             f"ct dl {ct.dl_s:.0f}s dec {ct.dec_s:.0f}s")
     if writer[0] is not None:
         writer[0].join()
     ctx.__exit__(None, None, None)
     strip_ex.shutdown()
-    del stages
+    stages[0] = stages[1] = None
+    for pth in stage_path:
+        if os.path.exists(pth):
+            os.remove(pth)
     ct.keep_from(10 ** 9)
 
 
@@ -710,7 +788,8 @@ def volume_params(v, stride, plan):
     import tensorrt as trt
     rt = trt.Runtime(trt.Logger(trt.Logger.ERROR))
     w = int(rt.deserialize_cuda_engine(open(plan, "rb").read()).get_tensor_shape("x")[-1])
-    rec = {"window": w, "stride": int(stride), "plan": plan, "t": time.time()}
+    rec = {"window": w, "stride": int(stride), "plan": plan, "t": time.time(),
+           "ct_smooth": float(os.environ.get("M7W_CT_SMOOTH", "0") or 0)}
     os.makedirs(state_dir(v), exist_ok=True)
     tmp = f"{p}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
@@ -803,7 +882,7 @@ def cmd_worker(a):
         global W
         W = int(prm["window"])
         assert W == m7.w, (W, m7.w)
-        run_unit(v, r0, r1, m7, codec, pool, int(prm["stride"]), wstat)
+        run_unit(v, r0, r1, m7, codec, pool, int(prm["stride"]), wstat, float(prm.get("ct_smooth", 0.0)))
         os.remove(cpath)
     stop.set()
 
@@ -832,7 +911,7 @@ def level_meta(shape, side):
             "dimension_names": ["z", "y", "x"]}
 
 
-def write_meta(v, stride, plan):
+def write_meta(v, stride, plan, ct_smooth=0.0):
     root = store_dir(v)
     levels = []
     for k in range(NLEV):
@@ -866,12 +945,17 @@ def write_meta(v, stride, plan):
                           "blend": "separable Gaussian sigma=w/6, normalised over the whole-volume window grid",
                           "normalisation": {"clip": [CLO, CHI], "mean": MEAN, "std": STD},
                           "output": "softmax foreground channel (surface)", "air_windows": "skipped (all-zero CT)",
+                          "ct_decode_smooth": ct_smooth,
+                          "ct_decode": ("volcomp_decode_smooth strength %g, gated, zero guard" % ct_smooth) if ct_smooth
+                          else "plain volcomp decode (no deblocking)",
                           "tta": 1},
-            "source_volume": v["url"] + "/", "source_level": 0, "source_shape": v["shape"],
-            "native_voxel_size_um": v["pitch"], "resampled": False, "resample_scale": 1.0,
+            "source_volume": v["url"] + "/", "source_level": v.get("level", 0),
+            "source_shape": v.get("shape0", v["shape"]), "source_level_shape": v["shape"],
+            "native_voxel_size_um": v.get("native_pitch", v["pitch"]), "inference_voxel_size_um": v["pitch"],
+            "rung_voxel_size_um": v["pitch"], "resampled": False, "resample_scale": 1.0,
             "shape": v["shape"], "levels": levels,
             "encoding": {"name": "volcomp q", "q": Q, "codec_chain": ["volcomp"], "inner_chunk": CH,
-                         "volcomp_build_sha256_16": volcomp_build(),
+                         "volcomp_build_sha256_16": volcomp_build(), "volcomp_version": _vc_version(),
                          "volume_compressor": "github.com/SuperOptimizer/volume-compressor main f31b0e2"},
             "produced_by": "github.com/SuperOptimizer/rvsm tools/m7_wholevol.py",
             "commit": os.environ.get("M7W_COMMIT", "unknown"),
@@ -1010,7 +1094,7 @@ def cmd_finisher(a):
                 prm = json.load(open(os.path.join(state_dir(v), "params.json")))
                 global W
                 W = int(prm["window"])
-                write_meta(v, int(prm["stride"]), prm["plan"])
+                write_meta(v, int(prm["stride"]), prm["plan"], float(prm.get("ct_smooth", 0.0)))
                 open(os.path.join(state_dir(v), "levels.done"), "w").close()
                 log(f"[finish] {v['stem']}: levels 4-7 + metadata in {time.time() - t:.0f}s")
             files, total, el = upload_store(v)
