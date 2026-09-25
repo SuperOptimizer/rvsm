@@ -349,6 +349,88 @@ def _best_dice(hp, ha):
     return float(d[j]), j / float(len(hp))
 
 
+BAND_RUNGS = (2, 3)       # the rungs the recto BAND metrics (`dice_recto_r2_thin` ...) are scored at
+BAND_REACH = 2            # a thinned-reference voxel is COVERED when a student voxel is this close
+TOPO_HEADS = {2: ("recto", "verso"), 4: ("recto",)}   # rung -> heads the continuity metrics score
+TOPO_MARGIN, TOPO_BAND = 8, 6    # betti0: interior crop and band around the reference (`compare_stores`)
+NBAND, NTOPO = 6, 5              # lengths of the two parts of a `_sheet_sums` vector
+
+
+def _label26(m):
+    """26-connected component labels of the bool (B, Z, Y, X) mask `m` (0 off it): `edt.label` on the
+    GPU, scipy on the CPU (the torch iteration `edt.label` falls back to there is far slower)."""
+    if m.is_cuda:
+        from rvsm import edt as E
+        return E.label(m)
+    from scipy import ndimage as ndi
+    st = np.ones((3, 3, 3), np.uint8)
+    return torch.from_numpy(np.stack([ndi.label(v, structure=st)[0] for v in m.numpy()]).astype(np.int32))
+
+
+def _ncomp(m):
+    """Number of 26-connected components of the bool (B, Z, Y, X) mask `m`."""
+    if not bool(m.any()):
+        return 0
+    lab = _label26(m)
+    return int(sum(torch.unique(lab[b][m[b]]).numel() for b in range(m.shape[0])))
+
+
+def _sheet_sums(p, t, w, thr=0.5, band=True, topo=False):
+    """Voxel sums of the BAND and CONTINUITY metrics of one head of one window, for a reference that
+    can be a WIDE soft band (m7's 9.6 um output upsampled 4x) against a student that draws thin sharp
+    sheets, where plain dice caps near 0.27 whatever the student does. `p`, `t`, `w` are (B, Z, Y, X)
+    probability, target and weight of the one channel; only voxels with weight > 0 are looked at.
+
+    s = p >= thr (the student sheet, at the 0.5 threshold of `dice` -- the best threshold is only known
+    after pooling), ref = t >= 0.5, thin = the medial surface of ref (`targets.medial_torch`, exact
+    Euclidean), dil(.) = one 26-neighbour dilation (3^3 max-pool), cov = thin voxels within
+    `BAND_REACH` (Euclidean, `edt.edt2`) of s. With `band`, the first `NBAND` entries are
+      (|s & dil(thin)| + |thin & dil(s)|, |s| + |thin|)   -> dice_thin, a 1-voxel TOLERANT dice
+      (|cov|, |thin|)                                     -> recall_band
+      (|s & dil(ref)|, |s|)                               -> precision_band
+    With `topo`, `NTOPO` more -- the store analogues of `evalsurf`'s mesh-walk continuity / ERL (which
+    need tifxyz meshes the eval grid does not have) and `compare_stores`' betti0 error:
+      (|cov & ~dil(thin & ~cov)|, |cov|)  -> cont: covered medial voxels whose medial neighbours are
+                                             ALL covered (`continuity_one` with the medial surface as
+                                             the grid)
+      (sum over the 26-connected pieces of cov of size^2, |thin|)
+                                          -> erl: the expected size (medial voxels) of the covered piece
+                                             holding a medial voxel drawn uniformly (`compare_stores`'
+                                             erl_vox, on the exact medial surface)
+      |b0(s & B) - b0(ref & B)|           -> betti0: B = the interior (`TOPO_MARGIN` cropped) within
+                                             `TOPO_BAND` voxels of ref, 26-connected components
+    as a float64 CPU vector."""
+    from rvsm import edt as E
+    from rvsm.targets import medial_torch
+    k = w > 0
+    s = (p >= thr) & k
+    ref = (t >= 0.5) & k
+    thin = medial_torch(ref, cap=16) & k
+
+    def dil(m):
+        return F.max_pool3d(m.float().unsqueeze(1), 3, stride=1, padding=1).squeeze(1) > 0
+    cov = thin & (E.edt2(s, indices=False, cap=BAND_REACH)[0] <= BAND_REACH * BAND_REACH)
+    v = []
+    if band:
+        v += [(s & dil(thin)).sum() + (thin & dil(s)).sum(), s.sum() + thin.sum(),
+              cov.sum(), thin.sum(), (s & dil(ref)).sum(), s.sum()]
+    if topo:
+        v += [(cov & ~dil(thin & ~cov)).sum(), cov.sum()]
+        l2 = 0.0
+        if bool(cov.any()):
+            lab = _label26(cov)
+            for b in range(lab.shape[0]):
+                _, n = torch.unique(lab[b][cov[b]], return_counts=True)
+                l2 += float((n.double() ** 2).sum())
+        v += [torch.tensor(l2), thin.sum()]
+        m = TOPO_MARGIN
+        inner = torch.zeros_like(ref)
+        inner[:, m:-m or None, m:-m or None, m:-m or None] = True
+        near = inner & (E.edt2(ref, indices=False, cap=TOPO_BAND)[0] <= TOPO_BAND * TOPO_BAND)
+        v += [torch.tensor(float(abs(_ncomp(s & near) - _ncomp(ref & near))))]
+    return torch.stack([torch.as_tensor(q).double().cpu() for q in v])
+
+
 def _pool_eval(acc):
     """(bce, dice, mae, overlap) of pooled voxel sums: every weighted voxel counts once, whatever
     window or rung it came from."""
@@ -358,7 +440,8 @@ def _pool_eval(acc):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
+def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None, band=True,
+             cost=None):
     """bce / dice / mae over the validation grid, plus the metrics the layout makes meaningful.
 
     Every entry is a compact rung sample (`sample.rung_item`), whose input is built on the device by
@@ -390,6 +473,18 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
     sigmoid(l / T) >= 0.5 exactly when l >= 0, for every T > 0, so a calibrated `dice` is the raw one.
     `dice_raw` is written as an alias of `dice` to make that explicit in the logs.
 
+    RECTO BAND metrics at rungs `BAND_RUNGS` (2, 3), for a reference that is a wide soft band (m7
+    upsampled) while the student draws thin sheets (see `_sheet_sums`; student sheet = p >= 0.5):
+    `dice_recto_r{k}_thin` (1-voxel tolerant dice against the band's medial surface),
+    `recall_recto_r{k}_band` (medial-surface voxels within `BAND_REACH` voxels of a student sheet voxel)
+    and `precision_recto_r{k}_band` (student sheet voxels inside the band dilated by one voxel).
+    CONTINUITY metrics per head and rung of `TOPO_HEADS` (recto and verso at rung 2, recto at rung 4),
+    against the same reference: `cont_<head>_r{k}` (covered medial voxels whose medial neighbours are
+    all covered), `erl_<head>_r{k}` (expected covered-piece size, in medial voxels, pooled over the
+    windows) and `betti0_<head>_r{k}` (mean per-window |component-count error| in a band around the
+    reference) -- store analogues of `evalsurf`'s mesh metrics, which need tifxyz meshes.
+    `band=False` skips all of them; a `cost` dict gets their seconds as `cost["band"]` (eval_s).
+
     `rungs` scores only the windows of those rungs (the mask-cascade pass scores the fine ones).
 
     The affinity heads are a training-only head: never scored, never drawn.
@@ -398,6 +493,8 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
     net.eval()
     per, pch, dch, scored = {}, {}, {}, 0
     np_ = layout.nprob
+    chn = list(layout.channels)
+    bsum, tsum, band_s = {}, {}, 0.0   # band / continuity sums per rung (`_sheet_sums`), their cost
     if rungs is not None and hasattr(grid, "of_rungs"):
         grid = grid.of_rungs(rungs)      # a DiskGrid: the other rungs' items are not even read
     for item in grid:
@@ -448,6 +545,19 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
         if np_ >= 2:
             a["ov"] += float((p[:, :1] + p[:, 1:2] - 1).clamp_min(0).sum())
             a["vox"] += float(p[:, :1].numel())
+        for c, nm in enumerate(chn[:np_]):     # the band / continuity metrics (`_sheet_sums`)
+            do_b = band and nm == "recto" and int(rung) in BAND_RUNGS
+            do_t = band and nm in TOPO_HEADS.get(int(rung), ())
+            if (do_b or do_t) and float(w[:, c].sum()) > 0:
+                tb = time.perf_counter()
+                v = _sheet_sums(p[:, c], tgt[:, c], w[:, c], band=do_b, topo=do_t)
+                if do_b:
+                    bsum[int(rung)] = bsum.get(int(rung), 0) + v[:NBAND]
+                if do_t:
+                    q = tsum.setdefault((nm, int(rung)), [torch.zeros(NTOPO, dtype=torch.float64), 0])
+                    q[0] += v[-NTOPO:]
+                    q[1] += 1
+                band_s += time.perf_counter() - tb
         for c in range(np_):
             wc = w[:, c]
             if float(wc.sum()) > 0:
@@ -499,6 +609,18 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
         out[key] = float(np.mean(pch[key]))
     if np_ >= 2:
         out["overlap"] = ov
+    for k in sorted(bsum):                 # the recto BAND metrics (`_sheet_sums`), rungs BAND_RUNGS
+        v = bsum[k].tolist()
+        out[f"dice_recto_r{k}_thin"] = v[0] / (v[1] + 1.0)
+        out[f"recall_recto_r{k}_band"] = v[2] / max(v[3], 1.0)
+        out[f"precision_recto_r{k}_band"] = v[4] / max(v[5], 1.0)
+    for (nm, k), (v, n) in sorted(tsum.items()):   # continuity metrics (`_sheet_sums`), TOPO_HEADS
+        v = v.tolist()
+        out[f"cont_{nm}_r{k}"] = v[0] / max(v[1], 1.0)
+        out[f"erl_{nm}_r{k}"] = v[2] / max(v[3], 1.0)
+        out[f"betti0_{nm}_r{k}"] = v[4] / max(n, 1)
+    if cost is not None:                   # a timing, so kept out of the (reproducible) metrics
+        cost["band"] = round(band_s, 3)
     return out
 
 
@@ -1105,13 +1227,15 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         evnet.load_state_dict(ema)
         te = time.time()
         kept = {} if cfg.calibrate else None
-        rec = {"step": step, **evaluate(evfwd, grid, dev, layout, cascade=casval, calib_keep=kept)}
+        cost = {}
+        rec = {"step": step, **evaluate(evfwd, grid, dev, layout, cascade=casval, calib_keep=kept,
+                                        cost=cost)}
         if casmask is not None:
             # the same fine windows with the MASK cascade source (the pooled target, no noise): the
             # trajectory of what the model does with a good coarse prediction, beside the self-cascade
             # one the gates read. A leak by construction, so an upper bracket, never a gate input.
             tm = time.time()
-            mk = evaluate(evfwd, grid, dev, layout, cascade=casmask, rungs=FINE_RUNGS)
+            mk = evaluate(evfwd, grid, dev, layout, cascade=casmask, rungs=FINE_RUNGS, band=False)
             rec.update({"dice_mask": mk["dice"], "bce_mask": mk["bce"],
                         "dice_best_mask": mk.get("dice_best"),
                         **{f"dice_mask_r{k}": mk[f"dice_r{k}"] for k in FINE_RUNGS
@@ -1133,7 +1257,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                      calib.run(evnet, None, layout=layout, per=calib.stack(kept)).get("temps", {}).items()}
             rec["temps"] = dict(temps)
         rec["eval_s"] = {"evaluate": round(t_ev, 1), "val_png": round(t_png, 1),
-                         "calibrate": round(time.time() - te - t_ev - t_png, 1)}
+                         "calibrate": round(time.time() - te - t_ev - t_png, 1),
+                         "band": cost.get("band", 0.0)}   # inside `evaluate`: the recto band metrics
         _log(str(out / "logs" / "eval.jsonl"), rec)
 
     _log(str(out / "logs" / "train.jsonl"),

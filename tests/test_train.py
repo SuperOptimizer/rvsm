@@ -1082,3 +1082,91 @@ def test_a_disk_grid_evaluates_exactly_like_the_list(full_cfg, tmp_path):
     ref2 = TR.evaluate(net, items, torch.device("cpu"), lay, rungs=(2,))
     os.remove(d / names[1])                      # a rung-3 file: the rung-2 pass must not open it
     assert TR.evaluate(net, g, torch.device("cpu"), lay, rungs=(2,)) == ref2
+
+
+def _band_case(off, n=40, half=6):
+    """A wide reference band |z - c| <= half (a soft m7-like band) and a one-voxel student sheet at
+    z = c + off, as (B, Z, Y, X) probability, target and weight."""
+    c = n // 2
+    t = torch.zeros(1, n, n, n)
+    t[:, c - half:c + half + 1] = 0.8
+    p = torch.full_like(t, 0.05)
+    p[:, c + off] = 0.95
+    return p, t, torch.ones_like(t)
+
+
+def _band_metrics(v):
+    v = v.tolist()
+    return v[0] / (v[1] + 1.0), v[2] / max(v[3], 1.0), v[4] / max(v[5], 1.0)
+
+
+def test_band_metrics_score_a_thin_sheet_inside_a_wide_band():
+    """Plain dice of a thin sheet against a wide band is small whatever the sheet does; the band
+    metrics say whether the sheet sits on the band's medial surface (thin dice / recall ~1) and inside
+    the band (precision ~1)."""
+    p, t, w = _band_case(0)
+    d, r, pr = _band_metrics(TR._sheet_sums(p, t, w))
+    plain = 2 * float(((p >= 0.5) & (t >= 0.5)).sum()) / float((p >= 0.5).sum() + (t >= 0.5).sum())
+    assert plain < 0.2
+    assert d > 0.97 and r > 0.99 and pr > 0.99, (d, r, pr)
+
+
+def test_band_metrics_an_offset_sheet_has_no_recall():
+    """A sheet 5 voxels off the band's middle is still inside the band (precision ~1) but covers none
+    of the medial surface (recall ~0, thin dice ~0); a sheet outside the band has precision ~0."""
+    p, t, w = _band_case(5)
+    d, r, pr = _band_metrics(TR._sheet_sums(p, t, w))
+    assert r < 0.01 and d < 0.01 and pr > 0.99, (d, r, pr)
+    p, t, w = _band_case(9)
+    d, r, pr = _band_metrics(TR._sheet_sums(p, t, w))
+    assert r < 0.01 and pr < 0.01, (d, r, pr)
+
+
+def test_band_metrics_ignore_unweighted_voxels():
+    """Voxels with no weight are neither reference nor student: a student sheet where the reference is
+    unknown costs no precision."""
+    p, t, w = _band_case(0)
+    p[:, 2] = 0.95                       # a stray sheet far outside the band ...
+    w[:, :4] = 0                         # ... where nothing is known
+    d, r, pr = _band_metrics(TR._sheet_sums(p, t, w))
+    assert d > 0.97 and r > 0.99 and pr > 0.99, (d, r, pr)
+
+
+def test_evaluate_reports_the_recto_band_metrics(full_cfg):
+    """evaluate writes dice_recto_r2_thin / recall_recto_r2_band / precision_recto_r2_band (and the
+    seconds they cost, into `cost`) beside the existing keys, only at the band rungs."""
+    lay = full_cfg.layout()
+    it = _item(full_cfg, k=2, dist_w=0, verso_w=0)
+    _, tg, _ = prep.prepare(prep.batch1(it), torch.device("cpu"))
+    cost = {}
+    out = TR.evaluate(_Oracle(tg, lay.cout, lay.nprob), [it], torch.device("cpu"), lay, cost=cost)
+    for k in ("dice_recto_r2_thin", "recall_recto_r2_band", "precision_recto_r2_band"):
+        assert k in out and math.isfinite(out[k]), k
+    assert cost["band"] >= 0
+    assert out["recall_recto_r2_band"] > 0.99 and out["precision_recto_r2_band"] > 0.99, out
+    assert "dice_recto_r3_thin" not in out
+    for k in ("cont_recto_r2", "erl_recto_r2", "betti0_recto_r2"):
+        assert k in out and math.isfinite(out[k]), k
+    assert out["cont_recto_r2"] > 0.99 and out["betti0_recto_r2"] == 0, out
+    assert "cont_verso_r2" not in out           # verso has no weight in this window
+    off = TR.evaluate(_Oracle(tg, lay.cout, lay.nprob), [it], torch.device("cpu"), lay, band=False)
+    assert "dice_recto_r2_thin" not in off and "cont_recto_r2" not in off and off["dice"] == out["dice"]
+
+
+def test_continuity_metrics_see_a_broken_sheet():
+    """A student sheet on the band's medial surface scores continuity ~1, one covered piece (erl = the
+    whole medial surface) and no betti0 error; cutting it in two halves the erl and costs one
+    component; nothing predicted scores 0 continuity / erl and one missing component."""
+    p, t, w = _band_case(0)
+    v = TR._sheet_sums(p, t, w, band=False, topo=True).tolist()
+    assert len(v) == TR.NTOPO
+    whole = v[2] / v[3]
+    assert v[0] / v[1] > 0.99 and whole == pytest.approx(v[3]) and v[4] == 0, v
+    p[:, :, 15:25] = 0.05                     # a 10-voxel gap across the sheet, through the whole box
+    v = TR._sheet_sums(p, t, w, band=False, topo=True).tolist()
+    assert v[0] / v[1] < 0.95 and v[2] / v[3] < 0.6 * whole and v[4] == 1, v
+    p[:] = 0.05
+    v = TR._sheet_sums(p, t, w, band=False, topo=True).tolist()
+    assert v[1] == 0 and v[2] == 0 and v[4] == 1, v
+    both = TR._sheet_sums(p, t, w, band=True, topo=True)
+    assert both.numel() == TR.NBAND + TR.NTOPO
