@@ -522,6 +522,296 @@ def _pair_checks_torch(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n):
     return code.masked_fill(act & hit, _REASON["crossing"])
 
 
+_PAIR_K = None       # the pair-check kernels, False once they are known to be unusable
+_FTAB = {}           # (nt, device) -> the walk's float32(i / n) table
+
+
+def _pair_kernels():
+    """The Triton kernels of `_pair_checks_triton` (reciprocal, normals, walk), or False."""
+    global _PAIR_K
+    if _PAIR_K is None:
+        try:
+            import triton
+            import triton.language as tl
+            from triton.language.extra import libdevice as ld
+
+            @triton.jit
+            def _rav(boff, p0, p1, p2, Y, X):
+                return boff + (p0.to(tl.int64) * Y + p1) * X + p2
+
+            @triton.jit
+            def _rec(SEL, IXR, IXV, LR, LV, PR, PV, OKR, BOX, M, B, BV, V, Y, X, BIG,
+                     BLOCK: tl.constexpr):
+                # rule 4a per selected voxel, and each block's extent of the face points whose
+                # normals rule 4b will read (BOX[0, b] recto, BOX[1, b] verso: min, -max per axis)
+                offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+                ok = offs < M
+                s = tl.load(SEL + offs, mask=ok, other=0)
+                b = s // V
+                boff = b * V
+                r0 = tl.load(IXR + s, mask=ok, other=0)
+                r1 = tl.load(IXR + BV + s, mask=ok, other=0)
+                r2 = tl.load(IXR + 2 * BV + s, mask=ok, other=0)
+                v0 = tl.load(IXV + s, mask=ok, other=0)
+                v1 = tl.load(IXV + BV + s, mask=ok, other=0)
+                v2 = tl.load(IXV + 2 * BV + s, mask=ok, other=0)
+                fr = _rav(boff, r0, r1, r2, Y, X)
+                fv = _rav(boff, v0, v1, v2, Y, X)
+                q0 = tl.load(IXR + fv, mask=ok, other=0)          # p_v's nearest recto point
+                q1 = tl.load(IXR + BV + fv, mask=ok, other=0)
+                q2 = tl.load(IXR + 2 * BV + fv, mask=ok, other=0)
+                w0 = tl.load(IXV + fr, mask=ok, other=0)          # p_r's nearest verso point
+                w1 = tl.load(IXV + BV + fr, mask=ok, other=0)
+                w2 = tl.load(IXV + 2 * BV + fr, mask=ok, other=0)
+                er = tl.load(LR + _rav(boff, q0, q1, q2, Y, X), mask=ok, other=0) == \
+                    tl.load(LR + fr, mask=ok, other=0)
+                ev = tl.load(LV + _rav(boff, w0, w1, w2, Y, X), mask=ok, other=0) == \
+                    tl.load(LV + fv, mask=ok, other=0)
+                # within sqrt(3) (+1e-6) of each other <=> squared integer distance <= 3
+                dr2 = (q0 - r0) * (q0 - r0) + (q1 - r1) * (q1 - r1) + (q2 - r2) * (q2 - r2)
+                dv2 = (w0 - v0) * (w0 - v0) + (w1 - v1) * (w1 - v1) + (w2 - v2) * (w2 - v2)
+                okr = ok & (er | (dr2 <= 3)) & (ev | (dv2 <= 3))
+                tl.store(PR + offs, r0, mask=ok)
+                tl.store(PR + M + offs, r1, mask=ok)
+                tl.store(PR + 2 * M + offs, r2, mask=ok)
+                tl.store(PV + offs, v0, mask=ok)
+                tl.store(PV + M + offs, v1, mask=ok)
+                tl.store(PV + 2 * M + offs, v2, mask=ok)
+                tl.store(OKR + offs, okr.to(tl.int8), mask=ok)
+                # `sel` is sorted, so a program's voxels are the first block's but at a block boundary:
+                # one reduced atomic per value for that block, per-voxel atomics for the others
+                b0 = tl.min(tl.where(ok, b, 1 << 40))
+                m0 = okr & (b == b0)
+                mo = okr & (b != b0)
+                rb = BOX + b0 * 6
+                vb = BOX + (B + b0) * 6
+                tl.atomic_min(rb, tl.min(tl.where(m0, r0, BIG)))
+                tl.atomic_min(rb + 1, tl.min(tl.where(m0, -r0, BIG)))
+                tl.atomic_min(rb + 2, tl.min(tl.where(m0, r1, BIG)))
+                tl.atomic_min(rb + 3, tl.min(tl.where(m0, -r1, BIG)))
+                tl.atomic_min(rb + 4, tl.min(tl.where(m0, r2, BIG)))
+                tl.atomic_min(rb + 5, tl.min(tl.where(m0, -r2, BIG)))
+                tl.atomic_min(vb, tl.min(tl.where(m0, v0, BIG)))
+                tl.atomic_min(vb + 1, tl.min(tl.where(m0, -v0, BIG)))
+                tl.atomic_min(vb + 2, tl.min(tl.where(m0, v1, BIG)))
+                tl.atomic_min(vb + 3, tl.min(tl.where(m0, -v1, BIG)))
+                tl.atomic_min(vb + 4, tl.min(tl.where(m0, v2, BIG)))
+                tl.atomic_min(vb + 5, tl.min(tl.where(m0, -v2, BIG)))
+                rb = BOX + b * 6
+                vb = BOX + (B + b) * 6
+                tl.atomic_min(rb, r0, mask=mo)
+                tl.atomic_min(rb + 1, -r0, mask=mo)
+                tl.atomic_min(rb + 2, r1, mask=mo)
+                tl.atomic_min(rb + 3, -r1, mask=mo)
+                tl.atomic_min(rb + 4, r2, mask=mo)
+                tl.atomic_min(rb + 5, -r2, mask=mo)
+                tl.atomic_min(vb, v0, mask=mo)
+                tl.atomic_min(vb + 1, -v0, mask=mo)
+                tl.atomic_min(vb + 2, v1, mask=mo)
+                tl.atomic_min(vb + 3, -v1, mask=mo)
+                tl.atomic_min(vb + 4, v2, mask=mo)
+                tl.atomic_min(vb + 5, -v2, mask=mo)
+
+            @triton.jit
+            def _grad(Gb, p0, p1, p2, Z, Y, X, m):
+                # `_grad_at`: central differences, one-sided at the border, (f(hi) - f(lo)) / (hi - lo)
+                hi = tl.minimum(p0 + 1, Z - 1)
+                lo = tl.maximum(p0 - 1, 0)
+                g0 = ld.div_rn(ld.sub_rn(tl.load(Gb + _rav(0, hi, p1, p2, Y, X), mask=m, other=0.0),
+                                         tl.load(Gb + _rav(0, lo, p1, p2, Y, X), mask=m, other=0.0)),
+                               tl.maximum(hi - lo, 1).to(tl.float32))
+                hi = tl.minimum(p1 + 1, Y - 1)
+                lo = tl.maximum(p1 - 1, 0)
+                g1 = ld.div_rn(ld.sub_rn(tl.load(Gb + _rav(0, p0, hi, p2, Y, X), mask=m, other=0.0),
+                                         tl.load(Gb + _rav(0, p0, lo, p2, Y, X), mask=m, other=0.0)),
+                               tl.maximum(hi - lo, 1).to(tl.float32))
+                hi = tl.minimum(p2 + 1, X - 1)
+                lo = tl.maximum(p2 - 1, 0)
+                g2 = ld.div_rn(ld.sub_rn(tl.load(Gb + _rav(0, p0, p1, hi, Y, X), mask=m, other=0.0),
+                                         tl.load(Gb + _rav(0, p0, p1, lo, Y, X), mask=m, other=0.0)),
+                               tl.maximum(hi - lo, 1).to(tl.float32))
+                return g0, g1, g2
+
+            @triton.jit
+            def _norm3(a, b, c):
+                return ld.sqrt_rn(ld.add_rn(ld.add_rn(ld.mul_rn(a, a), ld.mul_rn(b, b)), ld.mul_rn(c, c)))
+
+            @triton.jit
+            def _normal(SEL, PR, PV, OKR, G, DY, DX, SDB, SDZ, SDY, SDX, SXB, SXZ, SXY, SXX, REASON, ACT,
+                        LMAX, M, BV, V, Z, Y, X, NMIN, NRAD, NAGR, EPS, C_REC: tl.constexpr,
+                        C_NORM: tl.constexpr, BLOCK: tl.constexpr):
+                # rule 4b per selected voxel (`_pair_checks_torch`'s float32 steps, each rounded), the
+                # reason code for 4a / 4b written into REASON, and each block's longest walked segment
+                offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+                ok = offs < M
+                s = tl.load(SEL + offs, mask=ok, other=0)
+                b = s // V
+                loc = s - b * V
+                z = loc // (Y * X)
+                y = (loc // X) % Y
+                x = loc % X
+                okr = ok & (tl.load(OKR + offs, mask=ok, other=0) != 0)
+                ry = tl.load(DY + b * SDB + z * SDZ + y * SDY + x * SDX, mask=ok, other=0.0)
+                rx = tl.load(DX + b * SXB + z * SXZ + y * SXY + x * SXX, mask=ok, other=0.0)
+                rn = tl.maximum(ld.sqrt_rn(ld.add_rn(ld.mul_rn(ry, ry), ld.mul_rn(rx, rx))), EPS)
+                ry = ld.div_rn(ry, rn)
+                rx = ld.div_rn(rx, rn)
+                r0 = tl.load(PR + offs, mask=ok, other=0)
+                r1 = tl.load(PR + M + offs, mask=ok, other=0)
+                r2 = tl.load(PR + 2 * M + offs, mask=ok, other=0)
+                v0 = tl.load(PV + offs, mask=ok, other=0)
+                v1 = tl.load(PV + M + offs, mask=ok, other=0)
+                v2 = tl.load(PV + 2 * M + offs, mask=ok, other=0)
+                a0, a1, a2 = _grad(G + b * V, r0, r1, r2, Z, Y, X, okr)
+                c0, c1, c2 = _grad(G + BV + b * V, v0, v1, v2, Z, Y, X, okr)
+                mr = _norm3(a0, a1, a2)
+                mv = _norm3(c0, c1, c2)
+                dr = tl.maximum(mr, EPS)
+                dv = tl.maximum(mv, EPS)
+                a0 = ld.div_rn(a0, dr)
+                a1 = ld.div_rn(a1, dr)
+                a2 = ld.div_rn(a2, dr)
+                c0 = ld.div_rn(c0, dv)
+                c1 = ld.div_rn(c1, dv)
+                c2 = ld.div_rn(c2, dv)
+                agree = ld.add_rn(ld.add_rn(ld.mul_rn(a0, c0), ld.mul_rn(a1, c1)), ld.mul_rn(a2, c2))
+                okn = (mr >= NMIN) & (mv >= NMIN) & \
+                    (ld.add_rn(ld.mul_rn(a1, ry), ld.mul_rn(a2, rx)) >= NRAD) & \
+                    (ld.add_rn(ld.mul_rn(c1, ry), ld.mul_rn(c2, rx)) >= NRAD) & (agree >= NAGR)
+                code = tl.where(okr, tl.where(okn, 0, C_NORM), C_REC)
+                tl.store(REASON + s, code.to(tl.uint8), mask=ok & (code != 0))
+                act = ok & (code == 0)
+                tl.store(ACT + offs, act.to(tl.int8), mask=ok)
+                ln = _norm3((v0 - r0).to(tl.float32), (v1 - r1).to(tl.float32), (v2 - r2).to(tl.float32))
+                b0 = tl.min(tl.where(ok, b, 1 << 40))
+                tl.atomic_max(LMAX + b0, tl.max(tl.where(act & (b == b0), ln, 0.0)))
+                tl.atomic_max(LMAX + b, ln, mask=act & (b != b0))
+
+            @triton.jit
+            def _walk(SEL, PR, PV, ACT, LMAX, FT, FTS, NT, BR, BVB, REASON, M, V, Y, X,
+                      C_CROSS: tl.constexpr, BLOCK: tl.constexpr):
+                # rule 4c: `edt.walk_crossings`' walk, each segment with its block's sample count
+                # n = max(1, ceil(2 * longest segment)), the crossings written into REASON
+                offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+                ok = offs < M
+                act = (tl.load(ACT + offs, mask=ok, other=0) != 0) & ok
+                s = tl.load(SEL + offs, mask=ok, other=0)
+                b = s // V
+                boff = b * V
+                lm = tl.load(LMAX + b, mask=act, other=0.0)
+                n = tl.maximum(tl.ceil(lm * 2.0), 1.0).to(tl.int32)
+                n = tl.minimum(tl.maximum(n, 1), NT)
+                az = tl.load(PR + offs, mask=ok, other=0).to(tl.float32)
+                ay = tl.load(PR + M + offs, mask=ok, other=0).to(tl.float32)
+                ax = tl.load(PR + 2 * M + offs, mask=ok, other=0).to(tl.float32)
+                sz = tl.load(PV + offs, mask=ok, other=0).to(tl.float32) - az
+                sy = tl.load(PV + M + offs, mask=ok, other=0).to(tl.float32) - ay
+                sx = tl.load(PV + 2 * M + offs, mask=ok, other=0).to(tl.float32) - ax
+                nmax = tl.max(tl.where(act, n, 0))
+                left = offs < 0
+                inv = offs < 0
+                hit = offs < 0
+                for i in range(0, nmax + 1):
+                    a_ = act & (i <= n)
+                    f = tl.load(FT + n.to(tl.int64) * FTS + i, mask=a_, other=0.0)
+                    qz = ld.rint(ld.add_rn(az, ld.mul_rn(sz, f))).to(tl.int64)
+                    qy = ld.rint(ld.add_rn(ay, ld.mul_rn(sy, f))).to(tl.int64)
+                    qx = ld.rint(ld.add_rn(ax, ld.mul_rn(sx, f))).to(tl.int64)
+                    qi = boff + (qz * Y + qy) * X + qx
+                    rr = tl.load(BR + qi, mask=a_, other=0) != 0
+                    vv = tl.load(BVB + qi, mask=a_, other=0) != 0
+                    hit = hit | (a_ & ((left & rr & ~vv) | (inv & ~vv)))
+                    left = left | (a_ & ~rr)
+                    inv = inv | (a_ & vv)
+                tl.store(REASON + s, tl.full([BLOCK], C_CROSS, tl.uint8), mask=act & hit)
+
+            _PAIR_K = (_rec, _normal, _walk)
+        except Exception:  # noqa: BLE001
+            _PAIR_K = False
+    return _PAIR_K
+
+
+def _ftab(nt, dev):
+    """The walk's float32(i / n) table [n, i], as `edt.walk_crossings` builds it, cached per device."""
+    import torch
+    key = (int(nt), str(dev))
+    if key not in _FTAB:
+        ni = torch.arange(int(nt) + 1, device=dev, dtype=torch.float64)
+        _FTAB[key] = (ni[None, :] / torch.clamp(ni, min=1)[:, None]).to(torch.float32).contiguous()
+    return _FTAB[key]
+
+
+# the pair checks as three fused kernels on CUDA (`_pair_checks_triton`); RVSM_FIELDS_FUSED=0 runs the
+# op-by-op torch version there too
+PAIR_FUSED = os.environ.get("RVSM_FIELDS_FUSED", "1") not in ("0", "false", "no")
+
+
+def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, reason):
+    """`_pair_checks_torch` on CUDA in a few launches, the codes written straight into `reason` (whose
+    `sel` entries are 0). True when done, False when the kernels are unusable (nothing written).
+
+    (a) one kernel per voxel: the nearest points, their reciprocal points, the label and distance tests
+        (integers only), and each block's extent of the face points that passed (atomic min / max);
+    (b) the Gaussian-smoothed distances only over those extents plus the one-voxel gradient stencil
+        (`edt.gaussian3_box`: the same bits as the whole-volume filter there), then one kernel per voxel
+        for the gradients, norms, radial and agreement tests in `_pair_checks_torch`'s float32 order,
+        every product, sum, quotient and root rounded on its own (no contraction), and each block's
+        longest walked segment (atomic max; a maximum does not depend on the order);
+    (c) the walk, one kernel, each voxel with its block's sample count.
+    The reason codes are the torch version's bit for bit (tested)."""
+    import torch
+    from rvsm import edt as E
+    k = _pair_kernels()
+    if not k or not PAIR_FUSED:
+        return False
+    B, Z, Y, X = (int(v) for v in shape)
+    V = Z * Y * X
+    BV = B * V
+    dev = sel.device
+    M = int(sel.numel())
+    lr, lv = E.label(br).reshape(-1), E.label(bv).reshape(-1)
+    pr = torch.empty((3, M), dtype=torch.int32, device=dev)
+    pv = torch.empty((3, M), dtype=torch.int32, device=dev)
+    okr = torch.empty(M, dtype=torch.int8, device=dev)
+    box = torch.full((2, B, 6), E.BOX_EMPTY, dtype=torch.int32, device=dev)
+    BLOCK = 256
+    grid = (-(-M // BLOCK),)
+    ixr, ixv = ixr.contiguous(), ixv.contiguous()
+    try:
+        k[0][grid](sel, ixr, ixv, lr, lv, pr, pv, okr, box, M, B, BV, V, Y, X, E.BOX_EMPTY, BLOCK=BLOCK)
+    except Exception as e:  # noqa: BLE001
+        _pair_failed(e)
+        return False
+    del lr, lv
+    dr, dv = dr.contiguous(), dv.contiguous()
+    g = E.gaussian3_box([dr, dv], box, NORMAL_SIGMA)
+    if g is None:
+        return False
+    dye, dxe = dy.expand(B, Z, Y, X), dx.expand(B, Z, Y, X)
+    act = torch.empty(M, dtype=torch.int8, device=dev)
+    lmax = torch.zeros(B, dtype=torch.float32, device=dev)
+    f32 = lambda v: float(np.float32(v))           # noqa: E731
+    try:
+        k[1][grid](sel, pr, pv, okr, g, dye, dxe, *dye.stride(), *dxe.stride(), reason, act, lmax, M, BV,
+                   V, Z, Y, X, f32(NORMAL_MIN), f32(NORMAL_RADIAL), f32(NORMAL_AGREE), f32(1e-6),
+                   C_REC=_REASON["reciprocal"], C_NORM=_REASON["normal"], BLOCK=BLOCK)
+        del g, okr
+        ft = _ftab(walk_n, dev)
+        k[2][grid](sel, pr, pv, act, lmax, ft, int(walk_n) + 1, int(walk_n), br.view(torch.uint8),
+                   bv.view(torch.uint8), reason, M, V, Y, X, C_CROSS=_REASON["crossing"], BLOCK=BLOCK)
+    except Exception as e:  # noqa: BLE001  -- the caller's torch version rewrites every `sel` code
+        _pair_failed(e)
+        return False
+    return True
+
+
+def _pair_failed(e):
+    global _PAIR_K
+    _PAIR_K = False
+    import warnings
+    warnings.warn(f"rvsm.targets: pair-check kernels unusable ({e!r}); using the torch version")
+
+
 NCOUNT = len(SUPPORT)      # the per-block support row: voxels, the nine reasons, valid
 
 # the device transforms are capped (`edt.edt2(cap=)`) at what the rules can read; RVSM_FIELDS_CAP=0
@@ -581,8 +871,10 @@ def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, d
     fail((t < tmin) | (t > tmax), "thickness")
     sel = torch.nonzero(((reason == 0) & ev).reshape(-1)).squeeze(1)       # one sync per batch
     if sel.numel():
-        reason.view(-1)[sel] = _pair_checks_torch(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx,
-                                                  int(np.ceil(4.0 * float(reach))) + 2)
+        wn = int(np.ceil(4.0 * float(reach))) + 2
+        if not (dev.type == "cuda" and
+                _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, wn, reason.view(-1))):
+            reason.view(-1)[sel] = _pair_checks_torch(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, wn)
     del ixr, ixv, sel, br, bv
     pair = (reason == 0) & ev
     zero = torch.zeros((), dtype=torch.float32, device=dev)

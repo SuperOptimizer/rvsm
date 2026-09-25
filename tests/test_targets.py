@@ -793,3 +793,49 @@ def test_capped_transforms_write_the_same_bytes(slab_region, tmp_path, monkeypat
             targets.region_fields(r.root, r.lo, r.ax, rungs=(2, 3), device=dev, **KW)
             rs[cap] = r
         _same_stores(rs[False], rs[True])
+
+
+def _fixture_bits(res):
+    m, t, ok, sup = res
+    return m.view(np.uint32).tobytes(), t.view(np.uint32).tobytes(), ok.tobytes(), sup
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="no CUDA device")
+def test_fused_pair_checks_are_the_torch_pair_checks(slab_region, tmp_path, monkeypatch):
+    """The pair checks as fused CUDA kernels (`_pair_checks_triton`: the reciprocal test, the
+    box-restricted Gaussian and the normals, the walk) against the op-by-op torch version: the same
+    float32 bits of every fixture's fields and the same support, and byte-identical stores on the
+    curved region and the paired / split slabs at rungs 2 and 3."""
+    import types
+    called = {"n": 0}
+    real = targets._pair_checks_triton
+
+    def counted(*a, **k):
+        r = real(*a, **k)
+        called["n"] += bool(r)
+        return r
+    monkeypatch.setattr(targets, "_pair_checks_triton", counted)
+    for name, rec, ver, dy, dx, kw in _fixtures():
+        out = {}
+        for fused in (False, True):
+            monkeypatch.setattr(targets, "PAIR_FUSED", fused)
+            out[fused] = _fixture_bits(targets.block_fields_torch(rec, ver, dy, dx, device="cuda", **kw))
+        assert out[False] == out[True], name
+        assert out[True] == _fixture_bits(targets.block_fields(rec, ver, dy, dx, **kw)), name
+    assert called["n"] > 5
+    lo = (0, 0, 0)
+    roots = {}
+    for fused in (False, True):
+        monkeypatch.setattr(targets, "PAIR_FUSED", fused)
+        root = str(tmp_path / f"curved{int(fused)}")
+        ax = _curved_region(root)
+        targets.region_fields(root, lo, ax, rungs=(2, 3), device="cuda", **KW)
+        roots[fused] = types.SimpleNamespace(root=root, lo=lo)
+    _same_stores(roots[False], roots[True])
+    for name, kw in (("pair", dict(recto_x=80, verso_x=70)), ("split", dict(recto_x=100, verso_x=20))):
+        rs = {}
+        for fused in (False, True):
+            monkeypatch.setattr(targets, "PAIR_FUSED", fused)
+            rs[fused] = slab_region(name=f"f{name}{int(fused)}", n=128, **kw)
+            targets.region_fields(rs[fused].root, rs[fused].lo, rs[fused].ax, rungs=(2, 3), device="cuda", **KW)
+        _same_stores(rs[False], rs[True])

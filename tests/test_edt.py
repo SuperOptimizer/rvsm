@@ -174,3 +174,44 @@ def test_a_capped_edt_is_exact_up_to_the_cap(dev, torch_only):
             assert torch.isinf(vc[~near]).all(), cap
             vn, none = E.edt2(t, indices=False, torch_only=torch_only, cap=cap)
             assert none is None and torch.equal(vn, vc)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_the_box_gaussian_is_the_whole_volume_filter_inside_its_box():
+    """`gaussian3_box`: on each field / volume's box widened by the margin, the same bits as
+    `gaussian3` of the whole volume (the nearest-mode clamping is to the volume, not the box), for
+    stacked and separately allocated fields, empty boxes, boxes at the borders and thin volumes."""
+    g = torch.Generator().manual_seed(0)
+    for shape in ((1, 40, 37, 29), (3, 64, 64, 64), (2, 5, 70, 9)):
+        ab = (torch.randn((2,) + shape, generator=g) * 10).cuda()
+        whole = [E.gaussian3(ab[0], 1.5), E.gaussian3(ab[1], 1.5)]
+        B = shape[0]
+        box = torch.full((2, B, 6), E.BOX_EMPTY, dtype=torch.int32)
+        for f in range(2):
+            for b in range(B):
+                if (f + b) % 3 == 2:
+                    continue                       # an empty box
+                for c in range(3):
+                    n = shape[1 + c]
+                    lo = int(torch.randint(0, n, (1,), generator=g))
+                    hi = int(torch.randint(lo, n, (1,), generator=g))
+                    if (f + b + c) % 4 == 0:
+                        lo, hi = 0, n - 1          # touching both borders
+                    box[f, b, 2 * c], box[f, b, 2 * c + 1] = lo, -hi
+        out = E.gaussian3_box([ab[0], ab[1]], box.cuda(), 1.5)
+        seen = 0
+        for f in range(2):
+            for b in range(B):
+                bx = box[f, b].tolist()
+                if bx[0] == E.BOX_EMPTY:
+                    continue
+                sl = tuple(slice(max(bx[2 * c] - 1, 0), min(-bx[2 * c + 1] + 1, shape[1 + c] - 1) + 1)
+                           for c in range(3))
+                assert torch.equal(out[f, b][sl].view(torch.int32), whole[f][b][sl].view(torch.int32))
+                seen += 1
+        assert seen
+    a, b = torch.randn((2, 30, 31, 32), device="cuda"), torch.randn((2, 30, 31, 32), device="cuda")
+    full = torch.tensor([[[0, -29, 0, -30, 0, -31]] * 2] * 2, dtype=torch.int32, device="cuda")
+    out = E.gaussian3_box([a, b], full, 1.5)
+    assert torch.equal(out[0].view(torch.int32), E.gaussian3(a, 1.5).view(torch.int32))
+    assert torch.equal(out[1].view(torch.int32), E.gaussian3(b, 1.5).view(torch.int32))

@@ -141,6 +141,59 @@ def _triton_kernels():
                     acc = acc + tl.load(W + R + j) * (a + b)
                 tl.store(Y + offs, acc.to(tl.float32), mask=ok)
 
+            @triton.jit
+            def _gauss_box(X, Y, W, BOX, DIN, DOUT, B, V, Z, YN, XN, MARG, EY, EX, AX: tl.constexpr,
+                           R: tl.constexpr, BLOCK: tl.constexpr):
+                # `_gauss` along axis AX of volume b of field f (program_id(1) = f * B + b), computed
+                # only inside that volume's box (BOX[f, b] = zmin, -zmax, ymin, -ymax, xmin, -xmax),
+                # widened by MARG on every axis and by EY / EX more on y / x, clamped to the volume.
+                # The programs walk the box (the ones past its end return at once); per voxel the SAME
+                # loads and the same float64 expression as `_gauss`, so the same bits.
+                fb = tl.program_id(1)
+                f = fb // B
+                b = fb - f * B
+                bx = BOX + fb * 6
+                z0 = tl.maximum(tl.load(bx) - MARG, 0)
+                z1 = tl.minimum(-tl.load(bx + 1) + MARG, Z - 1)
+                y0 = tl.maximum(tl.load(bx + 2) - MARG - EY, 0)
+                y1 = tl.minimum(-tl.load(bx + 3) + MARG + EY, YN - 1)
+                x0 = tl.maximum(tl.load(bx + 4) - MARG - EX, 0)
+                x1 = tl.minimum(-tl.load(bx + 5) + MARG + EX, XN - 1)
+                nz = tl.maximum(z1 - z0 + 1, 0)
+                ny = tl.maximum(y1 - y0 + 1, 0)
+                nx = tl.maximum(x1 - x0 + 1, 0)
+                start = tl.program_id(0) * BLOCK
+                if start < nz * ny * nx:
+                    t = start + tl.arange(0, BLOCK)
+                    ok = t < nz * ny * nx
+                    z = z0 + t // (ny * nx)
+                    y = y0 + (t // nx) % ny
+                    x = x0 + t % nx
+                    offs = (z * YN + y) * XN + x
+                    if AX == 0:
+                        i = z
+                        n = Z
+                        inner = YN * XN
+                    elif AX == 1:
+                        i = y
+                        n = YN
+                        inner = XN
+                    else:
+                        i = x
+                        n = XN
+                        inner = 1
+                    base = offs - i * inner
+                    src = X + f.to(tl.int64) * DIN + b.to(tl.int64) * V
+                    acc = tl.load(W + R) * tl.load(src + base + i * inner, mask=ok, other=0.0).to(tl.float64)
+                    for j in tl.static_range(1, R + 1):
+                        lo = tl.maximum(i - j, 0)
+                        hi = tl.minimum(i + j, n - 1)
+                        a = tl.load(src + base + lo * inner, mask=ok, other=0.0).to(tl.float64)
+                        c = tl.load(src + base + hi * inner, mask=ok, other=0.0).to(tl.float64)
+                        acc = acc + tl.load(W + R + j) * (a + c)
+                    tl.store(Y + f.to(tl.int64) * DOUT + b.to(tl.int64) * V + offs, acc.to(tl.float32),
+                             mask=ok)
+
             from triton.language.extra import libdevice
 
             @triton.jit
@@ -219,7 +272,7 @@ def _triton_kernels():
                     lab = tl.maximum(lab, q)
                 tl.atomic_max(L + offs, lab, mask=m)
 
-            _TRITON = (_pass, _gauss, _first, _walk, _lab_iter, _lab_jump)
+            _TRITON = (_pass, _gauss, _first, _walk, _lab_iter, _lab_jump, _gauss_box)
         except Exception:  # noqa: BLE001  -- no triton: the torch path
             _TRITON = False
     return _TRITON
@@ -422,6 +475,65 @@ def gaussian3(x, sigma, truncate=4.0):
         y = acc.to(torch.float32)
         del acc
     return y
+
+
+_WEIGHTS = {}          # (sigma, truncate, device) -> the float64 weights on that device
+
+
+def _weights_on(sigma, truncate, dev):
+    key = (float(sigma), float(truncate), str(dev))
+    if key not in _WEIGHTS:
+        w, _ = gaussian_weights(sigma, truncate)
+        _WEIGHTS[key] = torch.tensor(w, dtype=torch.float64).to(dev)
+    return _WEIGHTS[key]
+
+
+BOX_EMPTY = 1 << 30   # an entry of an empty `gaussian3_box` box: min = BOX_EMPTY, -max = BOX_EMPTY
+
+
+def gaussian3_box(xs, box, sigma, truncate=4.0, margin=1):
+    """`gaussian3` of each (B,Z,Y,X) float32 CUDA tensor of `xs` (all one shape), wanted only near some
+    points: `box` (len(xs), B, 6) int32 on the device holds, per field and volume, the points' extent
+    (zmin, -zmax, ymin, -ymax, xmin, -xmax; `BOX_EMPTY` everywhere for no point), and the result is
+    exact -- the same bits as `gaussian3` -- on that extent widened by `margin` voxels per axis (clamped
+    to the volume); elsewhere it is unspecified. One (len(xs), B, Z, Y, X) tensor, or None where the
+    Triton kernels are unusable (the caller then filters the whole volumes).
+
+    The separable passes run in `gaussian3`'s order (axis 0, 1, 2), each over the part of the volume the
+    NEXT passes read: the last (x) pass over the widened box, the y pass over it widened by the radius
+    along x, the z pass over it widened along y and x as well. Each output voxel is the same loads and
+    the same float64 expression as `gaussian3`'s kernel, and the clamping ("nearest") is to the whole
+    volume, so every voxel the final box needs sees exactly the values the whole-volume filter
+    would. The box lives on the device (no synchronisation): the grid covers the whole volume and the
+    voxels outside the box do nothing. One launch per pass for all of `xs`."""
+    k = _triton_kernels()
+    if not k:
+        return None
+    x0 = xs[0]
+    for x in xs:
+        assert x.is_cuda and x.dtype == torch.float32 and x.is_contiguous() and x.shape == x0.shape
+    assert x0.dim() == 4
+    B, Z, Y, X = (int(v) for v in x0.shape)
+    V = Z * Y * X
+    nf = len(xs)
+    _, r = gaussian_weights(sigma, truncate)
+    wt = _weights_on(sigma, truncate, x0.device)
+    din = 0 if nf == 1 else (xs[1].data_ptr() - x0.data_ptr()) // 4
+    for i, x in enumerate(xs):
+        assert x.data_ptr() - x0.data_ptr() == 4 * i * din
+    out = [torch.empty((nf, B, Z, Y, X), dtype=torch.float32, device=x0.device) for _ in range(2)]
+    BLOCK = 1024
+    grid = (-(-V // BLOCK), nf * B)
+    try:
+        src, sd = x0, din
+        for ax, (ey, ex), dst in ((0, (r, r), out[0]), (1, (0, r), out[1]), (2, (0, 0), out[0])):
+            k[6][grid](src, dst, wt, box, sd, B * V, B, V, Z, Y, X, int(margin), ey, ex, AX=ax, R=r,
+                       BLOCK=BLOCK)
+            src, sd = dst, B * V
+        return out[0]
+    except Exception as e:  # noqa: BLE001
+        _triton_failed(e)
+        return None
 
 
 def walk_crossings(pa, pb, boff, act, nb, nt, br, bv, torch_only=False):
