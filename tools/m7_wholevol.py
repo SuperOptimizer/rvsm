@@ -560,6 +560,7 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
     if cdev.type == "cpu":
         C = C.pin_memory()
     clen = 0                                   # C holds z in [s, s + clen)
+    c_live = np.zeros(len(ys), bool)           # C[:, y-slice j] may be non-zero (else it is exactly 0)
     gid = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
     stages = [np.memmap(os.path.join(WORK, f"stage_{gid}_{b}.u8"), np.uint8, "w+", shape=(SH, Y, X)) for b in (0, 1)]
     writer = [None]
@@ -648,9 +649,9 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
             stats["gpu_s"] += time.time() - th
             th = time.time()
             # y-slice [t, t+d) is final for this window row
-            if t < g_end or clen:
+            if t < g_end or (clen and c_live[j]):
                 blk = G[:, :d, :]
-                if clen:
+                if clen and c_live[j]:
                     blk[:clen] += C[:clen, t:t + d, :].to(dev, torch.float32)
                 if zb > za:
                     if sg is not None:
@@ -661,11 +662,13 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
                         put_stage(za, zb, t, d, np.zeros((zb - za, d, X), np.uint8))
                 if dz < W:
                     C[:W - dz, t:t + d, :] = blk[dz:].to(cdev, torch.float16)
+                    c_live[j] = True
             else:
                 if zb > za:
                     put_stage(za, zb, t, d, np.zeros((zb - za, d, X), np.uint8))
-                if dz < W:
+                if dz < W and c_live[j]:
                     C[:W - dz, t:t + d, :] = 0
+                c_live[j] = False
             if j + 1 < len(ys):
                 G[:, :W - d] = G[:, d:].clone()
                 G[:, W - d:] = 0
