@@ -171,7 +171,15 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        # (2026-09-25). A deliberate mid-run change of the recto target definition: the
                        # resume logs a `teacher_switch` sched line and the producer regenerates every
                        # recto another set made (`run.recto_needs_regen`)
-                       "teacher_ckpts")
+                       "teacher_ckpts",
+                       # the continuity terms, retunable on a resume (a deliberate mid-run retuning,
+                       # 2026-09-25, paris4: values unchanged for now); the trainer reads them from the
+                       # live config and the resume logs a `loss_switch` sched line naming any that moved
+                       "loss_skel", "loss_affinity", "loss_ect", "loss_selfcons")
+
+# The loss weights a resume may retune (`run.log_switches` logs a `loss_switch` line when one moved).
+LOSS_SWITCH_FIELDS = ("loss_prob_dice", "loss_pair", "loss_skel", "loss_affinity", "loss_ect",
+                      "loss_selfcons")
 
 
 @dataclass

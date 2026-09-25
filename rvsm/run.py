@@ -2662,7 +2662,8 @@ def frozen_meta(out, ct, log=print):
 def log_switches(out, old, cfg):
     """The deliberate mid-run changes a resume makes, as `sched` lines against the previous
     config.json (`old`): `teacher_switch` when the round-0 teacher set (the keys of `teacher_ckpts`)
-    or a teacher's weights moved. Returns the lines logged."""
+    or a teacher's weights moved, `loss_switch` naming every loss weight of `config.LOSS_SWITCH_FIELDS`
+    that moved (the trainer uses the live config's weights). Returns the lines logged."""
     d = (old or {}).get("config") or {}
     step = int(read_state(out).get("step", 0) or 0)
     got = []
@@ -2673,6 +2674,14 @@ def log_switches(out, old, cfg):
         rec = {"kind": "teacher_switch", "step": step, "old": on, "new": teacher_names(cfg),
                "old_ckpts": oc, "new_ckpts": nc,
                "regenerate": sorted(on) != sorted(teacher_names(cfg))}
+        jlog(out, "sched", rec)
+        got.append(rec)
+    moved = {}
+    for k in CFG.LOSS_SWITCH_FIELDS:
+        if k in d and float(d[k]) != float(getattr(cfg, k)):
+            moved[k] = {"old": float(d[k]), "new": float(getattr(cfg, k))}
+    if moved:
+        rec = {"kind": "loss_switch", "step": step, "weights": moved}
         jlog(out, "sched", rec)
         got.append(rec)
     return got
