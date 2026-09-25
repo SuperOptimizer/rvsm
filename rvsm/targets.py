@@ -1529,9 +1529,11 @@ class _FieldGraphs:
     and writing the graphs' static tensors.
 
     One graph pair for one key at a time -- (batch size, window shape, rung parameters, encoding) --
-    captured on the SECOND full batch with that key (the first runs eagerly, which compiles every
-    kernel), used only for full batches (every window with both faces, `batch` of them): a smaller or
-    faceless batch runs eagerly. A new key, `clear()` (between rungs, on a yield of the card, at the
+    captured on the SECOND graph-eligible batch with that key (the first runs eagerly, which compiles
+    every kernel). Eligible: any batch with at least one window with both faces; its faceless windows
+    are computed in full (what `_faceless` answers without the transforms, the same bytes) and a short
+    batch is padded with air windows (`_pad_batch`), so at batch 3 the mixed batches of a real region
+    replay too. A batch without any face pair runs eagerly (`_faceless`: cheaper than a replay). A new key, `clear()` (between rungs, on a yield of the card, at the
     end of a region) releases the graphs and their memory.
 
     Exactness: a replay runs the same kernels on the same values as the eager stages, so the bytes are
@@ -1686,7 +1688,8 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
     src = {"recto": _SlabStore(rec_a, ks, dev), "verso": None if ver_a is None else _SlabStore(ver_a, ks, dev)}
     groups = _batches(tasks, batch)
     lvl = int(round(thr * 255))
-    stats = {"blocks": 0, "no_recto": 0, "no_verso": 0}      # blocks answered without their transforms
+    stats = {"blocks": 0, "no_recto": 0, "no_verso": 0,      # blocks answered without their transforms
+             "graphed_faceless": 0, "graphed_padded": 0}      # ... and computed in a graphed batch instead
     axk = {k: AX.axis_at(np.asarray(ax, np.float64), k) for k in ks}
     stream = torch.cuda.Stream(dev) if dev.type == "cuda" else None
     ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
@@ -1744,10 +1747,16 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
             key = (k, batch, rsh, axr, int(halo), thr, rk, tn, tx, cap, EDT_CAP)
             if graphs is not None:
                 graphs.drop_other(key)     # a new rung / shape: the old key's pool goes back at once
-            if graphs is not None and GRAPHS and ver is not None and full.all() and len(group) == batch:
-                res = graphs.run(key, rec, ver, host, rsh, axr, halo, thr, rk, tn, tx, sl, cap)
+            # any batch with a face pair goes through the graphs: its faceless windows computed in full
+            # (the same bytes as `_faceless`, tested), a short batch padded with air windows whose
+            # results are not read
+            if graphs is not None and GRAPHS and ver is not None and full.any() and len(group) <= batch:
+                res = graphs.run(key, *_pad_batch(rec, ver, host, batch), rsh, axr, halo, thr, rk, tn, tx, sl,
+                                 cap)
             if res is not None:
                 enc, cnt = res
+                stats["graphed_faceless"] += int((~full).sum())
+                stats["graphed_padded"] += batch - len(group)
             else:
                 dy, dx, core, cover = _block_inputs_torch(host, rsh, axr, halo, dev)
                 if full.all() or not SKIP_FACELESS:
@@ -1787,6 +1796,21 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
             except Exception:  # noqa: BLE001
                 pass
     return stats
+
+
+def _pad_batch(rec, ver, host, batch):
+    """(rec, ver, host) of a batch padded to `batch` windows: air windows (no face: no candidate, no
+    saturation) with the last window's axis and coverage vectors. A batch's windows are computed
+    independently, so the real windows' bytes do not depend on the padding."""
+    n = int(rec.shape[0])
+    if n == batch:
+        return rec, ver, host
+
+    def pad(a, air):
+        extra = np.zeros((batch - n,) + a.shape[1:], a.dtype) if air else np.repeat(a[-1:], batch - n, 0)
+        return np.concatenate((a, extra))
+    return pad(rec, True), pad(ver, True), tuple(pad(a, False) for a in host[:4]) + \
+        ([pad(c, False) for c in host[4]],)
 
 
 def _faceless(rec, ver, hr, hv, dy, dx, core, cover, thr, rk, tn, tx, cap, sl, n, dev):

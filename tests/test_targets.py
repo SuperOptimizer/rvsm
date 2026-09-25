@@ -974,3 +974,35 @@ def test_fields_graphs_release_their_pool_on_another_key(slab_region, monkeypatc
     rep = targets.region_fields(r.root, r.lo, r.ax, rungs=(2, 3), device="cuda", **KW)
     assert rep["graphs"]["replayed"] > 0
     assert seen == [3]                                 # rung 2's graphs dropped by rung 3's first batch
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="no CUDA device")
+def test_mixed_and_short_batches_replay_the_graphs_with_the_same_bytes(slab_region, tmp_path, monkeypatch):
+    """At batch > 1 a batch with some faceless windows, and a short batch at a rung's end, go through
+    the graphs (the faceless windows computed in full, the short batch padded with air windows):
+    byte-identical stores to the eager path with the faceless windows skipped, on slabs whose faces
+    fall into only some windows and on the curved region."""
+    import types
+    monkeypatch.setattr(targets, "FIELD_BATCH", 3)
+    lo = (0, 0, 0)
+    reps = {}
+    for name, kw in (("pair", dict(recto_x=80, verso_x=70)), ("edge", dict(recto_x=110, verso_x=104)),
+                     ("curved", None)):
+        roots = {}
+        for g in (False, True):
+            monkeypatch.setattr(targets, "GRAPHS", g)
+            if kw is None:
+                root = str(tmp_path / f"mc{int(g)}")
+                ax = _curved_region(root)
+                reps[(name, g)] = targets.region_fields(root, lo, ax, rungs=(2, 3), device="cuda", **KW)
+                roots[g] = types.SimpleNamespace(root=root, lo=lo)
+            else:
+                roots[g] = slab_region(name=f"m{name}{int(g)}", n=128, **kw)
+                reps[(name, g)] = targets.region_fields(roots[g].root, roots[g].lo, roots[g].ax, rungs=(2, 3),
+                                                        device="cuda", **KW)
+        _same_stores(roots[False], roots[True])
+    st = {k: v["skipped_blocks"] for k, v in reps.items()}
+    assert sum(st[(n, True)]["graphed_faceless"] for n in ("pair", "edge", "curved")) > 0
+    assert sum(st[(n, True)]["graphed_padded"] for n in ("pair", "edge", "curved")) > 0
+    assert all(st[(n, False)]["graphed_faceless"] == st[(n, False)]["graphed_padded"] == 0
+               for n in ("pair", "edge", "curved"))
