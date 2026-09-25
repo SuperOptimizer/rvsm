@@ -1349,11 +1349,19 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         casch = ct[:, layout.i_cas:layout.i_cas + 1].detach().clone() if cas.on else None
         # the weights ride along as extra target channels, so the geometric augs transform them
         # identically to the fields they weigh -- and so does an overlap draw's EMA field
+        nt = int(tg.shape[1])        # cout_t, + the trailing ROUTING row under a teacher route
         ct, tgw = A.apply(ct, torch.cat([tg, wt] + ([ovE] if ovE is not None else []), 1), acfg,
                           nimg=layout.i_cas, rung=ks)
-        T_ = layout.cout_t
-        tg, wt = tgw[:, :T_], tgw[:, T_:2 * T_]
-        ovE = tgw[:, 2 * T_:] if ovE is not None else None
+        tg, wt = tgw[:, :nt], tgw[:, nt:2 * nt]
+        ovE = tgw[:, 2 * nt:] if ovE is not None else None
+        # ---- per-rung teacher ROUTING (`config.route_spec`): the routing row leaves the batch here, and
+        # at a routed rung-2 sample the recto target / weight become the gap-fill ones (`losses.route_*`)
+        w_cont, route_m = None, None
+        if nt > layout.cout_t:
+            tb, wb = tg[:, layout.cout_t:layout.cout_t + 1], wt[:, layout.cout_t:layout.cout_t + 1]
+            tg, wt = tg[:, :layout.cout_t], wt[:, :layout.cout_t]
+            route_m = L.route_masks(tb, wb, dilate=int(cfg.band_dilate))
+            tg, wt, w_cont = L.route_apply(tg, wt, tb, route_m)
         ct = ct.to(memory_format=M.memfmt())
         ph.mark("aug")
         nvox += int(np.prod(ct.shape[2:])) * ct.shape[0]
@@ -1395,6 +1403,17 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             lr_, lv_ = L.pair_logits(d, th, half=cfg.pair_band, tau=cfg.pair_tau)
             pb_, pd_ = pair_terms(lr_, lv_, tg[:, :2], wt[:, :2], paired)
             r["pair_bce"], r["pair_dice"] = float(cfg.loss_pair) * pb_, float(cfg.loss_pair) * pd_
+        if route_m is not None:
+            # the gap-fill: nothing predicted outside the dilated base band where the fine teacher is
+            # not confident; the routed shares say whether gap zones dominate (regression to blur)
+            nr = route_m["routed"].sum().clamp_min(1.0)
+            reg_extra.update({"route_vox": float(route_m["routed"].mean()),
+                              "route_ca": float(route_m["ca"].sum() / nr),
+                              "route_gap": float(route_m["gap"].sum() / nr),
+                              "route_out": float(route_m["outside"].sum() / nr)})
+            if float(cfg.loss_band) > 0:
+                r["band"] = float(cfg.loss_band) * L.band_penalty(
+                    torch.sigmoid(y0[:, :1]), route_m["outside"], eps=float(cfg.band_eps))
         for k_, v_ in r.items():
             loss = loss + v_
         reg_log = {k_: float(v_.detach()) for k_, v_ in r.items()}
@@ -1442,7 +1461,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                               skel_iters=cfg.skel_iters,
                               w_skel_prec=cfg.loss_skel_prec, skel_prec_iters=cfg.skel_prec_iters,
                               skel_prec_gate=cfg.skel_prec_gate,
-                              cascade=cv(casch), cascade_self=cas.last_self)
+                              cascade=cv(casch), cascade_self=cas.last_self, w_cont=cv(w_cont))
             if "aux" in ax:
                 loss = loss + ax["aux"].float()
             aux_log = {k: float(v.detach()) for k, v in ax.items()}

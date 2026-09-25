@@ -362,7 +362,7 @@ KEYS = ("excl", "selfcons", "skel", "skel_prec", "affinity")
 
 def aux_losses(logit, tgt, wv, layout, w_excl=0.0, w_selfcons=0.0, w_skel=0.0, w_affinity=0.0,
                cascade=None, cascade_self=None, skel_iters=4, aff_fg_only=True, w_skel_prec=0.0,
-               skel_prec_iters=3, skel_prec_gate=0.3):
+               skel_prec_iters=3, skel_prec_gate=0.3, w_cont=None):
     """{name: unweighted loss} for every term whose weight is non-zero, plus `aux` = their weighted sum.
 
     `logit` is the FULL head output and `layout` says where each head lives: the probability heads are
@@ -371,18 +371,23 @@ def aux_losses(logit, tgt, wv, layout, w_excl=0.0, w_selfcons=0.0, w_skel=0.0, w
     channel of this step and `cascade_self` (B,) the mask of samples that took the SELF source.
     `w_skel_prec` weighs the skeleton PRECISION term (`skel_precision`), on the same probability heads,
     the same level-0 output and so the same rungs as the skeleton recall.
+
+    `w_cont` (default `wv`): the weight of the two CONTINUITY terms, self-consistency and skeleton
+    recall. A routed rung-2 sample (`route_apply`) gives them the weight BEFORE its gap zones were
+    zeroed: in a gap they are the supervision (with the skeleton of the base-teacher band there).
     """
     out, total, np_ = {}, None, layout.nprob
+    wc = wv if w_cont is None else w_cont
     p = None
     if w_excl > 0 and np_ >= 2:
         p = torch.sigmoid(logit[:, :np_])
         out["excl"] = exclusivity(p, wv)
     if w_selfcons > 0 and cascade is not None:
         p = torch.sigmoid(logit[:, :np_]) if p is None else p
-        out["selfcons"] = self_consistency(p, cascade, wv, cascade_self)
+        out["selfcons"] = self_consistency(p, cascade, wc, cascade_self)
     if w_skel > 0:
         p = torch.sigmoid(logit[:, :np_]) if p is None else p
-        out["skel"] = skel_recall(p, tgt[:, :np_], wv[:, :np_] if wv is not None else None, iters=skel_iters)
+        out["skel"] = skel_recall(p, tgt[:, :np_], wc[:, :np_] if wc is not None else None, iters=skel_iters)
     if w_skel_prec > 0:
         p = torch.sigmoid(logit[:, :np_]) if p is None else p
         out["skel_prec"] = skel_precision(p, tgt[:, :np_], wv[:, :np_] if wv is not None else None,
@@ -397,6 +402,54 @@ def aux_losses(logit, tgt, wv, layout, w_excl=0.0, w_selfcons=0.0, w_skel=0.0, w
     if total is not None:
         out["aux"] = total
     return out
+
+
+# ============================================================== per-rung teacher routing, gap-fill
+
+ROUTE_ON, ROUTE_CA = 0.25, 0.75   # the routing row's weight: > ON = a routed voxel, > CA = c_A = 1
+                                  # (codes 128 / 255 from `sample._band_row`, thresholds robust to the
+                                  # augmentation's interpolation of the weight)
+
+
+def route_masks(tb, wb, dilate=2, thr=0.5):
+    """The per-voxel routing of a batch from its ROUTING row (target `tb` = the base (m7) teacher's
+    probability, weight `wb`; both (B, 1, Z, Y, X) in 0..1, `sample._band_row`). Float 0/1 masks:
+
+    routed   the voxel has a routed target (a routed region's fine rung, CT > 0, inside the store)
+    ca       ... and the fine teacher is trusted there (c_A = 1): BCE + dice vs the fine teacher, as today
+    band     the base teacher's band (tb >= thr) dilated by `dilate` voxels (a Chebyshev cube)
+    gap      routed, c_A = 0, inside `band`: NO direct BCE / dice -- the cascade self-consistency, the
+             skeleton recall against the band's skeleton and the distance heads carry it
+    outside  routed, c_A = 0, outside `band`: BCE + dice vs the base teacher's probability (the air
+             suppression of the m7-only targets, unchanged) and the band penalty (`band_penalty`)
+    """
+    routed = (wb > ROUTE_ON).to(wb.dtype)
+    ca = (wb > ROUTE_CA).to(wb.dtype)
+    band = (tb >= thr).to(tb.dtype)
+    r = int(dilate)
+    if r > 0:
+        band = F.max_pool3d(band, 2 * r + 1, stride=1, padding=r)
+    nca = routed * (1 - ca)
+    return {"routed": routed, "ca": ca, "band": band, "gap": nca * band, "outside": nca * (1 - band)}
+
+
+def route_apply(tgt, wv, tb, m):
+    """(tgt, wv, w_cont): the batch's recto target / weight with the routing applied, and the weight the
+    continuity terms keep (`aux_losses(w_cont=...)`). The recto row's target is the fine teacher's
+    probability where c_A = 1 (and on every unrouted voxel), the base teacher's elsewhere; its weight is
+    zeroed in the gap zones. Every other row, and every unrouted voxel, is left exactly as it was."""
+    nca = m["routed"] * (1 - m["ca"])
+    t0 = tgt[:, :1] * (1 - nca) + tb * nca
+    w0 = wv[:, :1] * (1 - m["gap"])
+    return torch.cat([t0, tgt[:, 1:]], 1), torch.cat([w0, wv[:, 1:]], 1), wv
+
+
+def band_penalty(p, outside, w=None, eps=0.05):
+    """sum(relu(p - eps)^2 * m) / sum(m) with m = `outside` (x the loader weight `w`): nothing is
+    predicted outside the dilated base-teacher band where the fine teacher is not confident. 0 (with no
+    gradient) for a batch without such voxels."""
+    m = outside if w is None else outside * w
+    return ((p - float(eps)).clamp_min(0) ** 2 * m).sum() / m.sum().clamp_min(1e-6)
 
 
 # ================================================ distance regression, Eikonal, normals, pairing, ECT
