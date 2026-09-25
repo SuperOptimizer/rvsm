@@ -695,6 +695,57 @@ def fuse_agreement_u8(ps, pm, ws=1.0, wm=1.0, floor=0.05, chunk=32):
     return P, W
 
 
+# THE COVERAGE RULE of a routed rung-2 target (`config.route_spec`, rule `config.ROUTE_RULE` "cA-v1"):
+# the fine (2.4 um recto) teacher's probability p is TRUSTED (c_A = 1) where it is confident --
+#   p >= COV_HI (0.6): a confident face voxel, anywhere; or
+#   p <= COV_LO (0.2) AND within COV_REACH rung-2 voxels (24 = 57.6 um, `targets.REACH`) of one of the
+#   fine teacher's own faces (p >= 0.5): a confident background voxel where the teacher demonstrably sees
+#   sheets, i.e. the gap BETWEEN faces it resolved.
+# Everywhere else c_A = 0: the undecided 0.2 < p < 0.6 voxels, and "background" far from any face the
+# fine teacher found -- exactly where a sheet the fine teacher MISSED (and the coarser m7 sees) would be.
+# The reach is measured on a COV_POOL x max-pooled face mask dilated by ceil(REACH / COV_POOL) coarse
+# voxels (a Chebyshev cube), so it is exact to within COV_POOL - 1 voxels and costs a 256^3 dilation
+# for a 1024^3 region instead of a 49^3 one.
+COV_HI, COV_LO, COV_FACE = 0.6, 0.2, 0.5
+COV_REACH = 24
+COV_POOL = 4
+
+
+def _dilate_max(x, r):
+    """Chebyshev dilation of a (Z, Y, X) float mask by `r` voxels, as three separable 1-D max pools."""
+    if r <= 0:
+        return x
+    v = x[None, None]
+    for k in ((2 * r + 1, 1, 1), (1, 2 * r + 1, 1), (1, 1, 2 * r + 1)):
+        pad = tuple(q for kk in reversed(k) for q in ((kk - 1) // 2, (kk - 1) // 2))
+        v = F.max_pool3d(F.pad(v, pad, value=0.0), k, stride=1)
+    return v[0, 0]
+
+
+def route_coverage_u8(P, hi=COV_HI, lo=COV_LO, face=COV_FACE, reach=COV_REACH, pool=COV_POOL, chunk=64):
+    """c_A of a fine-teacher uint8 probability block `P` (Z, Y, X), as a uint8 block on P's device:
+    255 where the rule above trusts the fine teacher, 0 elsewhere. Written as the routed generation's
+    `rw` store (the sampler turns it into the band row's weight, the trainer into the routing masks)."""
+    t = torch.as_tensor(P)
+    S = tuple(int(v) for v in t.shape)
+    f = int(pool)
+    pad = [q for d in (2, 1, 0) for q in (0, (-S[d]) % f)]
+    fc = (t >= int(round(face * 255))).to(torch.float32)
+    fc = F.max_pool3d(F.pad(fc[None, None], pad), f)[0, 0]
+    near = _dilate_max(fc, -(-int(reach) // f)) > 0
+    out = torch.empty(S, dtype=torch.uint8, device=t.device)
+    h8, l8 = int(round(hi * 255)), int(round(lo * 255))
+    for z in range(0, S[0], int(chunk)):
+        b = t[z:z + chunk]
+        nz = near[z // f:(z + b.shape[0] - 1) // f + 1]
+        nz = nz.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
+        off = z - (z // f) * f
+        nz = nz[off:off + b.shape[0], :S[1], :S[2]]
+        ok = (b >= h8) | ((b <= l8) & nz)
+        out[z:z + chunk] = ok.to(torch.uint8) * 255
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # The student pass
 # --------------------------------------------------------------------------- #

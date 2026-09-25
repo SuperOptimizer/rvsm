@@ -461,6 +461,14 @@ class TeacherBank:
         self.on_device = True               # False while the weights are parked in host memory (`offload`)
         self._host = {}                     # teacher -> pinned host copies of its parameters and buffers
         names = teacher_names(cfg)          # ONLY the configured teachers are built (m7 alone: no recto)
+        # the per-rung ROUTE (`config.route_spec`): both of its teachers must be in the bank, and the
+        # bank then writes recto (fine) + band (base) + rw (c_A) instead of a fusion (`probs_routed`)
+        self.route = CFG.route_spec(cfg)
+        if self.route is not None:
+            miss = [n for n in (self.route.fine, self.route.base) if n not in names]
+            if miss:
+                raise SystemExit(f"rvsm run: teacher_route names {miss} but the teacher set is {names}; "
+                                 f"give both in `teacher_ckpts`")
         self.items = []
         for n in names:
             if n not in T.TEACHERS:
@@ -551,13 +559,65 @@ class TeacherBank:
         them, and while they are parked in host memory)."""
         return sum(module_bytes(row[3]) for row in self.items) if getattr(self, "on_device", True) else 0
 
-    def read(self, ct, lo, size, pyr=None):
+    def read(self, ct, lo, size, pyr=None, skip=()):
         """Every teacher's CT for a region, read ahead of its pass (`infer.teacher_read`): the producer's
-        reader thread calls this for the NEXT region while the GPU runs the current one."""
+        reader thread calls this for the NEXT region while the GPU runs the current one. A teacher named
+        in `skip` (a routed reteach that reuses the base teacher's committed store) reads nothing (None)."""
         from rvsm import infer, ladder
         pyr = ladder.rungs(ct) if pyr is None else pyr
         m = int(getattr(self.cfg, "infer_margin", 0))
-        return [infer.teacher_read(ct, lo, size, row[1], pyr=pyr, margin=m) for row in self.items]
+        return [None if row[0] in skip else infer.teacher_read(ct, lo, size, row[1], pyr=pyr, margin=m)
+                for row in self.items]
+
+    def _one_u8(self, i, ct, lo, size, roi=None):
+        """Teacher `i` of the bank over one region, as a uint8 probability tensor on the device (its
+        float plane is quantised at once and freed: the routed pass never holds two)."""
+        from rvsm import infer
+        row = self.items[i]
+        net = self._net(row)
+        p = infer.teacher_region(ct, lo, size, row[1], row[2], device=self.device, backend=self.backend,
+                                 net=net, as_tensor=True, fast=self.fast.get(row[0]), roi=roi,
+                                 margin=int(getattr(self.cfg, "infer_margin", 0)),
+                                 engine_dir=os.path.join(self.out, "ckpt", "trt"))
+        u = infer.u8_t(p)
+        del p
+        return u
+
+    def probs_routed(self, ct, lo, size, rois=None, band=None, band_from=None):
+        """(u8 fine-teacher probability, u8 c_A coverage, u8 base-teacher band, attrs) for one region under
+        the ROUTE (`config.route_spec`), every block a uint8 tensor on the device.
+
+        recto = the fine (2.4 um recto) teacher's probability, as it is; band = the base (m7) teacher's
+        probability at rung 2 -- `band` (a host uint8 block, the base teacher's committed store read by
+        the producer: no base rerun) when given, else a base-teacher pass; rw = c_A
+        (`infer.route_coverage_u8`: 255 where the fine teacher is trusted). The passes run one after
+        the other on the one card, each freed to uint8 before the next."""
+        import torch
+
+        from rvsm import infer
+        self.onload()
+        r = self.route
+        names = [row[0] for row in self.items]
+        fi, bi = names.index(r.fine), names.index(r.base)
+        P = self._one_u8(fi, ct, lo, size, roi=(rois[fi] if rois is not None else None))
+        if band is not None:
+            B = torch.as_tensor(np.ascontiguousarray(band, np.uint8)).to(P.device)
+            if tuple(B.shape) != tuple(P.shape):     # a store is padded to 128s: the region's own box
+                Bf = torch.zeros_like(P)
+                s = tuple(slice(0, min(int(a), int(b))) for a, b in zip(B.shape, P.shape))
+                Bf[s] = B[s]
+                B = Bf
+            src = "store:" + str(band_from or "")
+        else:
+            B = self._one_u8(bi, ct, lo, size, roi=(rois[bi] if rois is not None else None))
+            src = "teacher"
+        W = infer.route_coverage_u8(P)
+        return P, W, B, {"producer": f"teacher:{r.fine}+band:{r.base}", "teachers": [r.fine, r.base],
+                         "route": r.sig, "radial_sign": 1, "rw": "coverage", "band_source": src,
+                         "coverage": {"hi": infer.COV_HI, "lo": infer.COV_LO, "face": infer.COV_FACE,
+                                      "reach": infer.COV_REACH, "pool": infer.COV_POOL},
+                         "ckpt": {x[0]: x[2] for x in self.items}, "backend": self.backend,
+                         "margin": int(getattr(self.cfg, "infer_margin", 0))}
 
     def probs_u8(self, ct, lo, size, rois=None):
         """(u8 fused probability, u8 agreement weight, attrs) for one region, over every loaded teacher,
@@ -860,7 +920,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     route, pos = region_route(cfg, visits, order, held)
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
     frungs = field_rungs(cfg)
-    teachers = teacher_names(cfg)       # a round-0 recto from another set is regenerated (`reteach`)
+    teachers = teacher_set(cfg)         # a round-0 recto from another set (or route) is regenerated (`reteach`)
     held_los = [tuple(int(v) for v in h["lo"]) for h in held]
     rr = {"todo": None, "t": 0.0, "n": None, "t_log": 0.0}   # the recto regeneration's work list
     # the distance fields: on the producer's own GPU when it has one (`targets.block_fields_torch`,
@@ -966,7 +1026,15 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             cache.fetch_region_outside(np.array(lo, np.int64), clock, ctx=cfg.ctx, patch=cfg.patch,
                                        region=cfg.region, on_booked=lambda k: keys.__setitem__(lo, k))
         if job in TEACHER_JOBS and bank is not None:
-            return bank.read(ct_local, lo, region_size(pyr, lo, cfg.region), pyr=pyr)
+            if bank.route is None:
+                return bank.read(ct_local, lo, region_size(pyr, lo, cfg.region), pyr=pyr)
+            # a ROUTED pass: a reteach reuses the base teacher's committed probability (no m7 rerun);
+            # the store is decoded here, on the reader thread, beside the GPU's current unit
+            bp = band_reuse(out, lo, teachers) if job == "reteach" else None
+            band = np.asarray(stores.open_store(bp)[:], np.uint8) if bp else None
+            return {"rois": bank.read(ct_local, lo, region_size(pyr, lo, cfg.region), pyr=pyr,
+                                      skip=(bank.route.base,) if bp else ()),
+                    "band": band, "band_from": bp}
         return None
 
     def prefetch(lo, job):
@@ -1235,17 +1303,36 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                           "step": None if cst is None else int(getattr(cst, "step", 0))},
                          echo=False)
                     if job in TEACHER_JOBS:
-                        P, W, attrs = bank.probs_u8(ct_local, lo, size, rois=got)
+                        B = None
+                        if bank.route is not None:
+                            g_ = got if isinstance(got, dict) else {"rois": got}
+                            P, W, B, attrs = bank.probs_routed(ct_local, lo, size, rois=g_.get("rois"),
+                                                               band=g_.get("band"),
+                                                               band_from=g_.get("band_from"))
+                            reused = g_.get("band") is not None
+                            del g_
+                            got = None
+                        else:
+                            P, W, attrs = bank.probs_u8(ct_local, lo, size, rois=got)
                         if job == "reteach":
                             # a new teacher set's recto + rw: the NEXT generation, beside the old pair
                             # (which readers keep using until `commit_sources` moves them)
                             attrs = {**attrs, "regeneration": True, "gen": stores.next_gen(out, lo, 0),
                                      "replaces_teachers": store_teachers(
                                          stores.current_path(out, "recto", lo, 0))}
-                        pooled = RG.pool_chain(P, RG.COARSE_RUNGS)
-                        rows = [("recto", P.cpu().numpy(), 8, "prob_u8"),
-                                ("rw", W.cpu().numpy(), 8, "prob_u8")]
-                        del P, W
+                        if B is not None:
+                            # ROUTED: the coarse rungs follow the BASE teacher (rungs >= 3 are its
+                            # targets); a band reused from its committed store fed them already
+                            pooled = None if reused else RG.pool_chain(B, RG.COARSE_RUNGS)
+                            # rw LAST: its `done` finishes the generation (`recto_needs_regen`)
+                            rows = [("recto", P.cpu().numpy(), 8, "prob_u8"),
+                                    ("band", B.cpu().numpy(), 8, "prob_u8"),
+                                    ("rw", W.cpu().numpy(), 8, "coverage_u8")]
+                        else:
+                            pooled = RG.pool_chain(P, RG.COARSE_RUNGS)
+                            rows = [("recto", P.cpu().numpy(), 8, "prob_u8"),
+                                    ("rw", W.cpu().numpy(), 8, "prob_u8")]
+                        del P, W, B
                     else:
                         rg = st.get("verso_regen") or {}
                         regen_unit = job == "verso" and round_ == 0 and cat.done("verso", lo) \
@@ -1643,6 +1730,52 @@ def store_teachers(path):
     return [str(n) for n in t] if isinstance(t, (list, tuple)) and t else list(DEFAULT_TEACHERS)
 
 
+ROUTE_TOKEN = "route:"    # the identity token of a ROUTED recto (`teacher_set`, `store_ident`)
+
+
+def teacher_set(cfg):
+    """The IDENTITY a round-0 recto of this config must have: the teacher set (`teacher_names`) -- or,
+    under a per-rung route (`config.route_spec`), its fine and base teachers plus a `route:<sig>` token.
+    A store is regenerated (`recto_needs_regen`) when its own identity (`store_ident`) differs, so turning
+    the route on (or changing it, or its coverage rule) regenerates exactly like the m7 switch did, and
+    turning it off regenerates back to the plain set."""
+    r = CFG.route_spec(cfg)
+    if r is None:
+        return teacher_names(cfg)
+    return [r.fine, r.base, ROUTE_TOKEN + r.sig]
+
+
+def store_ident(path):
+    """A finished recto store's identity, comparable with `teacher_set`: its `teachers`, plus the
+    `route:<sig>` token when it is a routed store (attr `route`)."""
+    from rvsm import stores
+    r = stores.read_attrs(path).get("route")
+    return store_teachers(path) + ([ROUTE_TOKEN + str(r)] if r else [])
+
+
+def routed_set(teachers):
+    """Is this identity (`teacher_set`) a routed one?"""
+    return any(str(t).startswith(ROUTE_TOKEN) for t in (teachers or ()))
+
+
+def band_reuse(out, lo, teachers):
+    """For a routed reteach: the path of a finished store holding the BASE teacher's rung-2 probability
+    already, so the base (m7) teacher is not run again -- the region's committed recto when the base
+    teacher alone made it (the m7-only stores of paris4), or the committed generation's `band` when it is
+    a routed store with the same base. None: the base teacher must run."""
+    from rvsm import stores
+    if not routed_set(teachers):
+        return None
+    base = str(teachers[1])
+    p = stores.current_path(out, "recto", lo, 0)
+    if stores.is_done(p) and store_ident(p) == [base]:
+        return p
+    b = stores.current_path(out, "band", lo, 0)
+    if stores.is_done(b) and store_teachers(b)[1:2] == [base]:
+        return b
+    return None
+
+
 def recto_needs_regen(out, lo, teachers):
     """WRITER side: is the region's newest finished round-0 recto (with its rw beside it) made by a
     teacher set other than `teachers`? Then a new teacher pass is due, written as the next generation
@@ -1654,9 +1787,12 @@ def recto_needs_regen(out, lo, teachers):
     if g < 0:
         return False                                 # no recto at all: that is the first teacher pass
     p = stores.gen_path(stores.store_path(out, "recto", lo, 0), g)
-    if sorted(store_teachers(p)) != sorted(str(t) for t in teachers):
+    if sorted(store_ident(p)) != sorted(str(t) for t in teachers):
         return True
-    # the rw of the same generation is written after the recto: a unit cut between the two is redone
+    # the rw of the same generation is written after the recto (and a routed band): a unit cut between
+    # them is redone
+    if routed_set(teachers) and not stores.is_done(stores.gen_path(stores.store_path(out, "band", lo, 0), g)):
+        return True
     return not stores.is_done(stores.gen_path(stores.store_path(out, "rw", lo, 0), g))
 
 
@@ -1667,7 +1803,7 @@ def recto_stale(out, lo, teachers):
     if not teachers:
         return False
     p = stores.current_path(out, "recto", lo, 0)
-    return stores.is_done(p) and sorted(store_teachers(p)) != sorted(str(t) for t in teachers)
+    return stores.is_done(p) and sorted(store_ident(p)) != sorted(str(t) for t in teachers)
 
 
 def fields_behind(out, lo):
@@ -2710,11 +2846,20 @@ def log_switches(out, old, cfg):
     got = []
     oc = dict(d.get("teacher_ckpts") or {})
     nc = dict(cfg.teacher_ckpts or {})
-    if "teacher_ckpts" in d and oc != nc:
+    # the per-rung route (a config.json that predates the field had none)
+    orr = {str(k): str(v) for k, v in dict(d.get("teacher_route") or {}).items()}
+    nrr = {str(k): str(v) for k, v in dict(cfg.teacher_route or {}).items()}
+    if ("teacher_ckpts" in d and oc != nc) or orr != nrr:
         on = [str(n) for n in oc] or list(DEFAULT_TEACHERS)
+        try:
+            oset = teacher_set(CFG.Config(teacher_ckpts=oc, teacher_route=orr))
+        except ValueError:
+            oset = on
         rec = {"kind": "teacher_switch", "step": step, "old": on, "new": teacher_names(cfg),
                "old_ckpts": oc, "new_ckpts": nc,
-               "regenerate": sorted(on) != sorted(teacher_names(cfg))}
+               "regenerate": sorted(oset) != sorted(teacher_set(cfg))}
+        if orr or nrr:
+            rec.update({"old_route": orr, "new_route": nrr, "old_set": oset, "new_set": teacher_set(cfg)})
         jlog(out, "sched", rec)
         got.append(rec)
     moved = {}
@@ -2740,6 +2885,10 @@ def setup(cfg, out=None):
     the CT mirror and the held-out set. Returns the context both halves need."""
     from rvsm import axis as AX, ladder, regions as RG, scanmeta as SM, stream
     out = str(out or cfg.out)
+    r = CFG.route_spec(cfg)                    # a malformed teacher_route fails here, not in the producer
+    if r is not None and not {r.fine, r.base} <= set(teacher_names(cfg)):
+        raise SystemExit(f"rvsm run: teacher_route {dict(cfg.teacher_route)} needs both {r.fine!r} and "
+                         f"{r.base!r} in teacher_ckpts (the teacher set is {teacher_names(cfg)})")
     for d in ("logs", "ckpt", "stores", "eval", "workers"):
         os.makedirs(os.path.join(out, d), exist_ok=True)
 
