@@ -467,8 +467,10 @@ class M7:
         self.eng = self.rt.deserialize_cuda_engine(open(plan, "rb").read())
         self.ctx = self.eng.create_execution_context()
         self.stream = torch.cuda.Stream(dev)
-        self.x = torch.empty((1, 1, W, W, W), dtype=torch.float32, device=dev)
-        self.y = torch.empty((1, 2, W, W, W), dtype=torch.float32, device=dev)
+        self.w = int(self.eng.get_tensor_shape("x")[-1])
+        w = self.w
+        self.x = torch.empty((1, 1, w, w, w), dtype=torch.float32, device=dev)
+        self.y = torch.empty((1, 2, w, w, w), dtype=torch.float32, device=dev)
         self.ctx.set_tensor_address("x", self.x.data_ptr())
         self.ctx.set_tensor_address("y", self.y.data_ptr())
 
@@ -696,6 +698,35 @@ def run_unit(v, r0, r1, m7, codec, pool, stride, wstat):
     ct.keep_from(10 ** 9)
 
 
+def volume_params(v, stride, plan):
+    """The (window, stride, plan) of a volume, pinned by the first unit that starts it: every unit of
+    one volume must use the same grid and weights, whatever the workers are configured with later."""
+    p = os.path.join(state_dir(v), "params.json")
+    if os.path.exists(p):
+        return json.load(open(p))
+    import tensorrt as trt
+    rt = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+    w = int(rt.deserialize_cuda_engine(open(plan, "rb").read()).get_tensor_shape("x")[-1])
+    rec = {"window": w, "stride": int(stride), "plan": plan, "t": time.time()}
+    os.makedirs(state_dir(v), exist_ok=True)
+    with open(p + ".tmp", "w") as f:
+        json.dump(rec, f)
+    try:
+        os.link(p + ".tmp", p)          # first writer wins
+    except FileExistsError:
+        pass
+    os.remove(p + ".tmp")
+    return json.load(open(p))
+
+
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def claim_next(vols, rows_per_unit, me):
     qd = os.path.join(WORK, "queue")
     os.makedirs(qd, exist_ok=True)
@@ -706,11 +737,22 @@ def claim_next(vols, rows_per_unit, me):
             if all(row_done(v, r) for r in range(r0, r1)):
                 continue
             c = os.path.join(qd, f"{v['stem']}_{r0}.claim")
+            rec = json.dumps({"worker": me, "pid": os.getpid(), "t": time.time()}).encode()
             try:
                 fd = os.open(c, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
-                continue
-            os.write(fd, json.dumps({"worker": me, "t": time.time()}).encode())
+                try:
+                    old = json.load(open(c))
+                except (OSError, ValueError):
+                    continue
+                if _alive(old.get("pid")):
+                    continue
+                tmp = c + f".{os.getpid()}"
+                open(tmp, "wb").write(rec)
+                os.replace(tmp, c)          # a dead worker's claim: take it over
+                log(f"[claim] took over {os.path.basename(c)} from dead {old.get('worker')} pid {old.get('pid')}")
+                return v, r0, r1, c
+            os.write(fd, rec)
             os.close(fd)
             return v, r0, r1, c
     return None
@@ -722,7 +764,8 @@ def cmd_worker(a):
     torch.cuda.set_device(dev)
     me = f"gpu{os.environ.get('CUDA_VISIBLE_DEVICES', '0')}"
     vols = load_vols()
-    m7 = M7(dev)
+    plan0 = os.environ.get("M7W_PLAN") or sorted(glob.glob(PLAN_GLOB))[-1]
+    m7 = M7(dev, plan0)
     codec = Codec()
     pool = ThreadPoolExecutor(a.threads)
     wstat = {"worker": me, "pid": os.getpid()}
@@ -740,7 +783,8 @@ def cmd_worker(a):
                 pass
             stop.wait(15)
     threading.Thread(target=dump, daemon=True).start()
-    log(f"[worker] {me} plan {os.path.basename(m7.plan)} stride {a.stride} rows/unit {a.rows}")
+    log(f"[worker] {me} default plan {os.path.basename(m7.plan)} stride {a.stride} rows/unit {a.rows} "
+        f"(a started volume keeps its own pinned params)")
     while not os.path.exists(os.path.join(HOME, "STOP")):
         c = claim_next(vols, a.rows, me)
         if c is None:
@@ -748,7 +792,14 @@ def cmd_worker(a):
             wstat.update(vol=None, idle=True)
             break
         v, r0, r1, cpath = c
-        run_unit(v, r0, r1, m7, codec, pool, a.stride, wstat)
+        prm = volume_params(v, a.stride, plan0)
+        if prm["plan"] != m7.plan:
+            del m7
+            m7 = M7(dev, prm["plan"])
+        global W
+        W = int(prm["window"])
+        assert W == m7.w, (W, m7.w)
+        run_unit(v, r0, r1, m7, codec, pool, int(prm["stride"]), wstat)
         os.remove(cpath)
     stop.set()
 
@@ -952,7 +1003,10 @@ def cmd_finisher(a):
             t = time.time()
             if not os.path.exists(os.path.join(state_dir(v), "levels.done")):
                 build_upper_levels(v, codec, pool)
-                write_meta(v, a.stride, plan)
+                prm = json.load(open(os.path.join(state_dir(v), "params.json")))
+                global W
+                W = int(prm["window"])
+                write_meta(v, int(prm["stride"]), prm["plan"])
                 open(os.path.join(state_dir(v), "levels.done"), "w").close()
                 log(f"[finish] {v['stem']}: levels 4-7 + metadata in {time.time() - t:.0f}s")
             files, total, el = upload_store(v)

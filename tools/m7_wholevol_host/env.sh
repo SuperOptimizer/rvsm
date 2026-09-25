@@ -3,6 +3,7 @@ export PYTHONPATH=$HOME/volume-compressor/python:$HOME/m7_wholevol/rvsm
 export M7W_WORK=/vesuvius/m7_wholevol
 export M7W_HOME=$HOME/m7_wholevol
 export M7W_RUN_TS=20260925170000
+export M7W_STRIDE=96
 export NUMPY_MADVISE_HUGEPAGE=0
 PY=$HOME/usrm2/.venv/bin/python
 T=$HOME/m7_wholevol/rvsm/tools/m7_wholevol.py
