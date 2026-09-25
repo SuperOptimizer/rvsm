@@ -59,15 +59,25 @@ def store_gen(root, channel, lo, round_=0):
     """The highest FINISHED generation of a region store, or -1 when none is."""
     base = store_path(root, channel, lo, round_)
     best = 0 if is_done(base) else -1
-    g = 1
-    while os.path.isdir(gen_path(base, g)):
+    for g in gens(base):
         if is_done(gen_path(base, g)):
-            best = g
-        g += 1
+            best = max(best, g)
     return best
 
 
+def gens(base):
+    """The generations g >= 1 that have a directory beside the store `base`, ascending. Generations
+    may have gaps: a region's verso and recto regenerations share one counter (`next_gen`). Probed up
+    to GEN_MAX (a stat each: the channel directories hold thousands of stores, a listdir per call was
+    the slower way)."""
+    return [g for g in range(1, GEN_MAX + 1) if os.path.isdir(gen_path(base, g))]
+
+
+GEN_MAX = 8     # a region is regenerated a handful of times at most (the verso once, the recto per switch)
+
+
 BUNDLED = ("verso", "midline", "thickness")   # the channels a verso regeneration replaces TOGETHER
+TEACHER_BUNDLED = ("recto", "rw")             # ... and the pair a teacher regeneration replaces together
 
 
 def is_bundled(channel):
@@ -79,34 +89,65 @@ def _bundle_file(root, lo, round_):
     return os.path.join(str(root), "stores", f"round_{int(round_)}", "bundle", region_name(lo)[:-5] + ".json")
 
 
-def bundle_gen(root, lo, round_=0):
-    """The COMMITTED generation of a region's label bundle (verso + its fields): what every reader uses.
-    0 until a regenerated bundle is complete and committed (`commit_bundle`)."""
+def bundle_state(root, lo, round_=0):
+    """The region's COMMITTED generations, what every reader uses: {"gen": the fields' generation,
+    "verso": the verso's, "recto": the recto + rw pair's}. A bundle file written before the recto
+    regeneration existed is {"gen": g}, meaning verso = fields = g and recto = 0; no file is all 0."""
     try:
         import json
         with open(_bundle_file(root, lo, round_)) as f:
-            return int(json.load(f).get("gen", 0))
-    except (OSError, ValueError):
-        return 0
+            d = dict(json.load(f))
+    except (OSError, ValueError, TypeError):
+        d = {}
+    g = int(d.get("gen", 0))
+    return {"gen": g, "verso": int(d.get("verso", g)), "recto": int(d.get("recto", 0))}
 
 
-def commit_bundle(root, lo, round_, gen, **info):
-    """Make generation `gen` of the region's label bundle the one readers use -- written ONLY once the
-    verso and every field store of that generation are finished, so a reader never mixes a new verso
-    with old fields (pass-4 P4-04). Atomic (tmp + rename)."""
+def bundle_gen(root, lo, round_=0):
+    """The COMMITTED generation of a region's field stores (midline*, thickness*): 0 until a
+    regenerated bundle is complete and committed (`commit_bundle`)."""
+    return bundle_state(root, lo, round_)["gen"]
+
+
+def commit_bundle(root, lo, round_, gen, verso=None, recto=None, **info):
+    """Make generation `gen` of the region's fields -- with its verso at generation `verso` (default
+    `gen`) and its recto + rw at `recto` (default: the pair committed now) -- the ones readers use.
+    Written ONLY once every store it names is finished, so a reader never mixes a new verso or recto
+    with fields built from the old one (pass-4 P4-04). Atomic (tmp + rename)."""
     import json
+    cur = bundle_state(root, lo, round_)
+    rec = {"gen": int(gen), "verso": int(gen if verso is None else verso),
+           "recto": int(cur["recto"] if recto is None else recto), **info}
     p = _bundle_file(root, lo, round_)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p + ".tmp", "w") as f:
-        json.dump({"gen": int(gen), **info}, f)
+        json.dump(rec, f)
     os.replace(p + ".tmp", p)
     return p
 
 
+def next_gen(root, lo, round_=0):
+    """A generation number no store of the region uses yet: one past the highest generation DIRECTORY
+    (finished or not) of its recto, rw and verso. Both regenerations (the verso's, the recto's) write
+    there, so the fields rebuilt for them -- at max(verso gen, recto gen), `targets.field_path` -- land
+    in a fresh directory and never over committed ones."""
+    top = 0
+    for ch in TEACHER_BUNDLED + ("verso",):
+        top = max([top] + gens(store_path(root, ch, lo, round_)))
+    assert top < GEN_MAX, f"region {tuple(lo)}: generation {top + 1} is past GEN_MAX"
+    return top + 1
+
+
 def current_path(root, channel, lo, round_=0):
-    """The path a READER uses. A bundled channel (verso, midline*, thickness*) reads the region's
-    COMMITTED bundle generation, all of them the same one; any other channel has one generation."""
+    """The path a READER uses: the committed generation (`bundle_state`) of the verso, of a field
+    channel (midline*, thickness*) and of the teacher pair (recto, rw); any other channel has one
+    generation."""
     base = store_path(root, channel, lo, round_)
+    c = str(channel)
+    if c in TEACHER_BUNDLED:
+        return gen_path(base, bundle_state(root, lo, round_)["recto"])
+    if c == "verso" or c.startswith("verso_r"):
+        return gen_path(base, bundle_state(root, lo, round_)["verso"])
     return gen_path(base, bundle_gen(root, lo, round_)) if is_bundled(channel) else base
 
 

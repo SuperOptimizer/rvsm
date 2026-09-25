@@ -1185,19 +1185,33 @@ def source_verso(root, lo, round_=0):
     return g, stores.gen_path(stores.store_path(root, "verso", lo, round_), g)
 
 
+def source_recto(root, lo, round_=0):
+    """(generation, path) of the recto the WRITER builds fields from: the newest FINISHED generation (a
+    teacher regeneration's new recto, `run.recto_needs_regen`), which readers see only once the fields
+    built from it are committed with it."""
+    g = max(stores.store_gen(root, "recto", lo, round_), 0)
+    return g, stores.gen_path(stores.store_path(root, "recto", lo, round_), g)
+
+
+def field_gen(root, lo, round_=0):
+    """The generation the fields of the region's newest sources are written at: max(verso gen, recto
+    gen). Both regenerations draw from one per-region counter (`stores.next_gen`), so this is a fresh
+    directory whenever either source is new."""
+    return max(source_verso(root, lo, round_)[0], source_recto(root, lo, round_)[0])
+
+
 def _want(root, lo, round_, rung, reach, tmin, tmax, thr):
     rk, tn, tx = rung_params(rung, reach, tmin, tmax)
     return {"target_def": TARGET_DEF, "reach_vox": rk, "tmin_vox": tn, "tmax_vox": tx, "thr": float(thr),
-            "recto_digest": source_digest(stores.store_path(root, "recto", lo, round_)),
+            "recto_digest": source_digest(source_recto(root, lo, round_)[1]),
             "verso_digest": source_digest(source_verso(root, lo, round_)[1])}
 
 
 def field_path(root, kind, k, lo, round_=0):
-    """Where a field store of the region lives: at the GENERATION of its verso source, so a verso
-    regenerated once (round 0, `run.verso_needs_regen`) gets its fields in a new directory beside the
-    old ones, never over them."""
-    g = source_verso(root, lo, round_)[0]
-    return stores.gen_path(stores.store_path(root, channel(kind, k), lo, round_), g)
+    """Where a field store of the region lives: at the GENERATION of its sources (`field_gen`), so a
+    verso regenerated once (round 0, `run.verso_needs_regen`) or a recto from a new teacher set
+    (`run.recto_needs_regen`) gets its fields in a new directory beside the old ones, never over them."""
+    return stores.gen_path(stores.store_path(root, channel(kind, k), lo, round_), field_gen(root, lo, round_))
 
 
 def _current(path, want):
@@ -1251,8 +1265,8 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
     512 and 256 and nothing is padded."""
     assert 0 < float(reach) < int(halo), f"reach {reach} must be positive and below the halo {halo}"
     assert 0 <= float(tmin) <= float(tmax), (tmin, tmax)
-    rp = stores.store_path(root, "recto", lo, round_)
-    vgen, vp = source_verso(root, lo, round_)         # the writer's source: the newest finished verso
+    rp = source_recto(root, lo, round_)[1]            # the writer's sources: the newest finished recto
+    vgen, vp = source_verso(root, lo, round_)         # ... and the newest finished verso
     rec = stores.open_store(rp)                       # raises unless the recto pass has finished
     if not stores.is_done(vp):
         vp = ""
