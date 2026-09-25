@@ -43,7 +43,7 @@ import numpy as np
 import torch
 
 from rvsm import axis as AX, ladder, regions as RG, scanmeta as SM, stores
-from rvsm.config import RUNG_ITEM_KEYS
+from rvsm.config import RUNG_ITEM_KEYS, route_spec
 
 NORM = None            # None = per-patch z-score; (mean, std) = a fixed scan-level normalisation
 AXIS_R_UM = 400.0      # verso / distance / confidence carry no weight this close to the scroll axis
@@ -51,6 +51,9 @@ DIST_CHANNELS = ("midline", "thickness")
 NEAR_AXIS_ZERO = ("verso", "midline", "thickness", "conf")
 DIST_MAX_RUNG = 4      # a distance is never pooled: rungs 2..4 only
 RW = "rw"              # the per-voxel agreement weight store written beside round 0's recto
+BAND = "band"          # a ROUTED generation's base-teacher (m7) probability at rung 2 (`config.route_spec`)
+BAND_CA = 255          # the band row's weight code where the fine teacher is trusted (c_A = 1) ...
+BAND_GAP = 128         # ... and where it is not (c_A = 0); 0 = no routed target (see `_band_row`)
 
 
 def zscore(x):
@@ -232,8 +235,10 @@ def collate(items):
 # --------------------------------------------------------------------------- the dataset
 
 def target_channels(cfg):
-    """The target fields of a sample, in head order: the probability channels then the distances."""
-    return list(cfg.channels) + list(DIST_CHANNELS)
+    """The target fields of a sample, in head order: the probability channels then the distances -- and,
+    under a teacher route (`config.route_spec`), one trailing ROUTING row `band` (`Patches._band_row`)
+    that no head predicts: the trainer takes it off before the losses (`losses.route_masks`)."""
+    return list(cfg.channels) + list(DIST_CHANNELS) + ([BAND] if route_spec(cfg) is not None else [])
 
 
 def _clip_read(arr, o, n):
@@ -269,6 +274,7 @@ class Patches(torch.utils.data.IterableDataset):
         self.patch = ladder.shape3(cfg.patch)
         self.ctx = tuple(int(q) for q in cfg.ctx)
         self.channels = target_channels(cfg)
+        self.route = route_spec(cfg)      # the per-rung teacher route (None: off, nothing below changes)
         self.need = tuple(need if need is not None else (self.channels[0],))
         self.windows = int(cfg.windows_per_region if windows is None else windows)
         self.heldout = list(heldout)
@@ -346,7 +352,8 @@ class Patches(torch.utils.data.IterableDataset):
         r = self._region_of(k, lo, shape)
         if r is None:
             return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
-        a = self.cat.open(chan, r)
+        chan = self._eff(chan, r, k)
+        a = self.cat.open(chan, r) if chan is not None else None
         if a is None:
             return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
         v, ins = stores.read_store(a, k, lo, shape)
@@ -381,23 +388,74 @@ class Patches(torch.utils.data.IterableDataset):
             if (phi <= plo).any():
                 continue
             pn = phi - plo
+            ch = self._eff(chan, r, k)         # a routed region's rungs >= 3 read its base-teacher band
+            if ch is None:
+                continue
             if k == 3 and home is not None and tuple(int(v) for v in r) == home:
-                got = self._pool3(chan, r)     # the visit's own region: pooled once per visit
+                got = self._pool3(ch, r)       # the visit's own region: pooled once per visit
                 if got is None:
                     continue
                 v, i_ = _clip_read(got, plo - f0, pn)
             elif k == 3:
-                a = self.cat.open(chan, r)
+                a = self.cat.open(ch, r)
                 if a is None:
                     continue
                 v, i_ = stores.read_store(a, 3, plo, pn)
             else:
-                v, i_ = RG.pooled_window(self.root, chan, r, k, plo, pn, self.round)
+                v, i_ = RG.pooled_window(self.root, ch, r, k, plo, pn, self.round)
             o = plo - lo
             sl = tuple(slice(int(o[j]), int(o[j] + pn[j])) for j in range(3))
             out[sl] = v
             ins[sl] = i_
         return out, ins
+
+    def _routed(self, r):
+        """Is region `r` (rung-2 origin) served by a ROUTED generation: a route is configured, this is
+        round 0, and the region's COMMITTED teacher generation has its `band` (a region the regeneration
+        has not reached yet keeps its old stores' meaning -- the m7 recto with its rw)."""
+        return self.route is not None and self.round == 0 and r is not None and \
+            self.cat.done(BAND, tuple(int(v) for v in r))
+
+    def _eff(self, chan, r, k):
+        """The store a channel is read from for region `r` at rung `k` -- or None: nothing.
+
+        Unrouted (every region without a route): the channel itself, and `band` has nothing. Routed
+        (`_routed`): at the fine rung (2) the recto IS the fine teacher's store and the rw is c_A,
+        which is never a recto weight (the band row reads it itself, `_band_row`); at every other
+        rung the recto target is the BASE teacher's -- the `band` store, pooled like the recto was --
+        and neither band nor rw means anything."""
+        if chan not in ("recto", RW, BAND) or not self._routed(r):
+            return None if chan == BAND else chan
+        fine = int(k) in self.route.fine_rungs
+        if chan == "recto":
+            return "recto" if fine else BAND
+        return None if chan == RW or not fine else BAND
+
+    def _band_row(self, k, lo, p, air):
+        """The ROUTING row of a rung-`k` window: (target, weight) uint8. At a routed region's fine rung the
+        target is the base (m7) teacher's probability and the weight says, per voxel, which rule
+        applies: BAND_CA (1.0) where the fine teacher is trusted (c_A, the generation's `rw`), BAND_GAP
+        (~0.5) where it is not, 0 where there is no routed target at all (CT air, outside the store, an
+        unrouted region, another rung). The trainer turns it into the gap-fill masks
+        (`losses.route_masks`) and drops it; nothing predicts it and the evaluation never reads it."""
+        tg = np.zeros(p, np.uint8)
+        w = np.zeros(p, np.uint8)
+        if self.route is None or int(k) not in self.route.fine_rungs:
+            return tg, w
+        r = self._region_of(k, lo, p)
+        if not self._routed(r):
+            return tg, w
+        r = tuple(int(v) for v in r)
+        a, c = self.cat.open(BAND, r), self.cat.open(RW, r)
+        if a is None or c is None:
+            return tg, w
+        v, ins = stores.read_store(a, k, lo, p)
+        cv, cin = stores.read_store(c, k, lo, p)
+        m = air & ins & cin
+        np.copyto(tg, v, where=air)
+        w[m] = BAND_GAP
+        w[m & (cv >= 128)] = BAND_CA
+        return tg, w
 
     def _dist_stitched(self, kind, k, lo, shape):
         """Rungs 3-4 of a DISTANCE channel: (cube, inside) with every voxel read from its region's OWN
@@ -498,6 +556,9 @@ class Patches(torch.utils.data.IterableDataset):
             if (rf > 0).any():
                 rw8 = np.where(rf > 0, rv, np.uint8(255))
         for c, chan in enumerate(self.channels):
+            if chan == BAND:
+                tg[c], w[c] = self._band_row(k, lo, p, air)
+                continue
             dist = chan in DIST_CHANNELS
             if dist and int(k) > DIST_MAX_RUNG:
                 continue                      # a distance is never pooled: no target here, so weight 0
@@ -802,10 +863,14 @@ def grid_global(cfg, round_, heads):
     versions, the store round, the heads with targets and the config fields an item is built from
     (`grid_key` without the corners and the per-region sources)."""
     from rvsm import targets as TG
-    return {"round": int(round_), "heads": list(heads), "schema": GRID_SCHEMA, "target_def": TG.TARGET_DEF,
-            "keys": [q for q in RUNG_ITEM_KEYS if q != "tch"], "patch": int(cfg.patch),
-            "ctx": [int(v) for v in cfg.ctx], "channels": [str(c) for c in cfg.channels],
-            "planes": str(cfg.planes), "rungs": [int(v) for v in cfg.rungs]}
+    g = {"round": int(round_), "heads": list(heads), "schema": GRID_SCHEMA, "target_def": TG.TARGET_DEF,
+         "keys": [q for q in RUNG_ITEM_KEYS if q != "tch"], "patch": int(cfg.patch),
+         "ctx": [int(v) for v in cfg.ctx], "channels": [str(c) for c in cfg.channels],
+         "planes": str(cfg.planes), "rungs": [int(v) for v in cfg.rungs]}
+    r = route_spec(cfg)
+    if r is not None:                  # a routed item carries the routing row: a different item
+        g["route"] = r.sig
+    return g
 
 
 def _item_name(glob, source, k, lo):
