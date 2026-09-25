@@ -26,13 +26,13 @@ ONNX = "/vesuvius/tsm/models/trt/m7_b1_fp16.onnx"
 LAB = os.path.join(M.WORK, "lab")
 
 
-def build(window, batch, level, tag=""):
+def build(window, batch, level, tag="", onnx_path=None, name=None):
     import onnx
     import tensorrt as trt
     os.makedirs(LAB, exist_ok=True)
-    name = f"m7_p{window}_b{batch}_L{level}{tag}"
+    name = name or f"m7_p{window}_b{batch}_L{level}{tag}"
     plan = os.path.join(LAB, name + ".plan")
-    m = onnx.load(ONNX, load_external_data=True)
+    m = onnx.load(onnx_path or ONNX, load_external_data=True)
     for vi in list(m.graph.input) + list(m.graph.output):
         d = vi.type.tensor_type.shape.dim
         for i, v in enumerate([batch, d[1].dim_value, window, window, window]):
@@ -203,6 +203,8 @@ def main():
     b.add_argument("--batch", type=int, default=1)
     b.add_argument("--level", type=int, default=3)
     b.add_argument("--tag", default="")
+    b.add_argument("--onnx", default=None)
+    b.add_argument("--name", default=None)
     t = sub.add_parser("time")
     t.add_argument("--plan", required=True)
     t.add_argument("--n", type=int, default=20)
@@ -215,7 +217,7 @@ def main():
     g.add_argument("--configs", required=True)
     a = ap.parse_args()
     if a.cmd == "build":
-        build(a.window, a.batch, a.level, a.tag)
+        build(a.window, a.batch, a.level, a.tag, a.onnx, a.name)
     elif a.cmd == "time":
         cmd_time(a)
     else:
