@@ -70,7 +70,7 @@ agreement; with one, `rw` is 1 everywhere. No walk, no state.json, no lookahead:
 region a producer, a test or a hand at the terminal asks for.
 
 --margin M reads M rung-2 voxels of fine CT around the region (the config's `infer_margin`, default
-64; 0 = none) so the region's faces are predicted with real context; the store is still the region.
+16; 0 = none) so the region's faces are predicted with real context; the store is still the region.
 """
 
 

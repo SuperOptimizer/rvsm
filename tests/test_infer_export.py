@@ -991,8 +991,8 @@ def test_margin_geometry_and_the_zero_margin_is_the_old_pass(student_env):
     assert old.core == (0, 0, 0) and old.offs == infer.offsets(old.shape, WIN, HALO)
     new = _student_inputs(e.cfg, e.ax, e.meta, lo, size, cascade_depth=0, margin=16)
     assert new.core == (0, 16, 0) and new.shape == (80, 96, 80) and new.lo == (0, 48, 0)
-    for o in new.offs:                    # every window kept meets the box on every axis
-        assert all(o[k] < new.core[k] + size[k] and o[k] + WIN > new.core[k] for k in range(3))
+    for o in new.offs:                    # every window kept has its KEPT core in the box on every axis
+        assert all(o[k] + HALO < new.core[k] + size[k] and o[k] + WIN - HALO > new.core[k] for k in range(3))
     assert np.array_equal(new.roi[:64, 16:80, :64].numpy(),
                           ladder.read_rung(e.pyr, 2, lo, size, dtype=np.uint8))
 
@@ -1000,6 +1000,24 @@ def test_margin_geometry_and_the_zero_margin_is_the_old_pass(student_env):
     p0 = infer.run_region(_head0_of, old, size, WIN, HALO, offs=old.offs)
     pa = infer.run_region(_head0_of, old, size, WIN, HALO, offs=infer.offsets(old.shape, WIN, HALO))
     assert torch.equal(p0, pa)
+
+    # the accumulators are the BOX at any margin (only the inputs grow), and clipping each window to
+    # the box is exactly the padded-grid blend cropped: the same terms, added in the same order
+    st0, stm = {}, {}
+    infer.run_region(_head0_of, old, size, WIN, HALO, offs=old.offs, stats=st0)
+    pm = infer.run_region(_head0_of, new, size, WIN, HALO, offs=new.offs, stats=stm, acc_dtype=torch.float32)
+    assert st0["acc_shape"] == stm["acc_shape"] == tuple(size) and stm["windows"] > 0
+    g = infer.gauss_t(WIN, torch.device("cpu"))
+    acc, ws = torch.zeros(new.shape), torch.zeros(new.shape)
+    for o in new.offs:
+        if new.window_any(o):
+            sl = tuple(slice(o[k], o[k] + WIN) for k in range(3))
+            acc[sl] += _head0_of(new.prep(o))[0, 0].float() * g
+            ws[sl] += g
+    c = new.core
+    box = tuple(slice(c[k], c[k] + size[k]) for k in range(3))
+    ref = torch.where((ws[box] > 0) & (new.roi[box] > 0), acc[box] / ws[box].clamp_min(1e-30), 0.0)
+    assert torch.allclose(pm[0], ref, atol=1e-6)
 
 
 def _face_err(e, st, margin, depth=0):
@@ -1021,7 +1039,7 @@ def test_margin_removes_the_region_face_seam(student_env, student_ckpt):
     e = student_env
     st = infer.student_fn(student_ckpt, device="cpu", compile=False)
     e0, _ = _face_err(e, st, 0)
-    em, A = _face_err(e, st, 2 * WIN)
+    em, A = _face_err(e, st, 16)           # the default `infer_margin`
     assert A.shape == (64, 64, 64)
     assert em < 0.25 * e0 and em < 0.02, (e0, em)
 

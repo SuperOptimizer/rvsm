@@ -68,12 +68,24 @@ def margin_box(lo, size, margin, shape):
     return a, b - a
 
 
-def core_offsets(offs, window, core, size):
-    """The window starts of `offs` whose window [o, o + w) meets the core box [core, core + size) on
-    every axis: a window wholly in the margin adds nothing to the cropped output."""
-    w = int(window)
-    return [o for o in offs
-            if all(int(o[a]) < int(core[a]) + int(size[a]) and int(o[a]) + w > int(core[a]) for a in range(3))]
+def core_offsets(offs, window, core, size, halo=0):
+    """The window starts of `offs` that matter for the box [core, core + size): per axis, those whose
+    KEPT core [o + halo, o + w - halo) meets the box. A window only its halo reaches into the box is
+    dropped -- its Gaussian tail there is the faintest weight of the blend, and every box voxel is
+    still in some kept window's core -- unless dropping it would leave box voxels on that axis with no
+    window at all (a box thinner than the halo), when the axis keeps every window that touches it."""
+    w, h = int(window), int(halo)
+    keep = []
+    for a in range(3):
+        c0, c1 = int(core[a]), int(core[a]) + int(size[a])
+        st = sorted({int(o[a]) for o in offs})
+        touch = [o for o in st if o < c1 and o + w > c0]
+        k = [o for o in touch if o + h < c1 and o + w - h > c0]
+        cov = sorted(k)
+        ok = bool(cov) and cov[0] <= c0 and cov[-1] + w >= c1 and \
+            all(cov[i + 1] <= cov[i] + w for i in range(len(cov) - 1))
+        keep.append(set(k if ok else touch))
+    return [o for o in offs if all(int(o[a]) in keep[a] for a in range(3))]
 
 
 GAUSS_SCALE = float(1 << 12)
@@ -212,7 +224,7 @@ class StudentInputs(Inputs):
             roi = np.pad(roi, [(0, max(w - s, 0)) for s in roi.shape])
         self.roi = torch.from_numpy(np.ascontiguousarray(roi)).to(self.dev)
         self.shape = tuple(self.roi.shape)
-        self.offs = core_offsets(offsets(self.shape, w, self.halo), w, self.core, self.core_size)
+        self.offs = core_offsets(offsets(self.shape, w, self.halo), w, self.core, self.core_size, self.halo)
 
         # ---- ONE context super-cube per context rung, covering every window's context box
         cs = [sorted({self.lo[a] + int(o[a]) + w // 2 for o in self.offs}) for a in range(3)]
@@ -314,7 +326,7 @@ class StudentInputs(Inputs):
 # The region pass
 # --------------------------------------------------------------------------- #
 def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torch.float16,
-               prep_dtype=torch.float32, offs=None, out_dtype=torch.float32, bounded=None):
+               prep_dtype=torch.float32, offs=None, out_dtype=torch.float32, bounded=None, stats=None):
     """The blended output of one region: (planes, Z, Y, X) with `size` = (Z, Y, X).
 
     `fn(x)` takes a (B, C, w, w, w) tensor and returns (B, planes, w, w, w). Windows whose CT is all air
@@ -329,8 +341,11 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     fp16, a 31.75-voxel midline overflowed to inf (pass-3 review P3-11). The division is fp32.
 
     THE MARGIN. `inputs.core` is where the output box starts inside the inputs' (padded) grid: the
-    windows tile the whole padded grid, and the output is the (Z, Y, X) box cropped at `core`. With
-    `offs` None, windows that miss that box are dropped here (a caller's own `offs` is used as given)."""
+    windows tile the whole padded grid, but the accumulators are the (Z, Y, X) BOX and nothing more --
+    a window reaching past it adds only its in-box part (its output and its Gaussian clipped alike), so
+    the accumulator VRAM of a region is the same at every margin; only the inputs grow. With `offs`
+    None, windows whose kept core misses the box are dropped here (`core_offsets`; a caller's own
+    `offs` is used as given). `stats`, a dict, gets the accumulator shape and the forwarded windows."""
     w, dev = int(window), inputs.dev
     Z, Y, X = (int(v) for v in size)
     c = tuple(int(v) for v in getattr(inputs, "core", (0, 0, 0)))
@@ -343,11 +358,14 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     g32 = gauss_t(w, dev, torch.float32)
     g16 = (g32 * GAUSS_SCALE).to(torch.float16) if ib else None
     if offs is None:
-        offs = core_offsets(offsets(inputs.shape, w, halo), w, c, (Z, Y, X))
+        offs = core_offsets(offsets(inputs.shape, w, halo), w, c, (Z, Y, X), halo)
     todo = [o for o in offs if inputs.window_any(o)]
-    acc_b = torch.zeros((len(ib),) + tuple(inputs.shape), dtype=torch.float16, device=dev) if ib else None
-    acc_u = torch.zeros((len(iu),) + tuple(inputs.shape), dtype=torch.float32, device=dev) if iu else None
-    wsum = torch.zeros(tuple(inputs.shape), dtype=torch.float32, device=dev)
+    box = (Z, Y, X)
+    acc_b = torch.zeros((len(ib),) + box, dtype=torch.float16, device=dev) if ib else None
+    acc_u = torch.zeros((len(iu),) + box, dtype=torch.float32, device=dev) if iu else None
+    wsum = torch.zeros(box, dtype=torch.float32, device=dev)
+    if stats is not None:
+        stats.update(acc_shape=box, windows=len(todo))
     for i in range(0, len(todo), max(1, int(batch))):
         ob = todo[i:i + max(1, int(batch))]
         x = torch.cat([inputs.prep(o, prep_dtype) for o in ob])
@@ -355,12 +373,18 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
             p = fn(x)
         del x
         for o, pj in zip(ob, p):
-            sl = (slice(o[0], o[0] + w), slice(o[1], o[1] + w), slice(o[2], o[2] + w))
+            # the window's part inside the box: `sl` in the box, `lw` in the window
+            a0 = [max(int(o[k]), c[k]) for k in range(3)]
+            a1 = [min(int(o[k]) + w, c[k] + box[k]) for k in range(3)]
+            if any(a1[k] <= a0[k] for k in range(3)):
+                continue
+            sl = tuple(slice(a0[k] - c[k], a1[k] - c[k]) for k in range(3))
+            lw = tuple(slice(a0[k] - int(o[k]), a1[k] - int(o[k])) for k in range(3))
             if ib:
-                acc_b[(slice(None),) + sl] += pj[ib].to(torch.float16) * g16
+                acc_b[(slice(None),) + sl] += pj[ib][(slice(None),) + lw].to(torch.float16) * g16[lw]
             if iu:
-                acc_u[(slice(None),) + sl] += pj[iu].float() * g32
-            wsum[sl] += g32
+                acc_u[(slice(None),) + sl] += pj[iu][(slice(None),) + lw].float() * g32[lw]
+            wsum[sl] += g32[lw]
         del p
     # normalised in z-slabs straight into the output dtype: the whole-volume float32 temporaries of
     # `where(keep, acc / wsum)` were 4 GB per plane on top of the accumulators (20+ GB for five heads)
@@ -368,15 +392,14 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     ys, xs = slice(c[1], c[1] + Y), slice(c[2], c[2] + X)
     for z in range(0, Z, 64):
         e = min(z + 64, Z)
-        zs = slice(c[0] + z, c[0] + e)
-        ws = wsum[zs, ys, xs].clamp_min(1e-30)
-        keep = (wsum[zs, ys, xs] > 0) & (inputs.roi[zs, ys, xs] > 0)
+        ws = wsum[z:e].clamp_min(1e-30)
+        keep = (wsum[z:e] > 0) & (inputs.roi[c[0] + z:c[0] + e, ys, xs] > 0)
         zero = torch.zeros((), device=dev)
         if ib:
-            q = acc_b[:, zs, ys, xs].float() / (ws * GAUSS_SCALE)[None]
+            q = acc_b[:, z:e].float() / (ws * GAUSS_SCALE)[None]
             out[ib, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
         if iu:
-            q = acc_u[:, zs, ys, xs] / ws[None]
+            q = acc_u[:, z:e] / ws[None]
             out[iu, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
     del acc_b, acc_u, wsum
     return out

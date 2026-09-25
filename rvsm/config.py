@@ -303,9 +303,12 @@ class Config:
     calibrate: bool = True             # refit the temperatures after every eval
     infer_window: int = 256            # sliding-window edge at inference
     infer_halo: int = 32               # window overlap discarded on each side
-    infer_margin: int = 64             # rung-2 voxels of fine CT read around a region at inference (the
-                                       # windows tile the padded box, the output is cropped back): no seam
-                                       # at a region face. Scaled by rung (`infer.margin_at`); 0 = none
+    infer_margin: int = 16             # rung-2 voxels of fine CT read around a region at inference (the
+                                       # windows tile the padded box, the accumulators stay the region): no
+                                       # seam at a region face. 16 is the smallest margin with zero face
+                                       # error on the fixture seam test, and at window 192 / halo 24 it
+                                       # costs no extra windows (7^3 per 1024^3 either way; 24+ is 8^3).
+                                       # Scaled by rung (`infer.margin_at`); 0 = none
     cascade_depth: int = 3             # coarse-to-fine passes per inference region
     tta: int = 1                       # test-time augmentations (1 = none)
     min_regions_before_train: int = 8  # cold start: regions the producer finishes before training begins
