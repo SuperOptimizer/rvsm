@@ -165,7 +165,13 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        "fields_batch", "verso_regen",
                        # the checkpoint-only cadence: WHEN the resume state is written, never what is
                        # trained (a checkpoint boundary runs no evaluation, calibration or gate)
-                       "ckpt_every")
+                       "ckpt_every",
+                       # the round-0 teacher set (its KEYS pick the teachers): paris4 dropped the 2.4 um
+                       # `recto` teacher and went m7-only from ~step 56000 on a user decision
+                       # (2026-09-25). A deliberate mid-run change of the recto target definition: the
+                       # resume logs a `teacher_switch` sched line and the producer regenerates every
+                       # recto another set made (`run.recto_needs_regen`)
+                       "teacher_ckpts")
 
 
 @dataclass
@@ -187,7 +193,9 @@ class Config:
                                        # a round is promoted only with round_steps of it left)
     workers: int = 6                   # sampler worker processes
     tifxyz: str = ""                   # optional directory of human tifxyz meshes, for eval only
-    teacher_ckpts: dict = field(default_factory=dict)  # {"recto": path, "m7": path} local teacher weights
+    teacher_ckpts: dict = field(default_factory=dict)  # {"recto": path, "m7": path} local teacher weights;
+                                       # its KEYS are the teacher set ({} = recto + m7; {"m7": path} alone =
+                                       # m7-only recto targets, rw = 1)
     cache_gb: float = 64.0             # CT shard cache budget on disk/RAM
     gpu_prefetch: bool = True          # the trainer copies batch i+1 to the device on a side stream
     pin_memory: bool = False           # the trainer's loader pins its batches. Off: on Thunder's A100 the

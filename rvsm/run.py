@@ -460,7 +460,7 @@ class TeacherBank:
         self.fast = {}
         self.on_device = True               # False while the weights are parked in host memory (`offload`)
         self._host = {}                     # teacher -> pinned host copies of its parameters and buffers
-        names = [n for n in (cfg.teacher_ckpts or {})] or ["recto", "m7"]
+        names = teacher_names(cfg)          # ONLY the configured teachers are built (m7 alone: no recto)
         self.items = []
         for n in names:
             if n not in T.TEACHERS:
@@ -576,10 +576,16 @@ class TeacherBank:
         if len(ps) >= 2:
             P, W = infer.fuse_agreement_u8(ps[0], ps[1])
         else:
+            # ONE teacher: its probability as it is, and rw = 1 everywhere. The loader's weight is
+            # already `inside x (CT > 0) x rw`, so air (m7's coarse air mask zeroed P there, the fine
+            # CT masks it again) needs nothing from rw; the agreement down-weighting has no second
+            # opinion to disagree with, and a self-confidence weight would change the loss (the bce of
+            # an undecided voxel would lose its pull towards 0.5) rather than keep it
             P = infer.u8_t(ps[0])
             W = torch_full_like_u8(P, 255)
         del ps
-        return P, W, {"producer": "teacher:" + ",".join(names), "radial_sign": 1,
+        return P, W, {"producer": "teacher:" + ",".join(names), "teachers": list(names), "radial_sign": 1,
+                      "rw": "agreement" if len(names) >= 2 else "ones",
                       "ckpt": {r[0]: r[2] for r in self.items}, "backend": self.backend}
 
     def probs(self, ct, lo, size):
@@ -714,18 +720,52 @@ def _fed_marker(out, lo, round_):
                         "region_%d_%d_%d" % tuple(int(v) for v in lo))
 
 
-def feed_coarse_once(out, lo, round_, block, shape2, pooled=None):
-    """Fold a finished recto block into the coarse rungs, once per region and round (a marker file, so
-    a restart does not redo it and two producers could not double-count it)."""
+def feed_coarse_once(out, lo, round_, block, shape2, pooled=None, gen=0):
+    """Fold a finished recto block into the coarse rungs, once per region, round and GENERATION (a
+    marker file, so a restart does not redo it and two producers could not double-count it). A
+    regenerated recto (`reteach`, generation g > 0) overwrites the region's footprint of the coarse
+    arrays once: the coarse rungs have no generations, they follow the newest teacher pass at once
+    (their footprint is the same, only the values move)."""
     from rvsm import regions as RG
     m = _fed_marker(out, lo, round_)
-    if os.path.exists(m):
+    if os.path.exists(m) and int((_read_json(m) or {}).get("gen", 0)) >= int(gen):
         return []
     ks = RG.feed_coarse(out, "recto", lo, block, round_=round_, shape2=shape2, pooled=pooled)
     os.makedirs(os.path.dirname(m), exist_ok=True)
-    with open(m, "w") as f:
-        f.write(json.dumps({"rungs": ks, "t": time.time()}))
+    with open(m + ".tmp", "w") as f:
+        f.write(json.dumps({"rungs": ks, "t": time.time(), "gen": int(gen)}))
+    os.replace(m + ".tmp", m)
     return ks
+
+
+def commit_sources(out, lo, round_, rungs=(2, 3, 4)):
+    """Commit the region's newest finished sources for every reader once they are coherent: the newest
+    verso and recto (+ its rw) generations, and -- where the region has a verso -- every field store
+    built from exactly those (`targets.fields_current`). Returns the committed bundle, or None when
+    nothing changed or something is still missing. Idempotent: the producer calls it after a fields
+    job, after a reteach of a region without a verso, and for any stale region it finds with nothing
+    left to run (a unit whose commit a restart cut off)."""
+    from rvsm import stores, targets as TG
+    cur = stores.bundle_state(out, lo, round_)
+    gr = TG.source_recto(out, lo, round_)[0]
+    if gr < 0:
+        return None
+    if int(round_) == 0 and gr > 0 and \
+            not stores.is_done(stores.gen_path(stores.store_path(out, "rw", lo, round_), gr)):
+        return None                                  # a regenerated recto is committed with its rw
+    has_verso = stores.store_gen(out, "verso", lo, round_) >= 0
+    if has_verso:
+        gv = TG.source_verso(out, lo, round_)[0]
+        want = {"gen": max(gv, gr), "verso": gv, "recto": gr}
+    else:
+        want = {"gen": cur["gen"], "verso": cur["verso"], "recto": gr}
+    if want == cur:
+        return None
+    if has_verso and not TG.fields_current(out, lo, round_, rungs):
+        return None
+    stores.commit_bundle(out, lo, round_, want["gen"], verso=want["verso"], recto=want["recto"],
+                         t=time.time())
+    return want
 
 
 def lookahead(cfg, out, k_active):
@@ -808,6 +848,9 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     route, pos = region_route(cfg, visits, order, held)
     k_active = max(len([k for k in cfg.rungs if int(k) < RG.COARSE_RUNGS[0]]), 1)
     frungs = field_rungs(cfg)
+    teachers = teacher_names(cfg)       # a round-0 recto from another set is regenerated (`reteach`)
+    held_los = [tuple(int(v) for v in h["lo"]) for h in held]
+    rr = {"todo": None, "t": 0.0, "n": None, "t_log": 0.0}   # the recto regeneration's work list
     # the distance fields: on the producer's own GPU when it has one (`targets.block_fields_torch`,
     # ~2.5 GB of extra VRAM at peak, inside the memory fraction), else a CPU pool of
     # every core at low priority
@@ -844,13 +887,16 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     def release_backlog():
         """A backlog region sits outside the walk (no position), so `_release_passed` never gives its
         CT back: it is released here once it needs nothing more."""
-        rg = read_state(out).get("verso_regen")
+        st_ = read_state(out)
+        rg = st_.get("verso_regen")
         c0 = RG.Catalog(out, 0, ttl=1.0)
         for lo in list(backlog_keys):
             with lock:
                 if lo in busy:
                     continue
-            if _next_job(c0, lo, 0, True, out, rungs=frungs, regen=rg) is None:
+            # the backlog's own passes only: a verso the window has not asked for yet is not one
+            if _next_job(c0, lo, 0, bool(st_.get("verso_on")) and c0.done("verso", lo), out,
+                         rungs=frungs, regen=rg, teachers=teachers) is None:
                 backlog_keys.discard(lo)
                 if lo in keys:
                     cache.release(keys.pop(lo))
@@ -907,7 +953,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
         if not have:                            # the download itself runs WITHOUT the cache lock
             cache.fetch_region_outside(np.array(lo, np.int64), clock, ctx=cfg.ctx, patch=cfg.patch,
                                        region=cfg.region, on_booked=lambda k: keys.__setitem__(lo, k))
-        if job == "teacher" and bank is not None:
+        if job in TEACHER_JOBS and bank is not None:
             return bank.read(ct_local, lo, region_size(pyr, lo, cfg.region), pyr=pyr)
         return None
 
@@ -945,13 +991,19 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
         try:
             write_rows(out, lo, rows, cfg, round_, attrs, gen=int(attrs.get("gen", 0)))
             if pooled is not None or (kind == "self" and rows):
-                feed_coarse_once(out, lo, round_, rows[0][1], shape2, pooled=pooled)
+                feed_coarse_once(out, lo, round_, rows[0][1], shape2, pooled=pooled,
+                                 gen=int(attrs.get("gen", 0)))
             jlog(out, "produce", {"kind": kind, "region": list(lo), "round": round_,
                                   "s": round(time.time() - t0, 2), **(extra or {})})
+            # a reteach of a region without a verso has no fields to rebuild: its recto + rw are
+            # committed now; with a verso, the fields are rebuilt from the new recto and commit it
+            reteach_fields = kind == "reteach" and stores.store_gen(out, "verso", lo, round_) >= 0
+            if kind == "reteach" and not reteach_fields:
+                commit_sources(out, lo, round_, frungs)
             # the unit that makes a region's fields possible hands it straight to the fields pool
             # (still busy): waiting for the GPU loop's next pass over the window left the fields
             # of every verso region undone until a whole window of ~1 min verso passes had run
-            if kind in ("verso", "self") and not stopping():
+            if (kind in ("verso", "self") or reteach_fields) and not stopping():
                 with lock:
                     pend.append(fielder.submit(fields, lo, round_, time.time(), cursor_now()))
                 chained = True
@@ -970,10 +1022,10 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                              device=fdev, batch=fbatch,
                              gpu_lock=gate.fields_hold(t0, tag={"region": list(lo), "round": round_})
                              if fdev else None)
-            g = TG.source_verso(out, lo, round_)[0]
-            if g > stores.bundle_gen(out, lo, round_) and TG.fields_current(out, lo, round_, frungs):
-                # the new verso AND all of its fields are finished: only now do readers move to them
-                stores.commit_bundle(out, lo, round_, g, t=time.time())
+            # a new verso or recto AND all of the fields built from it are finished: only now do
+            # readers move to them (`commit_sources`)
+            commit_sources(out, lo, round_, frungs)
+            g = TG.field_gen(out, lo, round_)
             jlog(out, "produce", {"kind": "fields", "region": list(lo), "round": round_,
                                   "s": round(time.time() - t0, 2), "cursor": cursor, "gen": g,
                                   "device": fdev or "cpu",
@@ -1030,12 +1082,12 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if region_size(pyr, lo, cfg.region) is None:
                     continue
                 job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs,
-                                regen=st.get("verso_regen"))
+                                regen=st.get("verso_regen"), teachers=teachers)
                 if job is not None and job != "fields" and skip_until.get(lo, 0.0) > time.time():
                     continue                    # its read timed out within the hour: not again yet
                 if job is not None:
                     units.append((lo, job))
-            gpu_units = _gpu_order([u for u in units if u[1] != "fields"], leased=lorder)
+            gpu_units = _gpu_order([u for u in units if u[1] != "fields"], leased=lorder, held=held_los)
             if cache.remote and cache.cache_bytes > cache.budget:
                 # over the CT budget: no speculative region is fetched; the leased ones (and the regions
                 # already held) still are
@@ -1054,7 +1106,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     with lock:
                         if lo in busy:
                             continue
-                    job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs, regen=regen)
+                    job = _next_job(cat, lo, round_, verso_on, out, rungs=frungs, regen=regen,
+                                    teachers=teachers)
                     if job == "fields":
                         with lock:
                             busy.add(lo)
@@ -1064,10 +1117,19 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         gpu_units.append((lo, job))
                         backlog_keys.add(lo)
                         break
+            if round_ == 0 and not gpu_units:
+                # the RECTO regeneration (a new teacher set, `teacher_names`): every produced region
+                # whose committed recto another set made, worked through -- like the verso backlog --
+                # only when the window has nothing for the GPU; held-out regions first, then walk order
+                _recto_backlog(out, rr, route, held, teachers, cat, verso_on, frungs, busy, lock,
+                               skip_until, lambda lo: region_size(pyr, lo, cfg.region) is not None,
+                               gpu_units, backlog_keys,
+                               lambda lo: pend.append(fielder.submit(fields, lo, round_, time.time(),
+                                                                     cursor)))
             gate.set_pending(j for _, j in gpu_units)   # the fields make way for these
             _log_starved(out, recs, starved_t, {u[0] for u in units} | {u[0] for u in gpu_units},
                          lambda lo: _next_job(cat, lo, round_, verso_on, out, rungs=frungs,
-                                              regen=st.get("verso_regen")),
+                                              regen=st.get("verso_regen"), teachers=teachers),
                          lambda lo: {"busy": lo in busy, "skipped": skip_until.get(lo, 0.0) > time.time(),
                                      "no_size": region_size(pyr, lo, cfg.region) is None})
             did = False
@@ -1084,7 +1146,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 if stopping():
                     break
                 size = region_size(pyr, lo, cfg.region)
-                if job == "teacher" and bank is None:
+                if job in TEACHER_JOBS and bank is None:
                     bank = TeacherBank(cfg, out, device=device, backend=backend)
                     pre.pop((lo, job), None)        # read before the bank existed: no CT in it
                     gate.pass_acquire(job)
@@ -1146,7 +1208,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     t1 = time.time()
                     # a pass that will COMPILE first (a student slot's first forward in this process)
                     # can take many minutes; say so before it starts, so a stall is visible
-                    cst = None if job == "teacher" else (rslot if _frozen else slot).st
+                    cst = None if job in TEACHER_JOBS else (rslot if _frozen else slot).st
                     pending = bool(cst is not None and getattr(cst, "compiled", False)
                                    and not getattr(cst, "warm", True))
                     g0 = _compiled_graphs()
@@ -1156,8 +1218,14 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                           "compile_pending": pending,
                                           "step": None if cst is None else int(getattr(cst, "step", 0))},
                          echo=False)
-                    if job == "teacher":
+                    if job in TEACHER_JOBS:
                         P, W, attrs = bank.probs_u8(ct_local, lo, size, rois=got)
+                        if job == "reteach":
+                            # a new teacher set's recto + rw: the NEXT generation, beside the old pair
+                            # (which readers keep using until `commit_sources` moves them)
+                            attrs = {**attrs, "regeneration": True, "gen": stores.next_gen(out, lo, 0),
+                                     "replaces_teachers": store_teachers(
+                                         stores.current_path(out, "recto", lo, 0))}
                         pooled = RG.pool_chain(P, RG.COARSE_RUNGS)
                         rows = [("recto", P.cpu().numpy(), 8, "prob_u8"),
                                 ("rw", W.cpu().numpy(), 8, "prob_u8")]
@@ -1178,7 +1246,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                  "regeneration": bool(regen_unit),
                                  # a round-0 verso that already has a finished generation is the ONE
                                  # regeneration: it goes to the next generation, beside the old one
-                                 "gen": (stores.store_gen(out, "verso", lo, 0) + 1
+                                 # (the region's one counter, shared with the recto regeneration)
+                                 "gen": (stores.next_gen(out, lo, 0)
                                          if job == "verso" and cat.done("verso", lo) else 0),
                                  "radial_sign": int(sign), "window": int(stu.cfg.infer_window),
                                  "halo": int(stu.cfg.infer_halo),
@@ -1270,10 +1339,10 @@ def _bank_park(out, bank, job, rest):
     teacher pass is left in this pass over the window (`rest`: this unit and the ones after it), and
     back to the card before a teacher pass -- so a verso / self pass has the VRAM the bank held.
     Logs `bank_offload` / `bank_onload` with the seconds each took."""
-    if job == "teacher":
+    if job in TEACHER_JOBS:
         s = bank.onload()
         kind = "bank_onload"
-    elif not any(j == "teacher" for _, j in rest):
+    elif not any(j in TEACHER_JOBS for _, j in rest):
         s = bank.offload()
         kind = "bank_offload"
     else:
@@ -1408,7 +1477,7 @@ def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr):
                                 as_tensor=True)
 
 
-def _gpu_order(units, leased=None):
+def _gpu_order(units, leased=None, held=None):
     """The GPU units of one pass over the window, blocking passes first. A region without its recto
     (round 0: `teacher`; round r >= 1: `self`) is one a sampler worker cannot use at all, and the
     in-order DataLoader then holds every worker until it lands; a region lacking only its `verso` is
@@ -1419,12 +1488,19 @@ def _gpu_order(units, leased=None):
 
     `leased` (`lease_order`): the blocking passes of LEASED regions go before every other, in lease
     order -- a lease is a worker's declared need (paris4, 20:13-20:46: a worker waited 33 minutes on a
-    region outside the window while 16 verso passes ran)."""
+    region outside the window while 16 verso passes ran).
+
+    A `reteach` (a new teacher pass over a region whose recto came from another teacher set) is NOT
+    blocking: the region trains on its old recto meanwhile. It runs after the blocking passes -- a
+    held-out region's first (`held`: the evaluation reference), the others beside the verso passes."""
     rank = {lo: i for i, lo in enumerate(leased or ())}
+    held = {tuple(int(v) for v in h) for h in (held or ())}
 
     def key(u):
+        if u[1] == "reteach":
+            return (2, 0) if tuple(u[0]) in held else (2, 1)
         if u[1] == "verso":
-            return (2, 0)
+            return (2, 1)
         return (0, rank[u[0]]) if u[0] in rank else (1, 0)
     return sorted(units, key=key)
 
@@ -1531,17 +1607,148 @@ def verso_needs_regen(out, lo, regen):
     return made is None or int(made) < int(regen.get("step", 0))
 
 
-def _next_job(cat, lo, round_, verso_on, out, rungs=(2, 3, 4), regen=None):
+DEFAULT_TEACHERS = ("recto", "m7")   # the teacher set of a config without `teacher_ckpts`, and of a
+                                     # recto store written before stores recorded theirs (paris4's fused
+                                     # recto + m7 stores up to the 2026-09-25 switch)
+
+
+def teacher_names(cfg):
+    """The teachers this run's round-0 recto targets come from, in fusion order: the KEYS of
+    `teacher_ckpts` (`{"m7": path}` alone is the m7-only mode), or DEFAULT_TEACHERS when it is empty."""
+    return [str(n) for n in (getattr(cfg, "teacher_ckpts", None) or {})] or list(DEFAULT_TEACHERS)
+
+
+def store_teachers(path):
+    """The teacher set a finished recto store records (`teachers` attr), or DEFAULT_TEACHERS for a store
+    written before the attr existed."""
+    from rvsm import stores
+    t = stores.read_attrs(path).get("teachers")
+    return [str(n) for n in t] if isinstance(t, (list, tuple)) and t else list(DEFAULT_TEACHERS)
+
+
+def recto_needs_regen(out, lo, teachers):
+    """WRITER side: is the region's newest finished round-0 recto (with its rw beside it) made by a
+    teacher set other than `teachers`? Then a new teacher pass is due, written as the next generation
+    (`stores.next_gen`) beside the old one -- never in place. None/empty `teachers`: never."""
+    from rvsm import stores
+    if not teachers:
+        return False
+    g = stores.store_gen(out, "recto", lo, 0)
+    if g < 0:
+        return False                                 # no recto at all: that is the first teacher pass
+    p = stores.gen_path(stores.store_path(out, "recto", lo, 0), g)
+    if sorted(store_teachers(p)) != sorted(str(t) for t in teachers):
+        return True
+    # the rw of the same generation is written after the recto: a unit cut between the two is redone
+    return not stores.is_done(stores.gen_path(stores.store_path(out, "rw", lo, 0), g))
+
+
+def recto_stale(out, lo, teachers):
+    """READER side: does the region's COMMITTED round-0 recto come from another teacher set? True
+    until the regenerated recto (and, where the region has a verso, the fields rebuilt from it) is
+    committed: the count `recto_regen` lines report."""
+    from rvsm import stores
+    if not teachers:
+        return False
+    p = stores.current_path(out, "recto", lo, 0)
+    return stores.is_done(p) and sorted(store_teachers(p)) != sorted(str(t) for t in teachers)
+
+
+def recto_regen_todo(out, route, held, teachers):
+    """Every produced round-0 region whose committed recto is stale (`recto_stale`), in priority order:
+    the held-out regions first (the evaluation reference), then walk order, then any other produced
+    region (none, normally)."""
+    from rvsm import regions as RG
+    if not teachers:
+        return []
+    done = [tuple(int(v) for v in lo) for lo in RG.Catalog(out, 0, ttl=0.0).list_done("recto")]
+    rank = {}
+    for i, h in enumerate(held or ()):
+        rank.setdefault(tuple(int(v) for v in h["lo"]), (0, i))
+    for i, lo in enumerate(route or ()):
+        rank.setdefault(tuple(int(v) for v in lo), (1, i))
+    stale = [lo for lo in done if recto_stale(out, lo, teachers)]
+    return sorted(stale, key=lambda lo: rank.get(lo, (2, 0)))
+
+
+RECTO_TODO_S = 300.0     # the recto regeneration's work list is rescanned (and logged) this often
+
+
+def _recto_backlog(out, rr, route, held, teachers, cat, verso_on, rungs, busy, lock, skip_until, sized,
+                   gpu_units, backlog_keys, submit_fields, now=None):
+    """One idle step of the recto regeneration (the producer calls it when the window has no GPU unit).
+
+    `rr` is the producer's state: the work list (`recto_regen_todo`, rescanned every RECTO_TODO_S),
+    and the last count logged. Walks the list in priority order: a region that is no longer stale is
+    dropped, a region with nothing left to run is committed (`commit_sources`: a restart cut its
+    commit off), a `fields` job goes to the fields pool (`submit_fields`, the region marked busy),
+    and the first GPU job (the `reteach`, or a verso regeneration's own pass) is appended to
+    `gpu_units` -- one per call, like the verso backlog. Logs `recto_regen` (remaining count) at every
+    rescan while work remains and `recto_regen_done` once when it reaches zero. Returns the count."""
+    now = time.time() if now is None else now
+    if not teachers:
+        return 0
+    if rr.get("todo") is None or now - float(rr.get("t", 0.0)) >= RECTO_TODO_S:
+        rr["todo"] = recto_regen_todo(out, route, held, teachers)
+        rr["t"] = now
+        n, last = len(rr["todo"]), rr.get("n")
+        if n:
+            held_set = {tuple(int(v) for v in h["lo"]) for h in (held or ())}
+            jlog(out, "produce", {"kind": "recto_regen", "remaining": n, "teachers": list(teachers),
+                                  "heldout_remaining": sum(1 for lo in rr["todo"] if lo in held_set)})
+        elif last:
+            jlog(out, "produce", {"kind": "recto_regen_done", "teachers": list(teachers)})
+        rr["n"] = n
+    keep = []
+    picked = False
+    for lo in rr["todo"]:
+        if picked:
+            keep.append(lo)
+            continue
+        with lock:
+            if lo in busy:
+                keep.append(lo)
+                continue
+        if not recto_stale(out, lo, teachers):
+            continue
+        keep.append(lo)
+        if not sized(lo) or skip_until.get(lo, 0.0) > now:
+            continue
+        # the backlog's own passes only: no first verso for a region the window has not reached
+        job = _next_job(cat, lo, 0, bool(verso_on) and cat.done("verso", lo), out, rungs=rungs,
+                        regen=read_state(out).get("verso_regen"), teachers=teachers)
+        if job is None:
+            commit_sources(out, lo, 0, rungs)
+            if not recto_stale(out, lo, teachers):
+                keep.pop()
+        elif job == "fields":
+            with lock:
+                busy.add(lo)
+                submit_fields(lo)
+            backlog_keys.add(lo)
+        elif job != "teacher":
+            gpu_units.append((lo, job))
+            backlog_keys.add(lo)
+            picked = True
+    rr["todo"] = keep
+    return len(keep)
+
+
+def _next_job(cat, lo, round_, verso_on, out, rungs=(2, 3, 4), regen=None, teachers=None):
     """Which pass this region lacks, in the order the state machine allows -- or None when it is done.
 
-    Round 0: the teacher pass, then (once the gate has fired) the flipped-sign verso, then the distance
-    fields -- at the verso's GENERATION: a verso regenerated once (`regen`, see `verso_needs_regen`) is
-    written as generation 1 and gets its own fields. Round r >= 1: one multi-head student pass, then the
-    fields at the pooled rungs."""
+    Round 0: the teacher pass, then -- when the region's recto comes from another teacher set than the
+    configured one (`teachers`, `recto_needs_regen`) -- the `reteach` pass that writes the next
+    generation of recto + rw, then (once the gate has fired) the flipped-sign verso, then the distance
+    fields -- at the sources' GENERATION: a verso regenerated once (`regen`, see `verso_needs_regen`) or
+    a regenerated recto gets its own fields. Round r >= 1: one multi-head student pass, then the fields
+    at the pooled rungs."""
     from rvsm import targets as TG
     if round_ == 0:
         if not cat.done("recto", lo):
             return "teacher"
+        if teachers and recto_needs_regen(out, lo, teachers):
+            return "reteach"
         if verso_on and not cat.done("verso", lo):
             return "verso"
         if verso_on and verso_needs_regen(out, lo, regen):
@@ -1621,6 +1828,7 @@ class TracedLock:
 
 
 BLOCKING_JOBS = ("teacher", "self")   # the passes a sampler worker is blocked on (`_gpu_order`)
+TEACHER_JOBS = ("teacher", "reteach")  # the passes the teacher bank runs (a reteach never blocks)
 FIELDS_DEFER_S = 600.0   # GPU fields that have waited this long may start while only verso passes are pending
 
 
@@ -1885,7 +2093,7 @@ def heldout_rows(cfg, out, ckpt, held, ax, meta5=None, round_=0, device=None, n=
     stu = None
     for h in list(held)[:int(n)]:
         lo = tuple(int(v) for v in h["lo"])
-        p = stores.store_path(out, "recto", lo, 0)
+        p = stores.current_path(out, "recto", lo, 0)   # the COMMITTED reference (a regenerated recto)
         if not stores.is_done(p):
             continue
         ref = stores.open_store(p)               # lazy: read block by block by `compare_stores`
@@ -2101,7 +2309,7 @@ def regen_remaining(out):
     b = _read_json(backlog_path(out))
     if not b:
         return None
-    return [tuple(lo) for lo in b.get("regions", []) if stores.bundle_gen(out, tuple(lo), 0) < 1]
+    return [tuple(lo) for lo in b.get("regions", []) if stores.bundle_state(out, tuple(lo), 0)["verso"] < 1]
 
 
 def _complete_rows(rows, keys=("precision", "betti0_err")):
@@ -2451,6 +2659,25 @@ def frozen_meta(out, ct, log=print):
     return meta, meta5
 
 
+def log_switches(out, old, cfg):
+    """The deliberate mid-run changes a resume makes, as `sched` lines against the previous
+    config.json (`old`): `teacher_switch` when the round-0 teacher set (the keys of `teacher_ckpts`)
+    or a teacher's weights moved. Returns the lines logged."""
+    d = (old or {}).get("config") or {}
+    step = int(read_state(out).get("step", 0) or 0)
+    got = []
+    oc = dict(d.get("teacher_ckpts") or {})
+    nc = dict(cfg.teacher_ckpts or {})
+    if "teacher_ckpts" in d and oc != nc:
+        on = [str(n) for n in oc] or list(DEFAULT_TEACHERS)
+        rec = {"kind": "teacher_switch", "step": step, "old": on, "new": teacher_names(cfg),
+               "old_ckpts": oc, "new_ckpts": nc,
+               "regenerate": sorted(on) != sorted(teacher_names(cfg))}
+        jlog(out, "sched", rec)
+        got.append(rec)
+    return got
+
+
 def setup(cfg, out=None):
     """Freeze what the run is, once: config.json (asserted on a resume), umbilicus.json, metadata.json,
     the CT mirror and the held-out set. Returns the context both halves need."""
@@ -2466,6 +2693,7 @@ def setup(cfg, out=None):
         assert got == cfg.fingerprint(), (
             f"resume: {cp} was written by a config whose fingerprint is {got}, this run's is "
             f"{cfg.fingerprint()}. Everything but {CFG.FINGERPRINT_EXCLUDE} must match.")
+        log_switches(out, old, cfg)
     _write_json(cp, cfg.to_json())
 
     AX.ensure(out, cfg.umbilicus, ct=cfg.ct)

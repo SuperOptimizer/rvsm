@@ -591,7 +591,7 @@ def _store_block(root, channel, lo, round_):
     import numpy as np
 
     from rvsm import stores
-    p = stores.store_path(str(root), str(channel), lo, int(round_))
+    p = stores.current_path(str(root), str(channel), lo, int(round_))   # what readers use
     if not stores.is_done(p):
         return None
     a = stores.open_store(p)
