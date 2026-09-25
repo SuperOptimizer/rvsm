@@ -308,6 +308,12 @@ def test_a_resume_logs_the_teacher_and_the_loss_switch(tmp_path, small_cfg):
     o2 = replace(small_cfg).to_json()
     got = RUN.log_switches(out, o2, replace(small_cfg, teacher_ckpts={"m7": "p"}))
     assert got[0]["old"] == ["recto", "m7"] and got[0]["new"] == ["m7"]
+    # the gn_bf16 precision switch; a config.json that predates the field was float32
+    o3 = small_cfg.to_json()
+    o3["config"].pop("gn_bf16")
+    got = RUN.log_switches(out, o3, replace(small_cfg, gn_bf16=True))
+    assert [(r["kind"], r["gn_bf16"]) for r in got] == [("precision_switch", {"old": False, "new": True})]
+    assert RUN.log_switches(out, o3, small_cfg) == []
 
 
 # ------------------------------------------------------------------------------ the producer, for real

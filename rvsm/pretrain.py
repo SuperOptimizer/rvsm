@@ -287,7 +287,8 @@ def pretrain(cfg, out=None, steps=None, device=None, block=BLOCK, lo=MASK_LO, hi
 
     # cout 1: the reconstruction is ONE channel. Every other build argument is the fine-tuning run's,
     # which is what makes the stem and the trunk transfer without a reshape.
-    net = M.build(cfg.size, cin=layout.cin, cout=1, ckpt_act=cfg.ckpt_act, verbose=False).to(dev)
+    net = M.build(cfg.size, cin=layout.cin, cout=1, ckpt_act=cfg.ckpt_act, gn_bf16=cfg.gn_bf16,
+                  verbose=False).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=0.01)
     S, C = wsd_stable_until(nsteps, cfg.cooldown)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -316,7 +317,7 @@ def pretrain(cfg, out=None, steps=None, device=None, block=BLOCK, lo=MASK_LO, hi
         patches_factory = patches_factory or factory
         val_items = grid if val_items is None else val_items
     grid = list(val_items or [])
-    evnet = M.build(cfg.size, cin=layout.cin, cout=1, verbose=False).to(dev)
+    evnet = M.build(cfg.size, cin=layout.cin, cout=1, gn_bf16=cfg.gn_bf16, verbose=False).to(dev)
     model = torch.compile(net) if cfg.compile else net
 
     def save():

@@ -236,7 +236,168 @@ The memory math above says the second condition will fail.
 an fp32 tensor. At window 256 the level-0 concat alone is 6 GB (compiled inference), and training is
 the same. Keeping them in bf16 (casting the GroupNorm output) would roughly halve the activation
 memory, in the producer and in the trainer (where it might be what makes graphs fit). That changes
-numerics, so it needs its own eval.
+numerics, so it needs its own eval. (Measured in the `gn_bf16` section below: it does not lower either
+peak, but it makes the 256 forward 25 % faster, and its numerics are within noise.)
+
+## `gn_bf16`: GroupNorm+SiLU outputs in bf16 (2026-09-25)
+
+The lead at the end of the producer section above, measured. `Config.gn_bf16` (default False) makes
+every GroupNorm+SiLU output of the student leave in the autocast dtype (bf16) instead of fp32
+(`model.NormAct`). The GroupNorm still runs in fp32 (autocast puts `group_norm` on its fp32 list, so
+the statistics, the affine and the SiLU are computed in fp32), and the cast comes after the SiLU.
+Every consumer of a block output is a convolution (the next block, `down`, `proj`, the heads), and
+autocast rounds a conv's input to bf16 anyway. So the only arithmetic that changes is `up2x` and the
+decoder concat: they now interpolate and copy bf16 values instead of fp32 ones. The state dict does
+not change, and outside autocast (CPU, fp32) the flag does nothing. The trainer's net, its eval and
+cascade nets, `rvsm calibrate`, pretrain, and the producer's `infer.Student` all follow the flag. The
+student reads it from the checkpoint's cfg, `gn_bf16=` overrides it, and `Student.reload` of a
+checkpoint whose cfg flipped it switches the module in place, which costs one recompile.
+
+**Fingerprint:** the flag is in `FINGERPRINT_EXCLUDE`. It changes numerics, so it is recorded in
+config.json and in every checkpoint's cfg. A resume may flip it as a deliberate mid-run switch, like
+the cascade change, and `run.log_switches` logs a `precision_switch` sched line
+(`{"gn_bf16": {"old", "new"}}`). A config.json from before this field counts as False.
+
+Same laptop, torch and bench as above: the real `train.train` loop, 30m6, batch 1 x accum 2, bf16,
+13.7 GB allocator cap, synthetic full-recipe items (`tests/test_train.py::_item` construction), step =
+median of the second half. Bench scripts are in `/home/forrest/rvsm_bench/gn/`, not in the repo.
+
+### Trainer (compiled, default mode, ckpt_act 0)
+
+| patch | gn_bf16 | step | peak alloc | peak reserved |
+|---|---|---|---|---|
+| 144 | off | 0.763 s | 6.24 GB | 8.69 GB |
+| 144 | on | 0.736 s (-3.5 %) | 6.24 GB | 8.64 GB |
+| 160 | off | 1.017 s | 7.59 GB | 11.69 GB |
+| 160 | on | 0.993 s (-2.4 %) | 7.59 GB | 10.44 GB (-1.25) |
+| 176 | off | 1.454 s | 10.32 GB | 13.45 GB (at the cap) |
+| 176 | on | 1.412 s (-2.9 %) | 10.32 GB | 12.68 GB (-0.77) |
+| 192 / 208 / 224 | on | OOM (11.4 / 13.1 / 13.2 GB alloc) | | |
+
+With `RVSM_PROFILE=1` at patch 160 the per-phase peaks, off vs on, are **identical to 0.01 GB**
+(cascade self pass 5.09, aug 4.00, forward + deep losses 6.62, aux 6.89, backward 7.59 GB).
+
+| mode (gn_bf16 on) | patch | step | regular reserved | graph pool | total reserved |
+|---|---|---|---|---|---|
+| max-autotune (graphs) | 144 | 0.746 s | 5.79 | 6.33 | 12.12 GB |
+| max-autotune (graphs) | 160 | **OOM** at microbatch 6 (7.25 GB alloc + pool = cap) | | | |
+| max-autotune (graphs) | 176 | OOM | | | |
+
+(The flag-off 144 graph run hit `cudaErrorStreamCaptureInvalidated` twice in this session, i.e. a
+failure inside capture at the cap. The earlier section measured it at 11.48 GB with a 6.24 GB pool.)
+
+**The flag does not lower the trainer's peak allocation at all, and it does not make CUDA graphs
+fit.** Largest clean patch: 176 on and off both (off sits at the cap, on has 0.8 GB to spare), 192
+OOMs either way. Why: under compile, inductor's partitioner does not save the fp32 GroupNorm/SiLU
+tensors for the backward. It saves the bf16 conv outputs and recomputes the norm+act. The fp32
+tensors exist only inside fused kernels, so there was never an fp32 activation store to halve. The
+step's high water is the head outputs, the losses and the backward's transients (the earlier
+section's diagnosis), and the flag does not touch those. What it does buy: 2.4-3.5 % per step (less
+fp32 traffic through `up2x` and the concat) and 0.8-1.25 GB of reserved memory (less fragmentation).
+The graph pool is unchanged (6.33 GB on vs 6.24 GB off at 144).
+
+### Producer inference (compiled student, `plane_fn`, 5 planes, 30m6, random weights)
+
+| window | mode | gn_bf16 | fwd / window | peak alloc | peak reserved | largest single block |
+|---|---|---|---|---|---|---|
+| 192 | max-autotune-no-cudagraphs | off | 156.4 ms | 4.66 GB | 7.01 GB | 2.53 GB (fp32 concat) |
+| 192 | max-autotune-no-cudagraphs | on | 147.6 ms (-5.6 %) | 4.66 GB | 7.90 GB | 1.69 GB |
+| 256 | max-autotune-no-cudagraphs | off | 493 ms* | 10.48 GB | 12.94 GB | **6.0 GB** (fp32 concat) |
+| 256 | max-autotune-no-cudagraphs | on | 372 ms* (**-25 %**) | 10.48 GB | 13.94 GB | 4.0 GB |
+| 192 | max-autotune (graphs) | off | - | - | pool held after `empty_cache`: 6.99 GB | |
+| 192 | max-autotune (graphs) | on | - | - | pool held after `empty_cache`: 6.14 GB (-0.85) | |
+
+\* with `empty_cache()` before each call. At 256 flag off, back-to-back calls OOM on the 16 GB card
+(13.7 GB and 15.8 GB caps) when the allocator cannot find a contiguous 6 GB segment. Flag on, 8
+back-to-back calls run (349 ms each). (The graph rows' times were taken while a training run shared
+the card, so they are not comparable.)
+
+The memory history of one forward shows the same thing as in the trainer. Flag off, inductor
+allocates the level-0 decoder concat `(1, 96, w^3)` fp32 **at the start of the forward** (the skip
+is written straight into its tail, the cat-as-view optimisation) and holds it until the last conv.
+The peak (9.0 GB above the input at 256) is that 6 GB block plus the level-1 concat (1.5 GB) and
+transients. Flag on, the concat is bf16 (3.0 GB) and is allocated late, and the peak moves to the
+last conv: the 3 GB concat, a 4 GB buffer allocated inside the conv call (cuDNN's workspace, which
+`CUDNN_CONV_WSCAP_DBG=1024` did not change), the skip and the output. **That is 9.0 GB again, to
+the byte.** So the flag removes the one 6 GB contiguous block (which fixes the fragmentation OOM) and
+a quarter of the forward time at 256, but not the peak.
+
+### Numerics
+
+No trained checkpoint exists under `/home/forrest/rvsm` or `/home/forrest/rvsm_bench`, so a 30m6
+(21 in, 14 heads) was trained from scratch for 300 steps with the flag OFF (compiled, bf16, patch 96,
+batch 1 x accum 2, full recipe). It used a HARDER variant of the synthetic fixture: per-item random
+slab tilt, offset and thickness, a recto/verso pair, CT noise +-90 on a 0.6-contrast slab. Held-out
+grid: 8 items. Its held-out dice was 0.89. The probability heads had learned the slabs. The distance
+heads had not (midline MAE ~26 voxels), so the distance-head numbers below are an untrained head's
+sensitivity and do not describe a trained one.
+
+Outputs on 4 held-out windows at 160^3 (the EMA weights, via the producer's `Student.plane_fn`: the
+temperatures, the sigmoid and the soft thickness included). q8 = `infer.u8_t` of the bounded planes.
+flip = the 0.5 threshold decision changes.
+
+| comparison | recto max / mean \|dp\| | recto q8 differ (max) | verso max / mean \|dp\| | verso q8 differ (max) | flip (r / v) | midline max / mean \|d\| (vox) | thickness max / mean |
+|---|---|---|---|---|---|---|---|
+| **on vs off (compiled, production)** | 3.7e-3 / 2.3e-5 | 0.58 % (1) | 9.9e-3 / 5.1e-5 | 1.23 % (3) | 1.6e-5 / 3.8e-5 | 0.016 / 9.1e-4 | 0.012 / 2.0e-4 |
+| on vs off (eager) | 4.0e-3 / 2.9e-5 | 0.71 % (1) | 1.2e-2 / 6.1e-5 | 1.48 % (3) | 2.0e-5 / 4.2e-5 | 0.016 / 1.1e-3 | 0.013 / 2.5e-4 |
+| reference: off eager vs off compiled | 5.2e-3 / 7.7e-5 | 1.93 % (2) | 1.3e-2 / 1.7e-4 | 4.07 % (4) | 3.2e-5 / 7.2e-5 | 0.023 / 1.7e-3 | 0.013 / 4.1e-4 |
+| reference: off (bf16) vs fp32 | 3.2e-3 / 6.2e-5 | 1.47 % (1) | 7.1e-3 / 1.3e-4 | 3.24 % (2) | 2.4e-5 / 6.6e-5 | 0.014 / 1.6e-3 | 0.0097 / 5.6e-4 |
+| on (bf16) vs fp32 | 3.6e-3 / 6.2e-5 | 1.48 % (1) | 7.4e-3 / 1.3e-4 | 3.25 % (2) | 2.4e-5 / 6.8e-5 | 0.014 / 1.6e-3 | 0.0097 / 5.6e-4 |
+
+**The flag moves the outputs about half as much as the kernel choice already does** (eager vs
+compiled, the difference between the trainer's eval and the producer today). With the flag on, the
+distance to an fp32 forward is the same as with it off, to the third digit. That is expected: the
+only changed arithmetic is the interpolation and the concat, and the next conv rounds those to bf16
+anyway.
+
+300-step continuation from that checkpoint (resume, steps 300 -> 600, the same item stream). Two torch
+seeds (the augmentation and cascade draws) x flag off/on. Loss = the logged total, mean over rows
+301-600 and 501-600. Held-out metrics at step 600:
+
+| run | mean loss 301-600 | mean loss 501-600 | dice | dice_soft | dice_best | bce | mae_thickness |
+|---|---|---|---|---|---|---|---|
+| off, seed 0 | 19.0595 | 18.3991 | 0.9522 | 0.7813 | 0.9530 | 0.0669 | 7.3704 |
+| **on, seed 0** | 19.0594 | 18.3991 | 0.9522 | 0.7812 | 0.9530 | 0.0670 | 7.3716 |
+| off, seed 1 | 19.0211 | 18.3552 | 0.9506 | 0.7811 | 0.9543 | 0.0672 | 7.3527 |
+| **on, seed 1** | 19.0214 | 18.3556 | 0.9506 | 0.7811 | 0.9542 | 0.0672 | 7.3527 |
+
+Every logged loss row agrees between off and on at the same seed to 1e-3. The held-out dice agrees to
+<= 2e-4 at steps 400, 500 and 600. The seed-to-seed spread is 8-30x larger (dice 0.0016-0.0055 at
+steps 400-600, loss 0.04). **The flag's effect on training is well inside the run-to-run noise.**
+Limits: 300 steps on a synthetic fixture, with the distance heads still untrained. It does not show
+that a long run is unaffected. It shows that the per-step perturbation is smaller than what autotune
+kernel choice and the random seed already add.
+
+### Extrapolation to the A100 (patch 256 / window 256)
+
+* **Trainer (27.4 GB peak, ~43 GB reserved).** The peak allocation does not move (identical at 144,
+  160 and 176, and per phase at 160), so ~27 GB at 256. The reserved saving was 1.25 GB at V = 1.95
+  and 0.77 GB at V = 2.6. Scaled with the activation volume, that is **at most ~2-5 GB of reserved at
+  256 (~38-41 GB instead of ~43)**, and it comes from fragmentation, which does not scale reliably.
+  The graph pool is unchanged, and graphs need ~14-15 GB more than today. **CUDA graphs still do not
+  fit in the trainer.** Step: -2.5 to -3.5 % here, and probably more on the A100 at 256, where the
+  fp32 concat traffic is 8x larger. Not measured there.
+* **Producer (verso peak 21 GB at window 256).** The student forward's peak allocation is unchanged
+  (9.0 GB above the input in both), so the verso peak stays **~21 GB**. What changes is that the
+  largest single block goes from 6 GB to 4 GB, so the "reserved but fragmented" failure (a teacher or
+  fields pass that needs a 6 GB contiguous segment after the student pass) gets less likely. The
+  forward is **~25 % faster** at 256 on the laptop (493 -> 372 ms), and that is the one real gain.
+  Under CUDA graphs the held pool shrinks ~12 % (6.99 -> 6.14 GB at 192, i.e. ~14 -> ~12 GB at 256),
+  still far past the ~0.1 GB the producer has spare. **CUDA graphs still do not fit in the producer.**
+
+### Recommendation: deploy as a speed change only, with a host check, and never as a memory fix
+
+* It is **not** the memory fix it was expected to be. No peak (trainer or producer) goes down, and
+  it does not make CUDA graphs fit anywhere. Do not budget VRAM around it.
+* It **is** a free speedup with no measurable quality cost: -25 % student forward at window 256,
+  -6 % at 192, -2.5 to -3.5 % per training step. It also removes the 6 GB contiguous fp32 block
+  that makes back-to-back 256 windows OOM on a 16 GB card. The output change is half the size of the
+  eager/compiled difference, and the training effect is 8-30x below the seed noise.
+* Deploying means setting `gn_bf16 = true` in the run's TOML at the next planned restart (resume logs
+  `precision_switch`). The producer's student picks it up from the next checkpoint's cfg (one
+  recompile). Before relying on the speed number, confirm it on the host: the verso `gpu_s` per region
+  (~51 s today) should fall, and `vram_report` peaks should not rise. If paris4 must stay bit-stable
+  across the rest of its run, leave it off there and turn it on for the next run from step 0.
 
 ## Compile threads
 
@@ -257,6 +418,10 @@ a reasonable first try.
    `ckpt_act`. Measured 2026-09-25 (section above): the graph pool adds ~14-15 GB at 256, checkpointing
    takes at most ~2-3 GB of it back and costs 8-18 % per step, and the graph gain was 1-3.5 %.
 3. Persist the inductor cache (`TORCHINDUCTOR_CACHE_DIR` on the run disk) so a restart is warm.
+4. `gn_bf16 = true` (section above): a speed change (-25 % student forward at 256, -3 % per training
+   step), with numerics within noise. It frees no peak memory and does not make CUDA graphs fit. Turn
+   it on at a planned restart (resume logs `precision_switch`), then check verso `gpu_s` and
+   `vram_report` on the host.
 
 Env lines (none needed to keep today's behaviour):
 
@@ -270,4 +435,5 @@ Env lines (none needed to keep today's behaviour):
 
 reduce-overhead; the graph gain ON the A100 behind the Thunder proxy (the laptop measures launch
 latency without the proxy); compile-worker RSS at 2-4 threads; the eval-grid prefetch timing (commit
-`23ee7c6`, tested for identical results but not timed).
+`23ee7c6`, tested for identical results but not timed); `gn_bf16` on the A100 (step time at 256,
+verso `gpu_s`, reserved memory) and over a long run on real data.

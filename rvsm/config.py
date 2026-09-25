@@ -175,7 +175,13 @@ FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_s
                        # the continuity terms, retunable on a resume (a deliberate mid-run retuning,
                        # 2026-09-25, paris4: values unchanged for now); the trainer reads them from the
                        # live config and the resume logs a `loss_switch` sched line naming any that moved
-                       "loss_skel", "loss_affinity", "loss_ect", "loss_selfcons")
+                       "loss_skel", "loss_affinity", "loss_ect", "loss_selfcons",
+                       # the GroupNorm+SiLU outputs in bf16 under autocast (model.NormAct): it changes
+                       # the numerics (the stored activations and the upsample round to bf16), so it is
+                       # recorded in config.json and in every checkpoint's cfg, but a resume may flip it
+                       # as a deliberate mid-run switch, like the cascade change; the resume logs a
+                       # `precision_switch` sched line (`run.log_switches`)
+                       "gn_bf16")
 
 # The loss weights a resume may retune (`run.log_switches` logs a `loss_switch` line when one moved).
 LOSS_SWITCH_FIELDS = ("loss_prob_dice", "loss_pair", "loss_skel", "loss_affinity", "loss_ect",
@@ -302,6 +308,10 @@ class Config:
     compile: bool = True               # torch.compile the student (and the teachers, when teacher_bf16)
     teacher_bf16: bool = True          # teachers under bf16 autocast (+ compile): their fp32 forward was
                                        # the whole cost of a teacher region
+    gn_bf16: bool = False              # the student's GroupNorm+SiLU outputs leave in bf16 under autocast
+                                       # (float32 statistics; `model.NormAct`): about half the activation
+                                       # memory. The trainer, its eval/cascade nets and the producer's
+                                       # student (from the checkpoint's cfg) all follow it
 
     # ------------------------------------------------------------------ derived
     def layout(self):

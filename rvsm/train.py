@@ -983,7 +983,9 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     grid = val_items if val_items is not None else []   # a list, or a `sample.DiskGrid` (never list()ed:
                                                          # that would load a spilled grid whole)
 
-    net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, ckpt_act=cfg.ckpt_act, verbose=False).to(dev)
+    gnb = bool(getattr(cfg, "gn_bf16", False))
+    net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, ckpt_act=cfg.ckpt_act, gn_bf16=gnb,
+                  verbose=False).to(dev)
     newp = set()
     if init:
         st = torch.load(init, map_location="cpu", weights_only=False)
@@ -1026,10 +1028,10 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
     # CASCADE: one `Cascade` builds the TRAINING channel (stochastic: mix / dropout / noise), another
     # the validation one (deterministic: self, no noise, no dropout). The self source runs its own copy
     # of the net on the EMA weights -- never the compiled module, and never with a grad path.
-    evnet = M.build(cfg.size, cin=layout.cin, cout=layout.cout, verbose=False).to(dev)
+    evnet = M.build(cfg.size, cin=layout.cin, cout=layout.cout, gn_bf16=gnb, verbose=False).to(dev)
     casnet = None
     if cfg.cascade in ("self", "mix"):
-        casnet = M.build(cfg.size, cin=layout.cin, cout=layout.cout, verbose=False).to(dev)
+        casnet = M.build(cfg.size, cin=layout.cin, cout=layout.cout, gn_bf16=gnb, verbose=False).to(dev)
         casnet.eval()
     casfwd = None
     if casnet is not None and cfg.compile and dev.type == "cuda":

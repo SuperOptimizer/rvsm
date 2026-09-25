@@ -753,7 +753,7 @@ def calibrate(argv):
         raise SystemExit(f"rvsm calibrate: no held-out regions for {out}")
     grid = sample.val_grid(cfg, held, root=str(out), ct=cfg.ct, ax=ax, round_=round_,
                            limit=int(one("limit", 8, int)))
-    net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, verbose=False).to(dev)
+    net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, gn_bf16=cfg.gn_bf16, verbose=False).to(dev)
     net.load_state_dict(sd)
     net.eval()
     res = CAL.run(net, _prepared_grid(grid, dev, layout), layout=layout,

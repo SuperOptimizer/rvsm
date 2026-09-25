@@ -57,3 +57,26 @@ def test_deep_heads_and_ckpt_act():
     assert [tuple(q.shape[2:]) for q in y] == [(16,) * 3, (8,) * 3, (4,) * 3]
     net.eval()
     assert torch.is_tensor(net(torch.zeros(1, 4, 16, 16, 16)))
+
+
+def test_gn_bf16_hands_on_bf16_under_autocast_and_changes_nothing_else():
+    """`gn_bf16`: the GroupNorm+SiLU output leaves in the autocast dtype; the switch off, or outside
+    autocast, it is plain SiLU. The state dict is the same either way (NormAct has no parameters)."""
+    x = torch.randn(2, 8, 4, 4, 4)
+    a = model.NormAct()
+    assert torch.equal(a(x), F.silu(x))
+    a.bf16 = True
+    assert torch.equal(a(x), F.silu(x))                    # no autocast: float32 stays float32
+    with torch.autocast("cpu", torch.bfloat16):
+        y = a(x)
+    assert y.dtype == torch.bfloat16 and torch.equal(y, F.silu(x).to(torch.bfloat16))
+    off = model.build("1m", cin=5, cout=3, verbose=False)
+    on = model.build("1m", cin=5, cout=3, gn_bf16=True, verbose=False)
+    assert list(off.state_dict()) == list(on.state_dict()) and on.gn_bf16 and not off.gn_bf16
+    acts = [m for m in on.modules() if isinstance(m, model.NormAct)]
+    assert acts and all(m.bf16 for m in acts)
+    model.set_gn_bf16(on, False)
+    assert not any(m.bf16 for m in acts) and not on.gn_bf16
+    on.load_state_dict(off.state_dict())
+    z = torch.randn(1, 5, 16, 16, 16)
+    assert torch.equal(on(z), off(z))                      # CPU float32: identical

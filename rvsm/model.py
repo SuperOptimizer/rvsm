@@ -52,22 +52,60 @@ def up2x(x, size):
     return x
 
 
+class NormAct(nn.SiLU):
+    """The SiLU after every GroupNorm, with the `gn_bf16` switch: `bf16 = True` hands its output on in
+    the autocast dtype (bf16) instead of float32.
+
+    Why: `group_norm` is on autocast's float32 list, so under bf16 autocast every GroupNorm output --
+    and therefore every block output, every skip, every upsample and every decoder concat -- is a
+    float32 tensor, twice the bytes of everything else in the net (the level-0 concat at window 256 is
+    one 6 GB buffer). Every consumer of a block output is a convolution (the next block, `down`,
+    `proj`, the heads), and autocast rounds a convolution's input to bf16 anyway, so casting HERE --
+    after the float32 normalisation and the SiLU, not before them -- changes only the storage: the
+    statistics, the affine and the SiLU still run in float32 on the float32 GroupNorm output, and the
+    one arithmetic difference is `up2x` (and the concat beside it) interpolating bf16 values instead
+    of float32 ones before the conv rounds them. The state dict is unchanged (no parameters here),
+    and with the switch off, or outside autocast (the CPU path, fp32 inference), this is `nn.SiLU`."""
+
+    bf16 = False
+
+    def forward(self, x):
+        y = F.silu(x)
+        if self.bf16 and y.dtype == torch.float32 and torch.is_autocast_enabled(y.device.type):
+            y = y.to(torch.get_autocast_dtype(y.device.type))
+        return y
+
+
 def block(cin, cout):
     layers = []
     for c in (cin, cout):
-        layers += [nn.Conv3d(c, cout, 3, padding=1), nn.GroupNorm(min(8, cout), cout), nn.SiLU()]
+        layers += [nn.Conv3d(c, cout, 3, padding=1), nn.GroupNorm(min(8, cout), cout), NormAct()]
     return nn.Sequential(*layers)
 
 
+def set_gn_bf16(net, on):
+    """Switch every `NormAct` of `net` (any module holding a UNet, compiled or not) to hand on bf16
+    (`on`) or float32. A compiled module guards on the attribute, so a switch recompiles once."""
+    net = getattr(net, "_orig_mod", net)
+    for m in net.modules():
+        if isinstance(m, NormAct):
+            m.bf16 = bool(on)
+    if isinstance(net, UNet):
+        net.gn_bf16 = bool(on)
+    return net
+
+
 class UNet(nn.Module):
-    def __init__(self, widths=PRESETS["1m"], cin=4, cout=1, ckpt_act=0, add_skip=0, deep=0):
+    def __init__(self, widths=PRESETS["1m"], cin=4, cout=1, ckpt_act=0, add_skip=0, deep=0,
+                 gn_bf16=False):
         """ckpt_act: recompute the activations of the blocks at the first `ckpt_act` levels (the
         full-resolution ones hold most of the memory) in the backward pass; True/-1 = every level.
         add_skip: at the first `add_skip` levels the decoder ADDS the skip to a 1x1 projection of the
         upsampled tensor instead of concatenating, so the widest full-resolution tensor is w0 channels
         and not w0 + w1.
         deep: also predict the `cout` maps at decoder levels 1..deep; `forward` returns
-        [logits_level0, logits_level1, ...] while training and level 0 otherwise."""
+        [logits_level0, logits_level1, ...] while training and level 0 otherwise.
+        gn_bf16: the GroupNorm+SiLU outputs leave in bf16 under autocast (`NormAct`), not float32."""
         super().__init__()
         self.deep = min(int(deep), len(widths) - 2)
         self.ckpt_act = len(widths) if ckpt_act is True or ckpt_act < 0 else int(ckpt_act)
@@ -81,6 +119,7 @@ class UNet(nn.Module):
                                    for i in range(len(w) - 1)])
         self.head = nn.Conv3d(w[0], cout, 1)
         self.deep_heads = nn.ModuleList([nn.Conv3d(w[i], cout, 1) for i in range(1, self.deep + 1)])
+        set_gn_bf16(self, gn_bf16)
 
     def _run(self, m, x, level):
         rg = any(t.requires_grad for t in (x if isinstance(x, tuple) else (x,)))
@@ -126,12 +165,13 @@ def params(size="1m", cin=4, cout=1, add_skip=0, deep=0):
     return int(sum(p.numel() for p in m.parameters()))
 
 
-def build(size="1m", cin=4, cout=1, ckpt_act=0, add_skip=0, deep=0, verbose=True):
+def build(size="1m", cin=4, cout=1, ckpt_act=0, add_skip=0, deep=0, gn_bf16=False, verbose=True):
     if size not in PRESETS:
         raise KeyError(f"unknown size {size!r}: one of {sorted(PRESETS)}")
     m = UNet(PRESETS[size], cin=int(cin), cout=int(cout), ckpt_act=ckpt_act, add_skip=int(add_skip),
-             deep=int(deep)).to(memory_format=memfmt())
+             deep=int(deep), gn_bf16=bool(gn_bf16)).to(memory_format=memfmt())
     if verbose:
         n = sum(p.numel() for p in m.parameters())
-        print(f"rvsm UNet {size} widths={PRESETS[size]} in={cin} heads={cout} params={n / 1e6:.2f}M")
+        print(f"rvsm UNet {size} widths={PRESETS[size]} in={cin} heads={cout} params={n / 1e6:.2f}M"
+              + (" gn_bf16" if gn_bf16 else ""))
     return m

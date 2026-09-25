@@ -905,6 +905,23 @@ def test_a_student_reloads_a_new_checkpoint_into_the_same_module(student_env, st
     assert s.reload(big) is False and s.ckpt == other          # another network: nothing touched
 
 
+def test_the_student_takes_gn_bf16_from_its_checkpoint_and_follows_a_switch(student_env, student_ckpt,
+                                                                            tmp_path):
+    """The producer's student runs with the checkpoint's own `gn_bf16`, and a reload of a checkpoint
+    whose cfg flipped it switches the loaded module in place (same module, same compiled forward)."""
+    import dataclasses
+    from rvsm import model as M
+    e = student_env
+    s = infer.student_fn(student_ckpt, device="cpu", compile=False)
+    acts = [m for m in s.raw.modules() if isinstance(m, M.NormAct)]
+    assert not s.gn_bf16 and acts and not any(m.bf16 for m in acts)
+    on = _other_ckpt(tmp_path, dataclasses.replace(e.cfg, gn_bf16=True), "on.pt", 3, 9)
+    raw = s.raw
+    assert s.reload(on) is True and s.raw is raw and s.gn_bf16 and all(m.bf16 for m in acts)
+    assert infer.student_fn(on, device="cpu", compile=False).gn_bf16
+    assert not infer.student_fn(on, device="cpu", compile=False, gn_bf16=False).gn_bf16   # override
+
+
 def test_the_producer_slot_follows_the_live_checkpoint_in_place(student_ckpt, tmp_path, region_cfg):
     """`run.StudentSlot` loads a newly published `student.pt` into the student it already has."""
     import shutil

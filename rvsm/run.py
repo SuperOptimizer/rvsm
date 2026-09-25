@@ -2699,7 +2699,8 @@ def log_switches(out, old, cfg):
     """The deliberate mid-run changes a resume makes, as `sched` lines against the previous
     config.json (`old`): `teacher_switch` when the round-0 teacher set (the keys of `teacher_ckpts`)
     or a teacher's weights moved, `loss_switch` naming every loss weight of `config.LOSS_SWITCH_FIELDS`
-    that moved (the trainer uses the live config's weights). Returns the lines logged."""
+    that moved (the trainer uses the live config's weights), `precision_switch` when `gn_bf16` moved (a
+    config.json that predates the field counts as False). Returns the lines logged."""
     d = (old or {}).get("config") or {}
     step = int(read_state(out).get("step", 0) or 0)
     got = []
@@ -2718,6 +2719,11 @@ def log_switches(out, old, cfg):
             moved[k] = {"old": float(d[k]), "new": float(getattr(cfg, k))}
     if moved:
         rec = {"kind": "loss_switch", "step": step, "weights": moved}
+        jlog(out, "sched", rec)
+        got.append(rec)
+    og = bool(CFG._coerce("gn_bf16", d.get("gn_bf16", False)))
+    if og != bool(cfg.gn_bf16):
+        rec = {"kind": "precision_switch", "step": step, "gn_bf16": {"old": og, "new": bool(cfg.gn_bf16)}}
         jlog(out, "sched", rec)
         got.append(rec)
     return got

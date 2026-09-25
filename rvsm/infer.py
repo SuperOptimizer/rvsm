@@ -647,7 +647,7 @@ class Student:
     FIELDS = ("midline", "thickness", "conf")
 
     def __init__(self, ckpt, device=None, compile=True, mode="max-autotune-no-cudagraphs", temps=True,
-                 data=None):
+                 data=None, gn_bf16=None):
         from rvsm import model as M
         self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.ckpt = str(ckpt)
@@ -655,8 +655,13 @@ class Student:
         self.cfg, self.layout, self.step = cfg, layout, step
         self.temps = tmps if temps else {}
         self.use_temps = bool(temps)
+        # gn_bf16 (`model.NormAct`): the checkpoint's own cfg unless the caller overrides it, so the
+        # producer serves a checkpoint with the precision it was trained with
+        self.gn_bf16_override = gn_bf16
+        self.gn_bf16 = bool(cfg.gn_bf16 if gn_bf16 is None else gn_bf16)
         net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, ckpt_act=0,
-                      add_skip=int(st.get("add_skip", 0)), deep=0, verbose=False).to(self.dev)
+                      add_skip=int(st.get("add_skip", 0)), deep=0, gn_bf16=self.gn_bf16,
+                      verbose=False).to(self.dev)
         net.load_state_dict(sd)
         net.eval()
         self.raw = net
@@ -695,6 +700,11 @@ class Student:
             assert set(cur) == set(sd), f"{ckpt}: the state dict keys differ from the loaded student's"
             for k, v in sd.items():
                 cur[k].copy_(v.to(cur[k].device, cur[k].dtype))
+        gnb = bool(cfg.gn_bf16 if self.gn_bf16_override is None else self.gn_bf16_override)
+        if gnb != self.gn_bf16:       # a mid-run precision switch: the compiled forward recompiles once
+            from rvsm import model as M
+            M.set_gn_bf16(self.raw, gnb)
+            self.gn_bf16 = gnb
         self.ckpt, self.cfg, self.layout, self.step = str(ckpt), cfg, layout, step
         self.temps = tmps if temps else {}
         self.use_temps = bool(temps)
@@ -757,10 +767,11 @@ class Student:
 
 
 def student_fn(ckpt_path, device=None, compile=True, mode="max-autotune-no-cudagraphs", temps=True,
-               data=None):
+               data=None, gn_bf16=None):
     """A `Student` for a checkpoint: the net built from its own cfg/layout, the EMA weights loaded, the
     per-rung temperature applied to the PROBABILITY heads only, ready to serve plane stacks."""
-    return Student(ckpt_path, device=device, compile=compile, mode=mode, temps=temps, data=data)
+    return Student(ckpt_path, device=device, compile=compile, mode=mode, temps=temps, data=data,
+                   gn_bf16=gn_bf16)
 
 
 def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, device=None,
