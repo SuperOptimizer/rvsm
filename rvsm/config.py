@@ -187,11 +187,64 @@ FINGERPRINT_EXCLUDE = ("infer_margin", "steps", "eval_every", "workers", "gpus",
                        "gn_bf16",
                        # the overlap-crop consistency term (docs/recipe.md): off by default, and switched
                        # on / retuned on a resume as a deliberate mid-run change (`loss_switch` line)
-                       "overlap_p", "overlap_sub", "loss_overlap")
+                       "overlap_p", "overlap_sub", "loss_overlap",
+                       # per-rung teacher ROUTING with gap-fill (`route_spec`, docs/recipe.md §7): like the
+                       # m7 switch, a change of the recto target SOURCE that the producer's regeneration
+                       # handles (a routed store records `route`, `run.recto_needs_regen` compares it); the
+                       # resume logs a `teacher_switch` sched line. The gap-fill loss knobs go with it
+                       "teacher_route", "loss_band", "band_dilate", "band_eps")
 
 # The loss weights a resume may retune (`run.log_switches` logs a `loss_switch` line when one moved).
 LOSS_SWITCH_FIELDS = ("loss_prob_dice", "loss_pair", "loss_skel", "loss_affinity", "loss_ect",
-                      "loss_selfcons", "loss_skel_prec", "loss_overlap")
+                      "loss_selfcons", "loss_skel_prec", "loss_overlap", "loss_band", "band_dilate", "band_eps")
+
+# The per-rung teacher routing (`Config.teacher_route`). ONE fine teacher may own the recto targets of
+# rung 2 (`ROUTE_FINE_RUNGS`: the only rung the sampler and the producer know how to route); every other
+# rung keeps the BASE teacher's targets, and the base teacher's probability rides along at rung 2 as the
+# gap-fill `band`. `ROUTE_RULE` versions the coverage rule c_A (`infer.route_coverage_u8`): a new rule
+# is a new store identity, so the producer regenerates.
+ROUTE_FINE_RUNGS = (2,)
+ROUTE_RULE = "cA-v1"
+ROUTE_BASE_DEFAULT = "m7"
+
+
+@dataclass(frozen=True)
+class RouteSpec:
+    """An ACTIVE teacher route: `fine` makes the recto probability at `fine_rungs` (rung 2), `base` makes
+    it at every other rung and the gap-fill band at the fine rungs. `sig` is the identity a routed store
+    records (`route` attr) and the producer compares against."""
+    fine: str
+    base: str
+    fine_rungs: tuple
+    sig: str
+
+
+def route_spec(cfg):
+    """The config's teacher route as a `RouteSpec`, or None when routing is off.
+
+    `teacher_route` maps rung -> teacher name (TOML keys are strings: `{ "2" = "recto", "3" = "m7",
+    "4" = "m7" }`). OFF: an empty map, or one whose rung 2 names the same teacher as the other rungs
+    (that is the one-teacher mode of `teacher_ckpts`, nothing to route). ON: rung 2 names the FINE
+    teacher and every other rung given names one BASE teacher (`m7` when no other rung is given). A
+    fine teacher at another rung, or two base teachers, is an error: only rung 2 can be routed."""
+    r = getattr(cfg, "teacher_route", None) or {}
+    if not r:
+        return None
+    try:
+        m = {int(k): str(v) for k, v in dict(r).items()}
+    except (TypeError, ValueError):
+        raise ValueError(f"teacher_route: the keys must be rungs, got {r!r}") from None
+    fine = m.get(2)
+    others = sorted({v for k, v in m.items() if k != 2})
+    if len(others) > 1:
+        raise ValueError(f"teacher_route: every rung but 2 must name the one base teacher, got {m}")
+    base = others[0] if others else ROUTE_BASE_DEFAULT
+    if fine is None:
+        raise ValueError(f"teacher_route: only rung 2 can be routed to a fine teacher, got {m}")
+    if fine == base:
+        return None
+    return RouteSpec(fine=fine, base=base, fine_rungs=ROUTE_FINE_RUNGS,
+                     sig=f"r2={fine};band={base};{ROUTE_RULE}")
 
 
 @dataclass
@@ -216,6 +269,11 @@ class Config:
     teacher_ckpts: dict = field(default_factory=dict)  # {"recto": path, "m7": path} local teacher weights;
                                        # its KEYS are the teacher set ({} = recto + m7; {"m7": path} alone =
                                        # m7-only recto targets, rw = 1)
+    teacher_route: dict = field(default_factory=dict)  # per-rung teacher routing with gap-fill; {} = off.
+                                       # {"2": "recto", "3": "m7", "4": "m7"}: rung-2 recto targets from the
+                                       # 2.4 um recto teacher where it is confident (c_A), the m7 band beside
+                                       # them for the gaps, rungs >= 3 from m7 as before (`route_spec`;
+                                       # both teachers must be keys of `teacher_ckpts`)
     cache_gb: float = 64.0             # CT shard cache budget on disk/RAM
     gpu_prefetch: bool = True          # the trainer copies batch i+1 to the device on a side stream
     pin_memory: bool = False           # the trainer's loader pins its batches. Off: on Thunder's A100 the
@@ -292,6 +350,11 @@ class Config:
     overlap_p: float = 0.0             # probability that a draw carries the second window
     overlap_sub: int = 0               # EMA forward on a q^3 sub-crop of the second window (0 = all of it)
     loss_overlap: float = 0.0          # weight of the term (0 = not computed, even with overlap_p > 0)
+    loss_band: float = 0.0             # routed rung 2 only (`teacher_route`): mean relu(p - band_eps)^2 over
+                                       # the voxels OUTSIDE the dilated base (m7) band where the fine teacher
+                                       # is not confident (`losses.band_penalty`); 0 = off
+    band_dilate: int = 2               # the base band's dilation radius at the routed rung, in voxels
+    band_eps: float = 0.05             # the band penalty's free margin
 
     # ------------------------------------------------------------------ fixed recipe: rounds + inference
     verso_source: str = "flip"         # verso stores come from the student run with the radial sign flipped

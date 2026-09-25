@@ -77,7 +77,9 @@ GEN_MAX = 8     # a region is regenerated a handful of times at most (the verso 
 
 
 BUNDLED = ("verso", "midline", "thickness")   # the channels a verso regeneration replaces TOGETHER
-TEACHER_BUNDLED = ("recto", "rw")             # ... and the pair a teacher regeneration replaces together
+TEACHER_BUNDLED = ("recto", "rw", "band")     # ... and what a teacher regeneration replaces together: the
+                                              # recto + rw pair, and a ROUTED generation's base-teacher band
+                                              # (`config.route_spec`; absent otherwise)
 
 
 def is_bundled(channel):
