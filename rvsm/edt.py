@@ -230,49 +230,97 @@ def _triton_kernels():
                 tl.store(HIT + offs, hit.to(tl.int8), mask=ok)
 
             @triton.jit
-            def _lab_iter(M, L, EXT, FLAG, N, Z, Y, X, BLOCK: tl.constexpr):
-                # one label iteration: the 3^3 neighbourhood maximum within the voxel's own volume,
-                # hooked onto the voxel the label names (atomic max) and taken by the voxel; FLAG is
-                # raised where the maximum differs from the label. Labels only grow and always name a
-                # voxel of the same component, so the order the atomics land in changes nothing at
-                # convergence (each component ends as its largest 1 + index).
+            def _uf_find(L, a, m):
+                # the root of a's tree: parents only ever grow (L[a] >= a, L[a] == a at a root), so
+                # a stale parent is still an ancestor and the walk ends
+                p = tl.load(L + a, mask=m, other=0, cache_modifier=".cg")
+                go = m & (p != a)
+                while tl.max(go.to(tl.int32), axis=0) > 0:
+                    # path halving: a's parent becomes its grandparent (still an ancestor, larger)
+                    gp = tl.load(L + p, mask=go, other=0, cache_modifier=".cg")
+                    tl.atomic_max(L + a, gp, mask=go & (gp != p))
+                    a = tl.where(go, gp, a)
+                    p = tl.load(L + a, mask=go, other=0, cache_modifier=".cg")
+                    go = go & (p != a)
+                return a
+
+            @triton.jit
+            def _uf_union(L, a, b, m):
+                # link the smaller root under the larger (atomic max); if it was no longer a root, retry
+                # from the parent the atomic returned (Playne & Hawick's union, max instead of min)
+                go = m
+                while tl.max(go.to(tl.int32), axis=0) > 0:
+                    a = _uf_find(L, a, go)
+                    b = _uf_find(L, b, go)
+                    up = go & (a > b)
+                    dn = go & (b > a)
+                    lo = tl.where(up, b, a)
+                    hi = tl.where(up, a, b)
+                    old = tl.atomic_max(L + lo, hi, mask=up | dn)
+                    fin = old == lo
+                    b = tl.where(up & ~fin, old, b)
+                    a = tl.where(dn & ~fin, old, a)
+                    go = (up | dn) & ~fin
+
+            @triton.jit
+            def _uf_nb(M, i, z, y, x, m, Y, X, dz: tl.constexpr, dy: tl.constexpr, dx: tl.constexpr):
+                inb = m & (z + dz >= 0) & (y + dy >= 0) & (y + dy < Y) & (x + dx >= 0) & (x + dx < X)
+                return inb & (tl.load(M + i + ((dz * Y + dy) * X + dx), mask=inb, other=0) != 0)
+
+            @triton.jit
+            def _uf_merge(M, L, N, Z, Y, X, BLOCK: tl.constexpr):
+                # every mask voxel is joined to its 13 earlier (lower flat index) 26-neighbours in the
+                # mask and its own volume -- except a neighbour 26-adjacent to one handled before it: that
+                # pair is joined by the later one's own merge, so it is connected to this voxel anyway
+                # (inside a solid band a voxel makes ONE union, with the voxel below it)
                 offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
                 ok = offs < N
                 m = (tl.load(M + offs, mask=ok, other=0) != 0) & ok
                 V = Z * Y * X
-                b = offs // V
-                r = offs - b * V
+                r = offs % V
                 z = r // (Y * X)
                 y = (r // X) % Y
                 x = r % X
-                cur = tl.load(L + offs, mask=m, other=0)
-                nb = cur
-                for dz in tl.static_range(-1, 2):
-                    for dy in tl.static_range(-1, 2):
-                        for dx in tl.static_range(-1, 2):
-                            zz, yy, xx = z + dz, y + dy, x + dx
-                            inb = m & (zz >= 0) & (zz < Z) & (yy >= 0) & (yy < Y) & (xx >= 0) & (xx < X)
-                            q = tl.load(L + offs + (dz * Y + dy) * X + dx, mask=inb, other=0)
-                            nb = tl.maximum(nb, q)
-                ch = m & (nb != cur)
-                tl.atomic_max(EXT + b * V + cur - 1, nb, mask=ch)
-                tl.atomic_max(L + offs, nb, mask=ch)
-                tl.atomic_max(FLAG + offs * 0, ch.to(tl.int32), mask=ch)
+                i = offs.to(tl.int32)
+                n0 = _uf_nb(M, i, z, y, x, m, Y, X, -1, 0, 0)
+                n1 = _uf_nb(M, i, z, y, x, m, Y, X, 0, -1, 0)
+                n2 = _uf_nb(M, i, z, y, x, m, Y, X, 0, 0, -1)
+                n3 = _uf_nb(M, i, z, y, x, m, Y, X, -1, -1, 0)
+                n4 = _uf_nb(M, i, z, y, x, m, Y, X, -1, 1, 0)
+                n5 = _uf_nb(M, i, z, y, x, m, Y, X, -1, 0, -1)
+                n6 = _uf_nb(M, i, z, y, x, m, Y, X, -1, 0, 1)
+                n7 = _uf_nb(M, i, z, y, x, m, Y, X, 0, -1, -1)
+                n8 = _uf_nb(M, i, z, y, x, m, Y, X, 0, -1, 1)
+                n9 = _uf_nb(M, i, z, y, x, m, Y, X, -1, -1, -1)
+                n10 = _uf_nb(M, i, z, y, x, m, Y, X, -1, -1, 1)
+                n11 = _uf_nb(M, i, z, y, x, m, Y, X, -1, 1, -1)
+                n12 = _uf_nb(M, i, z, y, x, m, Y, X, -1, 1, 1)
+                _uf_union(L, i, i + ((-1 * Y + 0) * X + 0), n0)
+                _uf_union(L, i, i + ((0 * Y + -1) * X + 0), n1 & ~(n0))
+                _uf_union(L, i, i + ((0 * Y + 0) * X + -1), n2 & ~(n0 | n1))
+                _uf_union(L, i, i + ((-1 * Y + -1) * X + 0), n3 & ~(n0 | n1 | n2))
+                _uf_union(L, i, i + ((-1 * Y + 1) * X + 0), n4 & ~(n0 | n2))
+                _uf_union(L, i, i + ((-1 * Y + 0) * X + -1), n5 & ~(n0 | n1 | n2 | n3 | n4))
+                _uf_union(L, i, i + ((-1 * Y + 0) * X + 1), n6 & ~(n0 | n1 | n3 | n4))
+                _uf_union(L, i, i + ((0 * Y + -1) * X + -1), n7 & ~(n0 | n1 | n2 | n3 | n5))
+                _uf_union(L, i, i + ((0 * Y + -1) * X + 1), n8 & ~(n0 | n1 | n3 | n6))
+                _uf_union(L, i, i + ((-1 * Y + -1) * X + -1), n9 & ~(n0 | n1 | n2 | n3 | n5 | n7))
+                _uf_union(L, i, i + ((-1 * Y + -1) * X + 1), n10 & ~(n0 | n1 | n3 | n6 | n8))
+                _uf_union(L, i, i + ((-1 * Y + 1) * X + -1), n11 & ~(n0 | n2 | n4 | n5))
+                _uf_union(L, i, i + ((-1 * Y + 1) * X + 1), n12 & ~(n0 | n4 | n6))
 
             @triton.jit
-            def _lab_jump(M, L, EXT, N, Z, Y, X, JUMPS: tl.constexpr, BLOCK: tl.constexpr):
+            def _uf_final(M, L, OUT, N, V, BLOCK: tl.constexpr):
+                # 1 + the root's index within its volume on the mask, 0 off it
                 offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
                 ok = offs < N
                 m = (tl.load(M + offs, mask=ok, other=0) != 0) & ok
-                V = Z * Y * X
-                base = (offs // V) * V
-                lab = tl.load(L + offs, mask=m, other=0)
-                for _ in tl.static_range(JUMPS):
-                    q = tl.load(EXT + base + lab - 1, mask=m, other=0)
-                    lab = tl.maximum(lab, q)
-                tl.atomic_max(L + offs, lab, mask=m)
+                i = offs.to(tl.int32)
+                root = _uf_find(L, i, m)
+                base = ((offs // V) * V).to(tl.int32)
+                tl.store(OUT + offs, tl.where(m, root - base + 1, 0), mask=ok)
 
-            _TRITON = (_pass, _gauss, _first, _walk, _lab_iter, _lab_jump, _gauss_box)
+            _TRITON = (_pass, _gauss, _first, _walk, _uf_merge, _uf_final, _gauss_box, _uf_find)
         except Exception:  # noqa: BLE001  -- no triton: the torch path
             _TRITON = False
     return _TRITON
@@ -587,30 +635,46 @@ def walk_crossings(pa, pb, boff, act, nb, nt, br, bv, torch_only=False):
     return hit
 
 
-def _label_triton(k, m, sh, vol, nb_, N, max_iter):
-    """`label` in two kernels per iteration (`_lab_iter`, `_lab_jump`), in place in one int32 array:
-    the same fixed point -- each component's largest 1 + index -- as the torch iteration."""
-    dev = m.device
+def _label_triton(k, m, sh, vol, N):
+    """`label` in two kernels and no synchronisation: a concurrent union-find over the mask voxels
+    (`_uf_merge`: each voxel joins its earlier 26-neighbours, a smaller root always linked under a
+    larger one with an atomic max; finds halve their paths), then every voxel's root (`_uf_final`).
+    Parents only grow and always name a voxel of the same component, and after the merge every
+    26-adjacent pair of mask voxels is in one tree, so each tree is one component with its LARGEST
+    voxel as the root, whatever order the atomics land in: the labels are the torch iteration's fixed
+    point -- each component's largest 1 + index -- bit for bit (tested). One warp per program: a
+    program's loops run until its slowest lane's find is done."""
+    mu, par = _forest(k, m, sh, N)
+    out = torch.empty(N, dtype=torch.int32, device=m.device)
+    k[5][(-(-N // 32),)](mu, par, out, N, vol, BLOCK=32, num_warps=1)
+    return out.view(sh)
+
+
+def _forest(k, m, sh, N):
     mu = m.contiguous().view(-1).view(torch.uint8)
-    loc = torch.arange(1, vol + 1, device=dev, dtype=torch.int32).repeat(nb_)
-    lab = torch.where(m.reshape(-1), loc, 0).to(torch.int32).contiguous()
-    del loc
+    par = torch.arange(N, device=m.device, dtype=torch.int32)
     Z, Y, X = (int(v) for v in sh[-3:])
-    flags = torch.zeros(LABEL_CHECK, dtype=torch.int32, device=dev)
-    BLOCK = 512
-    grid = (-(-N // BLOCK),)
-    for it in range(int(max_iter)):
-        j = it % LABEL_CHECK
-        k[4][grid](mu, lab, lab, flags[j:], N, Z, Y, X, BLOCK=BLOCK)
-        k[5][grid](mu, lab, lab, N, Z, Y, X, JUMPS=4, BLOCK=BLOCK)
-        if j == LABEL_CHECK - 1:
-            if int(flags.min()) == 0:          # some iteration since the last check changed nothing
-                break
-            flags.zero_()
-    return lab.view(sh)
+    k[4][(-(-N // 32),)](mu, par, N, Z, Y, X, BLOCK=32, num_warps=1)
+    return mu, par
 
 
-LABEL_CHECK = 8      # label iterations between convergence checks (each check is a device sync)
+def label_forest(m):
+    """The union-find forest of `label` on CUDA, before the labels are read out: an int32 parent array
+    over the flat voxels of `m` (a CUDA bool volume or batch, fewer than 2^31 voxels) in which two voxels
+    OF THE MASK are in one 26-connected component (of one volume) iff following parents from each ends
+    at the same root (`_uf_find`, the kernel set's last entry, which a caller's kernel can use). For a
+    caller that compares the labels of a few voxels only; None where the Triton kernels are unusable."""
+    k = _triton_kernels() if m.is_cuda else False
+    if not k or m.numel() >= 2 ** 31:
+        return None
+    try:
+        return _forest(k, m, m.shape, m.numel())[1]
+    except Exception as e:  # noqa: BLE001
+        _triton_failed(e)
+        return None
+
+
+LABEL_CHECK = 8      # the torch iteration: iterations between convergence checks (each is a device sync)
 
 
 def label(m, max_iter=100000):
@@ -620,8 +684,9 @@ def label(m, max_iter=100000):
     meaningful): each component ends as 1 + the largest flat index (within its volume) it contains, a
     deterministic function of `m`.
 
-    Every voxel starts as its own 1 + flat index; a label always names a voxel of the same component and
-    only ever grows. Per iteration: each voxel's 3^3 neighbourhood maximum (max_pool3d, per volume) is
+    On CUDA a union-find in two kernel launches (`_label_triton`). Elsewhere an iteration with the same
+    fixed point: every voxel starts as its own 1 + flat index; a label always names a voxel of the same
+    component and only ever grows. Per iteration: each voxel's 3^3 neighbourhood maximum (max_pool3d, per volume) is
     hooked onto the voxel its label names (a scatter-max, order independent), taken by the voxel itself,
     and the labels are pointer-jumped (a voxel takes the label of the voxel its label names). It stops
     when every voxel already holds its neighbourhood maximum; that is tested every `LABEL_CHECK`
@@ -633,9 +698,9 @@ def label(m, max_iter=100000):
     nb_ = m.numel() // max(vol, 1)
     N = m.numel()
     k = _triton_kernels() if m.is_cuda else False
-    if k and vol < 2 ** 31:
+    if k and N < 2 ** 31:
         try:
-            return _label_triton(k, m, sh, vol, nb_, N, max_iter)
+            return _label_triton(k, m, sh, vol, N)
         except Exception as e:  # noqa: BLE001
             _triton_failed(e)
     dt = torch.float32 if vol < 2 ** 24 else torch.float64

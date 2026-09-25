@@ -215,3 +215,24 @@ def test_the_box_gaussian_is_the_whole_volume_filter_inside_its_box():
     out = E.gaussian3_box([a, b], full, 1.5)
     assert torch.equal(out[0].view(torch.int32), E.gaussian3(a, 1.5).view(torch.int32))
     assert torch.equal(out[1].view(torch.int32), E.gaussian3(b, 1.5).view(torch.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_the_label_forest_roots_are_the_components():
+    """`label_forest` (the union-find behind `label` on CUDA): following parents from every mask voxel
+    ends at one root per 26-connected component of its own volume, and that root is the component's
+    largest voxel (what `label` reports as 1 + index)."""
+    rng = np.random.default_rng(4)
+    for shape, p in (((3, 20, 30, 25), 0.3), ((2, 17, 19, 23), 0.6), ((1, 40, 40, 40), 0.2)):
+        m = rng.random(shape) < p
+        par = E.label_forest(torch.from_numpy(m).cuda()).cpu().numpy().astype(np.int64)
+        root = np.arange(par.size)
+        while True:
+            nxt = par[root]
+            if np.array_equal(nxt, root):
+                break
+            root = nxt
+        V = int(np.prod(shape[1:]))
+        lab = E.label(torch.from_numpy(m).cuda()).cpu().numpy().reshape(-1)
+        mf = m.reshape(-1)
+        assert np.array_equal(root[mf] - (np.flatnonzero(mf) // V) * V + 1, lab[mf])

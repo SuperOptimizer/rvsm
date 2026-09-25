@@ -534,13 +534,19 @@ def _pair_kernels():
             import triton
             import triton.language as tl
             from triton.language.extra import libdevice as ld
+            from rvsm import edt as E
 
             @triton.jit
             def _rav(boff, p0, p1, p2, Y, X):
                 return boff + (p0.to(tl.int64) * Y + p1) * X + p2
 
+            ek = E._triton_kernels()
+            if not ek:
+                raise RuntimeError("no rvsm.edt kernels")
+            _uf_find = ek[7]
+
             @triton.jit
-            def _rec(SEL, IXR, IXV, LR, LV, PR, PV, OKR, BOX, M, B, BV, V, Y, X, BIG,
+            def _rec(SEL, IXR, IXV, PAR, PR, PV, OKR, BOX, M, B, BV, V, Y, X, BIG,
                      BLOCK: tl.constexpr):
                 # rule 4a per selected voxel, and each block's extent of the face points whose
                 # normals rule 4b will read (BOX[0, b] recto, BOX[1, b] verso: min, -max per axis)
@@ -563,10 +569,12 @@ def _pair_kernels():
                 w0 = tl.load(IXV + fr, mask=ok, other=0)          # p_r's nearest verso point
                 w1 = tl.load(IXV + BV + fr, mask=ok, other=0)
                 w2 = tl.load(IXV + 2 * BV + fr, mask=ok, other=0)
-                er = tl.load(LR + _rav(boff, q0, q1, q2, Y, X), mask=ok, other=0) == \
-                    tl.load(LR + fr, mask=ok, other=0)
-                ev = tl.load(LV + _rav(boff, w0, w1, w2, Y, X), mask=ok, other=0) == \
-                    tl.load(LV + fv, mask=ok, other=0)
+                # one band component <=> one root in the band forests (recto volumes first, then verso);
+                # every point here is a face voxel, i.e. in its band
+                er = _uf_find(PAR, _rav(boff, q0, q1, q2, Y, X).to(tl.int32), ok) == \
+                    _uf_find(PAR, fr.to(tl.int32), ok)
+                ev = _uf_find(PAR, (BV + _rav(boff, w0, w1, w2, Y, X)).to(tl.int32), ok) == \
+                    _uf_find(PAR, (BV + fv).to(tl.int32), ok)
                 # within sqrt(3) (+1e-6) of each other <=> squared integer distance <= 3
                 dr2 = (q0 - r0) * (q0 - r0) + (q1 - r1) * (q1 - r1) + (q2 - r2) * (q2 - r2)
                 dv2 = (w0 - v0) * (w0 - v0) + (w1 - v1) * (w1 - v1) + (w2 - v2) * (w2 - v2)
@@ -750,8 +758,10 @@ def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, re
     """`_pair_checks_torch` on CUDA in a few launches, the codes written straight into `reason` (whose
     `sel` entries are 0). True when done, False when the kernels are unusable (nothing written).
 
-    (a) one kernel per voxel: the nearest points, their reciprocal points, the label and distance tests
-        (integers only), and each block's extent of the face points that passed (atomic min / max);
+    (a) one kernel per voxel: the nearest points, their reciprocal points, the same-component test (the
+        roots of the four face points in both bands' union-find forests, `edt.label_forest`: only the
+        points compared are resolved, never a whole labelling), the within-sqrt(3) test (integers only),
+        and each block's extent of the face points that passed (atomic min / max);
     (b) the Gaussian-smoothed distances only over those extents plus the one-voxel gradient stencil
         (`edt.gaussian3_box`: the same bits as the whole-volume filter there), then one kernel per voxel
         for the gradients, norms, radial and agreement tests in `_pair_checks_torch`'s float32 order,
@@ -769,7 +779,12 @@ def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, re
     BV = B * V
     dev = sel.device
     M = int(sel.numel())
-    lr, lv = E.label(br).reshape(-1), E.label(bv).reshape(-1)
+    if 2 * BV >= 2 ** 31:
+        return False
+    # both bands' union-find forests in one batch; the reciprocal kernel finds the roots it compares
+    par = E.label_forest(torch.stack((br, bv)).view(2 * B, Z, Y, X))
+    if par is None:
+        return False
     pr = torch.empty((3, M), dtype=torch.int32, device=dev)
     pv = torch.empty((3, M), dtype=torch.int32, device=dev)
     okr = torch.empty(M, dtype=torch.int8, device=dev)
@@ -778,11 +793,12 @@ def _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, walk_n, re
     grid = (-(-M // BLOCK),)
     ixr, ixv = ixr.contiguous(), ixv.contiguous()
     try:
-        k[0][grid](sel, ixr, ixv, lr, lv, pr, pv, okr, box, M, B, BV, V, Y, X, E.BOX_EMPTY, BLOCK=BLOCK)
+        k[0][(-(-M // 32),)](sel, ixr, ixv, par, pr, pv, okr, box, M, B, BV, V, Y, X, E.BOX_EMPTY, BLOCK=32,
+                             num_warps=1)     # a warp per program: its finds diverge
     except Exception as e:  # noqa: BLE001
         _pair_failed(e)
         return False
-    del lr, lv
+    del par
     dr, dv = dr.contiguous(), dv.contiguous()
     g = E.gaussian3_box([dr, dv], box, NORMAL_SIGMA)
     if g is None:
