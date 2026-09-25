@@ -101,6 +101,7 @@ def test_rvsm_run_two_rounds_end_to_end(run_cfg, tmp_path, capsys):
     assert st.get("verso_on_step") is not None
     # every round-0 verso store records the checkpoint step that made it (and its generation)
     from rvsm import regions as _RG, stores as _ST
+    RG_ = _RG
     vs = _RG.Catalog(out, 0).list_done("verso")
     assert vs and all("step" in _ST.read_attrs(_ST.store_path(out, "verso", v, 0)) and
                       "gen" in _ST.read_attrs(_ST.store_path(out, "verso", v, 0)) for v in vs)
@@ -112,6 +113,15 @@ def test_rvsm_run_two_rounds_end_to_end(run_cfg, tmp_path, capsys):
     assert cnt[0].get("verso", 0) >= 1, f"no verso store was ever written: {cnt}"
     a = stores.open_store(stores.store_path(out, "recto", held[0]["lo"], 0))
     assert a.attrs["done"] and a.attrs["producer"].startswith("teacher:")
+    # ONE configured teacher (the m7-only mode's shape): its set on every recto, rw = 1 everywhere, and
+    # nothing for the recto regeneration to do
+    for lo in RG_.Catalog(out, 0, ttl=0.0).list_done("recto"):
+        assert stores.read_attrs(stores.store_path(out, "recto", lo, 0))["teachers"] == ["fake"]
+        rw = stores.open_store(stores.store_path(out, "rw", lo, 0))
+        assert rw.attrs["teachers"] == ["fake"] and (np.asarray(rw[:]) == 255).all()
+        assert not RUN.recto_stale(out, lo, ["fake"])
+    assert not [r for r in RUN.tail_jsonl(os.path.join(out, "logs", "produce.jsonl"), 5000)
+                if r.get("kind") in ("reteach", "recto_regen")]
     v = stores.open_store(stores.store_path(out, "verso", _first_done(out, "verso", 0), 0))
     assert v.attrs["radial_sign"] == -1, "the verso store is the FLIPPED-sign pass"
 
