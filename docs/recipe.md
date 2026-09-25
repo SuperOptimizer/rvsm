@@ -403,6 +403,101 @@ the same point in the step.
 | `reserve_gb` | `50.0` | production pauses below this much free disk; a region store is ~9-10 MB, and at most two rounds live on disk at once | `runpod-5090-verso.md`; plan §1 |
 | `round_steps` | `20000` | the MINIMUM a round trains before the round gate may promote it, counted from the round's own start (`state.json` `round_step`), not the absolute step. The gate fails closed (2026-09-23 review): round 0 needs `verso_on` (self-distillation needs round 0's verso stores); then held-out comparison rows with finite precision / betti0 error are required; round 0's stats become the reference (`state.json` `round_ref`, so a restart keeps the veto) and a round >= 1 with no reference, or worse than it beyond the bootstrap CI, is not promoted. The plateau fit reads only this round's evaluations and is logged beside the decision | plan §1; review 2026-09-23 |
 
+### Per-rung teacher routing with gap-fill (`teacher_route`, `loss_band`, `band_dilate`, `band_eps`)
+
+Off by default (`teacher_route = {}`: every rung's recto target comes from the teacher set of
+`teacher_ckpts`, exactly as above; the fingerprint, the grid key, the sampler rows and the loss are
+unchanged). On, it splits the recto target by rung:
+
+```toml
+teacher_ckpts = { recto = "/home/ubuntu/.cache/rvsm/surface_recto_3dunet.pth", m7 = "/home/ubuntu/.cache/rvsm/surface_m7_nnunet.pth" }
+teacher_route = { "2" = "recto", "3" = "m7", "4" = "m7" }
+loss_band = 0.1        # optional; 0 = the band penalty off (the gap-fill masks apply regardless)
+```
+
+- **Rung 2** recto targets come from the FINE teacher (the 2.4 µm `recto` 3D U-Net), trusted only where
+  its coverage `c_A = 1`; **rungs ≥ 3** (and the coarse rungs 7-11) keep the BASE teacher (m7, native at
+  rung 4; rung 3 its 2x-upsampled pool, as in the m7-only mode). `config.route_spec` accepts only this
+  shape: rung 2 is the one routable rung, every other rung named must be the one base teacher (default
+  `m7`), both must be keys of `teacher_ckpts` (checked at `setup` and by the `TeacherBank`).
+- **Stores.** A routed round-0 generation holds `recto` (the fine teacher, q8), `band` (the base
+  teacher's rung-2 probability, q8, a third member of the teacher bundle `stores.TEACHER_BUNDLED`, so it
+  follows the committed recto generation) and `rw` = c_A (0/255, encoding `coverage_u8`), written in that
+  order (rw's `done` finishes the generation). Every routed store records `route`
+  (`r2=<fine>;band=<base>;cA-v1`), `teachers` = [fine, base], `band_source` (`teacher`, or `store:<path>`
+  when the base probability was reused) and the coverage constants.
+- **The coverage rule `c_A` (`infer.route_coverage_u8`, rule `cA-v1`).** `c_A = 1` where the fine
+  teacher's p ≥ 0.6 (a confident face), or p ≤ 0.2 **and** within REACH = 24 rung-2 voxels (57.6 µm,
+  `targets.REACH`) of one of the fine teacher's own faces (p ≥ 0.5): confident background where the teacher
+  demonstrably resolves sheets. Everywhere else `c_A = 0`: undecided voxels (0.2 < p < 0.6) and
+  "background" far from any face the fine teacher found -- which is where a sheet it missed would be. The
+  reach is measured on a 4x max-pooled face mask dilated by 6 coarse voxels, so it is exact to ±3 voxels
+  (a 256³ instead of a 49³-kernel dilation per 1024³ region).
+- **Regeneration.** Turning the route on (or changing it, or bumping the rule) changes the store identity
+  (`run.teacher_set`: [fine, base, `route:<sig>`] vs `run.store_ident`), so every round-0 recto is
+  regenerated through the SAME `reteach` machinery as the m7 switch: the next free generation beside the old
+  one (generation 0 is never touched), held-out regions first, then the window's and leased regions beside
+  the verso passes, then walk order when the window is idle, committed by `commit_sources` once its rw is
+  finished. A region whose COMMITTED recto was made by the base teacher alone (paris4's m7-only stores) --
+  or a routed generation with the same base -- is reused as the band (`run.band_reuse`, decoded on the
+  reader thread): **no m7 rerun**, only the fine teacher runs, and the coarse rungs are not re-fed (they
+  already are the base teacher's). A never-produced region runs both teachers in its first `teacher`
+  pass and feeds the coarse rungs from the band. The fine and base passes run one after the other on the
+  one card, each quantised to uint8 before the next; like every teacher pass the unit holds the GpuGate
+  for its whole forward, so it never overlaps a verso pass or the GPU fields. Turning the route off again
+  regenerates back to the plain teacher set.
+- **Sampler (`sample.Patches`).** A routed config adds ONE trailing target row, `band` (`target_channels`),
+  that no head predicts. For a region whose committed generation has a band (`_routed`): at rung 2 the
+  recto row is the fine teacher at full weight (rw is no longer a recto weight), and the band row is the
+  base probability with weight 255 where `c_A = 1`, 128 where `c_A = 0` (0 = no routed target:
+  air, outside the store, an unrouted region, another rung); at rungs 3-6 the recto row reads the `band`
+  store (pooled exactly as the recto was) with full weight, and the rw is ignored. A region the
+  regeneration has not reached yet keeps its old meaning (recto + rw), so rungs 3-6 never lose targets
+  mid-switch. Round ≥ 1 never routes.
+- **Trainer loss at rung 2** (`losses.route_masks` / `route_apply` / `band_penalty`; the routing row is
+  taken off the batch after the augmentation, which moves it with the targets). Per voxel:
+  - `c_A = 1`: BCE + dice vs the fine teacher's p, as today;
+  - `c_A = 0`, inside the base band dilated by `band_dilate` (2) voxels (the GAP): weight 0 for the
+    direct BCE / dice (and the pair / ECT / exclusivity / affinity terms, which read the same weight);
+    the supervision there is the cascade self-consistency term and the skeleton-recall term -- both keep
+    the gap's weight (`aux_losses(w_cont=...)`), and the recto row's target in the gap is the base
+    probability, so the skeleton recalled there IS the m7 band's skeleton -- plus the distance heads
+    (their fields, where they exist, are unchanged);
+  - `c_A = 0`, outside the dilated band: BCE + dice vs the base teacher's probability (the air
+    suppression of the m7-only targets, unchanged), plus `loss_band · mean relu(p - band_eps)²` over
+    these voxels, so nothing is predicted outside m7's footprint where the fine teacher is not sure.
+    Deliberate deviation from "every voxel outside the band": a `c_A = 1` face the fine teacher sees and
+    m7 does not is NOT penalised -- it is a direct BCE target there and the two terms would fight.
+  Every train row logs `route_vox` (the routed share of the batch), `route_ca`, `route_gap`, `route_out`
+  (shares of the routed voxels) and `band`. Rungs 3-4 are unchanged (m7 targets).
+- **Evaluation.** Unchanged code, the committed generations as the reference: the held-out grid's
+  `grid_sources` see the new recto / rw / band digests and rebuild exactly the held-out regions' items as
+  their regeneration commits (a routed grid also carries the route in `grid_global`); `heldout_rows` /
+  `rvsm eval` read the committed recto. So from the switch on, **rung-2 dice is against the fine teacher
+  at its full base weight, gaps included**, rungs 3-4 against m7: a student that fills the gaps correctly
+  loses rung-2 dice there. Read `dice_r2` together with `dice_r3` / `dice_r4` and the train-row shares.
+- **Failure modes to watch.**
+  - *Confident-but-wrong fine-teacher voxels*: `c_A = 1` is self-confidence, not correctness. A confident
+    false face (a crack, a bright inclusion) is a full-weight target, and its REACH makes the background
+    around it trusted too. Look at rung-2 panels where the fine teacher and m7 disagree with `c_A = 1`.
+  - *Self-consistency at 0.1 may be too weak to bridge*: in a gap the direct loss is zero, and
+    `loss_selfcons` (0.1, self-source samples only) plus `loss_skel` (0.05) may not pull the student to
+    fill it; the gap then stays empty at rung 2 (the cascade from rung 3 is the only positive signal).
+    Both weights are fingerprint-excluded (`loss_switch` on resume) if they need raising.
+  - *Handoff seams at the c_A boundary*: at the edge of a trusted zone the target switches from the fine
+    teacher's thin face to the thicker upsampled m7 band (outside the dilated band) or to nothing (in a
+    gap); the prediction can step or tear along that boundary, and the hybrid skeleton can kink there.
+  - *Regression to blur if gap zones dominate*: if `route_gap` is large, most rung-2 voxels carry only the
+    soft continuity terms and the student drifts back to the coarse (upsampled m7) cascade -- blurrier than
+    either teacher. Watch `route_gap`, `dice_best_r2`, and the rung-2 panels' sharpness.
+  - The band reused from a committed m7 store is re-encoded at q8 (a second lossy pass, within one
+  or two q8 steps of the stored m7 probability, mean error < 1 code, test-checked).
+- **Producer cost.** Per routed reteach only the fine teacher runs: ~0.12 s a 256³ window compiled bf16
+  on tnr-0's A100 (§7 `teacher_bf16` row: recto 0.342 → 0.122 s a window), i.e. roughly the recto half
+  of the ~19 s two-teacher region (~12-15 s of GPU for a 1024³ region at window 256 / halo 32), plus the
+  coverage (~1 s), the band decode on the reader thread (overlapped) and the three store writes on the
+  writer thread (overlapped). A first-time routed region runs both teachers (~19 s, as the fusion did).
+
 ---
 
 ## 8. The ordered experiment list, rewritten for rvsm
