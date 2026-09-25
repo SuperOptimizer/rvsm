@@ -398,12 +398,14 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None):
     net.eval()
     per, pch, dch, scored = {}, {}, {}, 0
     np_ = layout.nprob
+    if rungs is not None and hasattr(grid, "of_rungs"):
+        grid = grid.of_rungs(rungs)      # a DiskGrid: the other rungs' items are not even read
     for item in grid:
         b = _batch(item)
-        x, tg, ww = prep.prepare(b, dev, cascade=cascade)
         rung = _rungs_of(b)[0]
         if rungs is not None and int(rung) not in rungs:
             continue
+        x, tg, ww = prep.prepare(b, dev, cascade=cascade)
         x = x.to(memory_format=M.memfmt())
         with prep.autocast(dev):
             y = net(x)
@@ -563,7 +565,8 @@ def write_region_panels(out, step, net, panels, dev, layout, cascade=None, grid=
     lines = ["k\tregion_origin_zyx\tradius_frac\tpanel"]
     for k, (r, frac, idx) in enumerate(panels):
         name = f"val_{int(step):06d}_r{k}.png"
-        items = [grid[i] for i in idx]
+        # a DiskGrid's subset is read with the grid's prefetch, one item decoded ahead of the drawing
+        items = grid.subset(idx) if hasattr(grid, "subset") else [grid[i] for i in idx]
         val_png(os.path.join(str(out), "eval", name), net, items, dev, layout, cascade=cascade)
         del items
         lines.append(f"{k}\t{r[0]},{r[1]},{r[2]}\t{frac:.3f}\t{name}")

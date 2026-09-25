@@ -1029,3 +1029,56 @@ def test_the_step_loop_runs_under_cuda_graphs(tiny_cfg, monkeypatch):
     assert st["step"] == 6 and all(torch.isfinite(v.float()).all() for v in st["ema"].values())
     assert not counters["graph_break"], dict(counters["graph_break"])
     assert not counters["inductor"].get("cudagraph_skips"), dict(counters["inductor"])
+
+
+def test_prefetched_keeps_order_and_holds_at_most_ahead_plus_one():
+    """`sample.prefetched`: the results in order, never more than `ahead` loads past the item the
+    caller holds, and a consumer that stops early cancels the loads that had not started."""
+    import threading
+    import time as _t
+    lock, state = threading.Lock(), {"taken": 0, "worst": 0, "calls": 0}
+
+    def load(x):
+        with lock:
+            state["calls"] += 1
+            state["worst"] = max(state["worst"], x - state["taken"])
+        _t.sleep(0.01)
+        return x * 10
+
+    got = []
+    for v in sample.prefetched(list(range(12)), load, ahead=2):
+        got.append(v)
+        with lock:
+            state["taken"] += 1
+        _t.sleep(0.02)
+    assert got == [10 * i for i in range(12)] and state["worst"] <= 2
+    state.update(taken=0, calls=0)
+    it = sample.prefetched(list(range(50)), load, ahead=2)
+    next(it)
+    it.close()
+    assert state["calls"] <= 3
+    assert list(sample.prefetched([1, 2, 3], load, ahead=0)) == [10, 20, 30]
+
+
+def test_a_disk_grid_evaluates_exactly_like_the_list(full_cfg, tmp_path):
+    """The prefetching DiskGrid (2 ahead) and its rung subset score exactly what the in-memory list
+    does, and the rung filter of the mask pass never reads the other rungs' files."""
+    import os
+    d = tmp_path / "grid"
+    d.mkdir()
+    items = [_item(full_cfg, k=(2, 3, 2, 3, 2)[i], seed=40 + i) for i in range(5)]
+    names = []
+    for i, it in enumerate(items):
+        names.append(f"item_r{int(it['rung'])}_{i:04d}.pt")
+        sample._save_item(str(d / names[-1]), it)
+    lay = full_cfg.layout()
+    net = M.build("1m", cin=lay.cin, cout=lay.cout, verbose=False).eval()
+    ref = TR.evaluate(net, items, torch.device("cpu"), lay)
+    for ahead in (0, 2):
+        g = sample.DiskGrid(str(d), names, ahead=ahead)
+        assert TR.evaluate(net, g, torch.device("cpu"), lay) == ref
+    g = sample.DiskGrid(str(d), names)
+    assert g.rungs() == [2, 3, 2, 3, 2] and len(g[:2]) == 2 and len(g.of_rungs((2,))) == 3
+    ref2 = TR.evaluate(net, items, torch.device("cpu"), lay, rungs=(2,))
+    os.remove(d / names[1])                      # a rung-3 file: the rung-2 pass must not open it
+    assert TR.evaluate(net, g, torch.device("cpu"), lay, rungs=(2,)) == ref2

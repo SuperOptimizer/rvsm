@@ -953,13 +953,18 @@ def _load_item(path):
 
 class DiskGrid:
     """The validation grid on disk (`val_grid(spill=...)`), used like the list it replaces: `len`,
-    indexing, slicing and iteration. Iteration reads the NEXT item on a thread while the caller scores
-    the current one, and never holds more than those two in memory."""
+    indexing, slicing and iteration. Iteration decodes the next `ahead` items on background threads
+    while the caller scores the current one (`prefetched`): an item is a ~310 MB compressed file, and
+    its read + decode, not the forward, set the pace of an evaluation. At most `ahead + 1` items are
+    held by the iterator at a time. A slice or `subset` is a DiskGrid too (lazy, prefetched)."""
 
-    def __init__(self, root, names):
+    AHEAD = 2           # items decoded ahead of the one being scored
+
+    def __init__(self, root, names, ahead=None):
         import os
         self.paths = [os.path.join(root, n) for n in names]
         self.rebuilt, self.reused = len(self.paths), 0      # `val_grid` sets what it actually did
+        self.ahead = self.AHEAD if ahead is None else int(ahead)
 
     def __len__(self):
         return len(self.paths)
@@ -969,20 +974,68 @@ class DiskGrid:
 
     def __getitem__(self, i):
         if isinstance(i, slice):
-            return [_load_item(p) for p in self.paths[i]]
+            return self.subset(range(len(self.paths))[i])
         return _load_item(self.paths[i])
 
+    def subset(self, idx):
+        """The items at these indices, in this order, as a DiskGrid (nothing is read until iterated)."""
+        g = DiskGrid("", [], ahead=self.ahead)
+        g.paths = [self.paths[int(i)] for i in idx]
+        g.rebuilt, g.reused = 0, len(g.paths)
+        return g
+
+    def rungs(self):
+        """Each item's rung, from its file name (`_item_name`: item_r<k>_<digest>.pt); None for a name
+        that does not carry one."""
+        import os
+        import re
+        out = []
+        for p in self.paths:
+            m = re.match(r"item_r(\d+)_", os.path.basename(p))
+            out.append(int(m.group(1)) if m else None)
+        return out
+
+    def of_rungs(self, rungs):
+        """The items of these rungs (a subset, never read to find out), or self when a name has none."""
+        ks = self.rungs()
+        if any(k is None for k in ks):
+            return self
+        want = {int(k) for k in rungs}
+        return self.subset([i for i, k in enumerate(ks) if k in want])
+
     def __iter__(self):
-        import concurrent.futures as cf
-        if not self.paths:
-            return
-        with cf.ThreadPoolExecutor(1) as ex:
-            nxt = ex.submit(_load_item, self.paths[0])
-            for j in range(len(self.paths)):
-                cur = nxt.result()
-                if j + 1 < len(self.paths):
-                    nxt = ex.submit(_load_item, self.paths[j + 1])
-                yield cur
+        # a snapshot of the paths: the driver's `refresh_grid` may replace them in place between two
+        # evaluations, never in the middle of one
+        return prefetched(list(self.paths), _load_item, self.ahead)
+
+
+def prefetched(xs, fn, ahead=2):
+    """`fn(x)` for every x, in order, with up to `ahead` of the next results computed on `ahead`
+    background threads while the caller holds the current one. A consumer that stops early cancels the
+    loads that have not started (the ones running finish and are dropped). `ahead` 0: in the caller."""
+    ahead = max(int(ahead), 0)
+    if not ahead or len(xs) < 2:
+        for x in xs:
+            yield fn(x)
+        return
+    import collections
+    import concurrent.futures as cf
+    ex = cf.ThreadPoolExecutor(ahead, thread_name_prefix="rvsm-grid")
+    q = collections.deque()
+    try:
+        nxt = 0
+        while nxt < len(xs) and len(q) < ahead:
+            q.append(ex.submit(fn, xs[nxt]))
+            nxt += 1
+        while q:
+            cur = q.popleft().result()
+            if nxt < len(xs):
+                q.append(ex.submit(fn, xs[nxt]))
+                nxt += 1
+            yield cur
+            del cur
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
 
 
 def loader(patches, workers=0, batch=1, pin_memory=True):
