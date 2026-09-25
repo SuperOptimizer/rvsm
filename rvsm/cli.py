@@ -56,7 +56,7 @@ def main(argv=None):
 # --------------------------------------------------------------------------- #
 PRODUCE_USAGE = """rvsm produce --out DIR --ct URL|PATH [--umbilicus PATH] --teacher recto[,m7]
                   --ckpt-recto P [--ckpt-m7 P] --region Z Y X [--size 1024]
-                  [--backend trt|torch] [--round 0] [--device cuda] [--tta 1]
+                  [--backend trt|torch] [--round 0] [--device cuda] [--tta 1] [--margin 64]
 rvsm produce      --out DIR --ct URL|PATH [--umbilicus PATH] --student CKPT --region Z Y X
                   [--sign -1] [--heads verso|all] [--round R] [--fields]   (see `--student --help`)
 
@@ -68,6 +68,9 @@ Runs the named teacher(s) over ONE 1024^3 region and writes its round-0 stores:
 With two teachers the probability is the confidence-weighted fusion of both and `rw` is their
 agreement; with one, `rw` is 1 everywhere. No walk, no state.json, no lookahead: this is the single
 region a producer, a test or a hand at the terminal asks for.
+
+--margin M reads M rung-2 voxels of fine CT around the region (the config's `infer_margin`, default
+64; 0 = none) so the region's faces are predicted with real context; the store is still the region.
 """
 
 
@@ -111,6 +114,8 @@ def produce(argv):
     backend = str(one("backend", "torch"))
     tta = int(one("tta", 1, int))
     device = one("device", None)
+    from rvsm.config import Config
+    margin = int(one("margin", Config.infer_margin, int))
     if "region" not in f or len(f["region"]) < 3:
         raise SystemExit(f"rvsm produce: --region Z Y X is required\n\n{PRODUCE_USAGE}")
     lo = np.array([int(v) for v in f["region"][:3]], np.int64)
@@ -151,7 +156,7 @@ def produce(argv):
         print(f"[produce] {nm}: region {tuple(int(v) for v in lo)} size {size3} window {w} halo {h} "
               f"backend {backend}", flush=True)
         probs[nm] = infer.teacher_region(ct, lo, size3, spec, ckpt, device=device, backend=backend,
-                                         tta=tta, window=w, halo=h,
+                                         tta=tta, window=w, halo=h, margin=margin,
                                          engine_dir=os.path.join(str(out), "ckpt", "trt"))
         win[nm], hal[nm], ckpts[nm] = w, h, ckpt
 
@@ -165,7 +170,7 @@ def produce(argv):
     attrs = {"producer": "teacher:" + ",".join(names), "round": int(round_),
              "ckpt": {nm: str(ckpts[nm]) for nm in names},
              "window": {nm: int(win[nm]) for nm in names}, "halo": {nm: int(hal[nm]) for nm in names},
-             "radial_sign": 1, "tta": int(tta), "backend": str(backend)}
+             "radial_sign": 1, "tta": int(tta), "backend": str(backend), "margin": int(margin)}
     got = {}
     for ch, block, q in (("recto", stores.u8(p), 8), ("rw", stores.u8(rw), 8)):
         path = stores.store_path(out, ch, lo, round_)
@@ -184,7 +189,7 @@ def produce(argv):
 STUDENT_USAGE = """rvsm produce --out DIR --ct URL|PATH [--umbilicus PATH] --student CKPT
                   --region Z Y X [--size 1024] [--sign -1] [--heads verso|all] [--round R]
                   [--device cuda] [--window 256] [--halo 32] [--cascade-depth 3] [--batch 1]
-                  [--tta 1] [--no-compile] [--fields [--jobs N]]
+                  [--tta 1] [--margin M] [--no-compile] [--fields [--jobs N]]
 
 Runs ONE student checkpoint over ONE region, in one multi-head pass, and writes its stores.
 
@@ -228,6 +233,7 @@ def _produce_student(f, one, out, ct, umb, lo, size3, round_, device):
     w = one("window", None, int)
     h = one("halo", None, int)
     depth = one("cascade-depth", None, int)
+    margin = one("margin", None, int)
     batch = int(one("batch", 1, int))
     tta = int(one("tta", 1, int))
     do_compile = "no-compile" not in f
@@ -238,13 +244,15 @@ def _produce_student(f, one, out, ct, umb, lo, size3, round_, device):
     eff_w = int(w if w is not None else st.cfg.infer_window)
     eff_h = int(h if h is not None else st.cfg.infer_halo)
     eff_d = int(depth if depth is not None else st.cfg.cascade_depth)
+    eff_m = int(margin if margin is not None else getattr(st.cfg, "infer_margin", 0))
     print(f"[produce] student {ckpt} step {st.step}: region {tuple(int(v) for v in lo)} size {size3} "
           f"sign {sign:+g} heads {heads} window {eff_w} halo {eff_h} cascade {eff_d}", flush=True)
     planes = infer.student_region(st, ct, ax, lo, size3, sign=sign, heads=want, window=w, halo=h,
-                                  cascade_depth=depth, batch=batch, tta=tta)
+                                  cascade_depth=depth, batch=batch, tta=tta, margin=eff_m)
 
     attrs = {"producer": "student", "ckpt": str(ckpt), "step": int(st.step), "round": int(round_),
              "radial_sign": int(sign), "window": eff_w, "halo": eff_h, "cascade_depth": eff_d,
+             "margin": eff_m,
              "tta": int(tta), "temps": {str(k): float(v) for k, v in st.temps.items()},
              "sign_convention": EX.SIGN_CONVENTION}
 
@@ -652,7 +660,7 @@ def eval(argv):    # noqa: A001  -- the subcommand is named `eval`; `main` dispa
             continue
         size = tuple(int(v) for v in ref.shape)
         if st is not None:
-            planes = infer.student_region(st, cfg.ct, ax, lo, size, heads=[chan])
+            planes = infer.student_region(st, cfg.ct, ax, lo, size, heads=[chan], margin=cfg.infer_margin)
             pred = stores.u8(planes[chan])
         else:
             pred = _store_block(out, chan, lo, round_)

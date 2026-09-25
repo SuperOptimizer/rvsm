@@ -66,7 +66,7 @@ def run_cfg(region_cfg, fake_teacher, tmp_path, has_volcomp):
                    verso_after_steps=5, verso_min_dice=0.0, round_min_steps_after_verso=0, verso_min_regions=1,
                    verso_regen_gain=10.0, round_steps=5, heldout=1, workers=0,
                    min_regions_before_train=2, lookahead_extra=2, reserve_gb=0.001,
-                   infer_window=64, infer_halo=8, cascade_depth=1, calibrate=True,
+                   infer_window=64, infer_halo=8, infer_margin=16, cascade_depth=1, calibrate=True,
                    aff_offsets=(4, 8, 16))
 
 

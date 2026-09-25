@@ -556,7 +556,8 @@ class TeacherBank:
         reader thread calls this for the NEXT region while the GPU runs the current one."""
         from rvsm import infer, ladder
         pyr = ladder.rungs(ct) if pyr is None else pyr
-        return [infer.teacher_read(ct, lo, size, row[1], pyr=pyr) for row in self.items]
+        m = int(getattr(self.cfg, "infer_margin", 0))
+        return [infer.teacher_read(ct, lo, size, row[1], pyr=pyr, margin=m) for row in self.items]
 
     def probs_u8(self, ct, lo, size, rois=None):
         """(u8 fused probability, u8 agreement weight, attrs) for one region, over every loaded teacher,
@@ -571,6 +572,7 @@ class TeacherBank:
                                            backend=self.backend, net=net, as_tensor=True,
                                            fast=self.fast.get(row[0]),
                                            roi=(rois[i] if rois is not None else None),
+                                           margin=int(getattr(self.cfg, "infer_margin", 0)),
                                            engine_dir=os.path.join(self.out, "ckpt", "trt")))
             names.append(row[0])
         if len(ps) >= 2:
@@ -586,7 +588,8 @@ class TeacherBank:
         del ps
         return P, W, {"producer": "teacher:" + ",".join(names), "teachers": list(names), "radial_sign": 1,
                       "rw": "agreement" if len(names) >= 2 else "ones",
-                      "ckpt": {r[0]: r[2] for r in self.items}, "backend": self.backend}
+                      "ckpt": {r[0]: r[2] for r in self.items}, "backend": self.backend,
+                      "margin": int(getattr(self.cfg, "infer_margin", 0))}
 
     def probs(self, ct, lo, size):
         """(fused probability, agreement weight, attrs) as host float32 arrays (the u8 path, decoded)."""
@@ -1253,7 +1256,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         heads = "verso" if job == "verso" else "all"
                         sign = -1.0 if job == "verso" else 1.0
                         want = [str(stu.layout.channels[0])] if heads == "verso" else "all"
-                        planes = _student_planes(stu, ct_local, ax, lo, size, sign, want, meta5, pyr)
+                        planes = _student_planes(stu, ct_local, ax, lo, size, sign, want, meta5, pyr,
+                                                 margin=int(cfg.infer_margin))
                         attrs = {"producer": "student", "ckpt": stu.ckpt, "step": int(stu.step),
                                  "ckpt_sha256": use.sha, "frozen_teacher": bool(round_ >= 1),
                                  "regeneration": bool(regen_unit),
@@ -1263,7 +1267,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                  "gen": (stores.next_gen(out, lo, 0)
                                          if job == "verso" and cat.done("verso", lo) else 0),
                                  "radial_sign": int(sign), "window": int(stu.cfg.infer_window),
-                                 "halo": int(stu.cfg.infer_halo),
+                                 "halo": int(stu.cfg.infer_halo), "margin": int(cfg.infer_margin),
                                  "cascade_depth": int(stu.cfg.cascade_depth),
                                  "temps": {str(k): float(v) for k, v in stu.temps.items()}}
                         rows = student_rows_t(planes, stu.layout, heads)
@@ -1484,10 +1488,10 @@ def _compiled_graphs():
         return 0
 
 
-def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr):
+def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr, margin=None):
     from rvsm import infer
     return infer.student_region(stu, ct, ax, lo, size, sign=sign, heads=want, meta=meta5, pyr=pyr,
-                                as_tensor=True)
+                                as_tensor=True, margin=margin)
 
 
 def _gpu_order(units, leased=None, held=None):
@@ -2138,7 +2142,7 @@ def heldout_rows(cfg, out, ckpt, held, ax, meta5=None, round_=0, device=None, n=
             stu = infer.student_fn(ckpt, device=device, compile=False)
         head = str(stu.layout.channels[0])
         planes = infer.student_region(stu, ct or cfg.ct, ax, lo, shape, sign=1.0, heads=[head],
-                                      meta=meta5, as_tensor=True)
+                                      meta=meta5, as_tensor=True, margin=int(cfg.infer_margin))
         pred = infer.u8_t(planes[head]).cpu().numpy()
         del planes
         if torch.cuda.is_available():

@@ -48,6 +48,34 @@ def offsets(shape, window, halo):
     return [(z, y, x) for z in ss[0] for y in ss[1] for x in ss[2]]
 
 
+def margin_at(margin, rung):
+    """The fine-CT context margin at `rung`, from `margin` given at rung 2 (`Config.infer_margin`): the
+    same physical margin, `margin >> (rung - 2)`, but never under 16 voxels once there is one at all."""
+    m, k = int(margin or 0), int(rung)
+    if m <= 0:
+        return 0
+    return m if k <= RUNG else max(m >> (k - RUNG), 16)
+
+
+def margin_box(lo, size, margin, shape):
+    """(lo', size') of the box (`lo`, `size`) grown by `margin` on every side and clipped to the volume
+    `shape` -- but never clipped inside the box itself (a store may run past the volume's far face; the
+    part past it is air, read as air). `margin` 0 gives the box back unchanged."""
+    lo, size = np.asarray(lo, np.int64), np.asarray(size, np.int64)
+    S = np.asarray(shape, np.int64)
+    a = np.minimum(np.maximum(lo - int(margin), 0), lo)
+    b = np.maximum(np.minimum(lo + size + int(margin), S), lo + size)
+    return a, b - a
+
+
+def core_offsets(offs, window, core, size):
+    """The window starts of `offs` whose window [o, o + w) meets the core box [core, core + size) on
+    every axis: a window wholly in the margin adds nothing to the cropped output."""
+    w = int(window)
+    return [o for o in offs
+            if all(int(o[a]) < int(core[a]) + int(size[a]) and int(o[a]) + w > int(core[a]) for a in range(3))]
+
+
 GAUSS_SCALE = float(1 << 12)
 
 
@@ -74,6 +102,7 @@ class Inputs:
     shape: tuple
     window: int
     dev: torch.device
+    core: tuple = (0, 0, 0)     # where the OUTPUT box starts inside `roi` (the fine-CT margin before it)
 
     def prep(self, o):
         raise NotImplementedError
@@ -88,11 +117,13 @@ class TeacherInputs(Inputs):
 
     `ct` is the region's CT block at the teacher's level, already read (numpy uint8 or a tensor). A block
     thinner than one window on any axis is zero-padded (air) to a full window, exactly as usrm2's
-    `slide` did, and the caller crops the result back.
+    `slide` did, and the caller crops the result back. `core` is where the output box starts inside
+    `ct` when the block carries a context margin (`teacher_read(..., margin=)`); `run_region` crops there.
     """
 
-    def __init__(self, ct, normalizer, window, device="cpu"):
+    def __init__(self, ct, normalizer, window, device="cpu", core=(0, 0, 0)):
         self.dev = torch.device(device)
+        self.core = tuple(int(v) for v in core)
         self.window = int(window)
         self.norm = normalizer or teachers.Normalizer("none")
         a = ct.detach().cpu().numpy() if torch.is_tensor(ct) else np.asarray(ct)
@@ -140,11 +171,19 @@ class StudentInputs(Inputs):
     was trained on. `head0(k) -> fn` is the caller's per-rung head-0 window function (a `Student`'s), and
     the recursion re-enters THIS class at rung k+1, so a coarse pass is built by the same code and cannot
     drift from the fine one. `cascade=<array>` supplies it directly; `cascade_depth=0` leaves it zero.
+
+    THE MARGIN. `margin` rung-`rung` voxels of fine CT are read around the box (clipped to the volume,
+    `margin_box`), and EVERYTHING -- the windows, the context super-cubes, the cascade, the axis -- is
+    built for that padded box, so the network sees real CT past the region's faces instead of zeros
+    (the receptive field is ~450 voxels; without it every 1024^3 face was a seam, and the verso
+    self-labels learned it). `self.lo` / `self.size` / `self.shape` are the PADDED box; `self.core` is
+    where the caller's box starts inside it and `run_region` crops the output back there. Windows that
+    miss the caller's box entirely are dropped (`core_offsets`). `margin=0` is the old pass exactly.
     """
 
     def __init__(self, ct, ax, lo, size, layout, meta=None, rung=RUNG, ctx=None, window=256, halo=32,
                  sign=1.0, cascade=None, cascade_depth=0, head0=None, norm=None, device="cpu",
-                 pyr=None, rmax_um=None, batch=1):
+                 pyr=None, rmax_um=None, batch=1, margin=0):
         from rvsm import axis as AX, scanmeta as SM
         self.dev = torch.device(device)
         self.ct, self.ax = ct, np.asarray(ax, np.float64)
@@ -158,6 +197,12 @@ class StudentInputs(Inputs):
         self.head0, self.cascade_depth = head0, int(cascade_depth)
         lo = np.asarray(lo, np.int64)
         size = ladder.shape3(size)
+        self.margin = int(margin)
+        self.core_size = tuple(int(v) for v in size)
+        if self.margin > 0:
+            plo, size = margin_box(lo, size, self.margin, ladder.rung_shape(self.pyr, self.rung))
+            self.core = tuple(int(v) for v in lo - plo)
+            lo = plo
         self.lo, self.size = tuple(int(v) for v in lo), tuple(int(v) for v in size)
         w = self.window
 
@@ -167,7 +212,7 @@ class StudentInputs(Inputs):
             roi = np.pad(roi, [(0, max(w - s, 0)) for s in roi.shape])
         self.roi = torch.from_numpy(np.ascontiguousarray(roi)).to(self.dev)
         self.shape = tuple(self.roi.shape)
-        self.offs = offsets(self.shape, w, self.halo)
+        self.offs = core_offsets(offsets(self.shape, w, self.halo), w, self.core, self.core_size)
 
         # ---- ONE context super-cube per context rung, covering every window's context box
         cs = [sorted({self.lo[a] + int(o[a]) + w // 2 for o in self.offs}) for a in range(3)]
@@ -281,8 +326,14 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     `acc_dtype` fp16 accumulator, with the Gaussian scaled by 2^12 so a window corner (~1.5e-6
     unscaled, an fp16 subnormal) is a normal fp16 and <= 8 overlapping centres stay <= 32768. Any
     other plane -- a distance, a thickness, a log-variance -- accumulates in fp32 unscaled: scaled in
-    fp16, a 31.75-voxel midline overflowed to inf (pass-3 review P3-11). The division is fp32."""
+    fp16, a 31.75-voxel midline overflowed to inf (pass-3 review P3-11). The division is fp32.
+
+    THE MARGIN. `inputs.core` is where the output box starts inside the inputs' (padded) grid: the
+    windows tile the whole padded grid, and the output is the (Z, Y, X) box cropped at `core`. With
+    `offs` None, windows that miss that box are dropped here (a caller's own `offs` is used as given)."""
     w, dev = int(window), inputs.dev
+    Z, Y, X = (int(v) for v in size)
+    c = tuple(int(v) for v in getattr(inputs, "core", (0, 0, 0)))
     P = int(planes)
     bnd = [True] * P if bounded is None else [bool(b) for b in bounded]
     assert len(bnd) == P, (bnd, P)
@@ -291,7 +342,9 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     iu = [k for k in range(P) if k not in ib]
     g32 = gauss_t(w, dev, torch.float32)
     g16 = (g32 * GAUSS_SCALE).to(torch.float16) if ib else None
-    todo = [o for o in (offsets(inputs.shape, w, halo) if offs is None else offs) if inputs.window_any(o)]
+    if offs is None:
+        offs = core_offsets(offsets(inputs.shape, w, halo), w, c, (Z, Y, X))
+    todo = [o for o in offs if inputs.window_any(o)]
     acc_b = torch.zeros((len(ib),) + tuple(inputs.shape), dtype=torch.float16, device=dev) if ib else None
     acc_u = torch.zeros((len(iu),) + tuple(inputs.shape), dtype=torch.float32, device=dev) if iu else None
     wsum = torch.zeros(tuple(inputs.shape), dtype=torch.float32, device=dev)
@@ -309,20 +362,21 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
                 acc_u[(slice(None),) + sl] += pj[iu].float() * g32
             wsum[sl] += g32
         del p
-    Z, Y, X = (int(v) for v in size)
     # normalised in z-slabs straight into the output dtype: the whole-volume float32 temporaries of
     # `where(keep, acc / wsum)` were 4 GB per plane on top of the accumulators (20+ GB for five heads)
     out = torch.empty((P, Z, Y, X), dtype=out_dtype, device=dev)
+    ys, xs = slice(c[1], c[1] + Y), slice(c[2], c[2] + X)
     for z in range(0, Z, 64):
         e = min(z + 64, Z)
-        ws = wsum[z:e, :Y, :X].clamp_min(1e-30)
-        keep = (wsum[z:e, :Y, :X] > 0) & (inputs.roi[z:e, :Y, :X] > 0)
+        zs = slice(c[0] + z, c[0] + e)
+        ws = wsum[zs, ys, xs].clamp_min(1e-30)
+        keep = (wsum[zs, ys, xs] > 0) & (inputs.roi[zs, ys, xs] > 0)
         zero = torch.zeros((), device=dev)
         if ib:
-            q = acc_b[:, z:e, :Y, :X].float() / (ws * GAUSS_SCALE)[None]
+            q = acc_b[:, zs, ys, xs].float() / (ws * GAUSS_SCALE)[None]
             out[ib, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
         if iu:
-            q = acc_u[:, z:e, :Y, :X] / ws[None]
+            q = acc_u[:, zs, ys, xs] / ws[None]
             out[iu, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
     del acc_b, acc_u, wsum
     return out
@@ -439,23 +493,29 @@ def teacher_fn(net, spec, tta=1):
     return flips_chan(go, int(tta), radial=False) if int(tta) > 1 else go
 
 
-def teacher_read(ct, lo, size, spec, pyr=None):
+def teacher_read(ct, lo, size, spec, pyr=None, margin=0):
     """The CT a teacher pass over the region (`lo`, `size`, rung 2) reads, as (roi uint8, a): the block
     at the teacher's own level, with `spec.margin` voxels of context for a coarse teacher, and its
     corner `a` at that level. Split out of `teacher_region` so a producer can read the NEXT region's CT
-    (the volcomp decode is seconds) on a thread while the GPU runs the current one."""
+    (the volcomp decode is seconds) on a thread while the GPU runs the current one.
+
+    `margin` (rung-2 voxels, `Config.infer_margin`) is the fine-CT context around the box: a level-0
+    teacher reads `margin_box` of it, a coarse one `margin_at(margin, 2 + level)` if that exceeds its own
+    `spec.margin`. 0 reads exactly what it always did."""
     if isinstance(spec, str):
         spec = teachers.TEACHERS[spec]
     pyr = ladder.rungs(ct) if pyr is None else pyr
     lvl = int(spec.level)
     lo, size = np.asarray(lo, np.int64), np.asarray(size, np.int64)
     if lvl == 0:
-        return ladder.read_rung(pyr, RUNG, lo, size, dtype=np.uint8), lo
+        a, sz = margin_box(lo, size, int(margin), ladder.rung_shape(pyr, RUNG)) if int(margin) > 0 \
+            else (lo, size)
+        return ladder.read_rung(pyr, RUNG, a, sz, dtype=np.uint8), a
     f = 1 << lvl
     assert not (lo % f).any() and not (size % f).any(), \
         f"teacher {spec.name} runs at level {lvl}: the box must be a multiple of {f}"
     o, s = lo // f, size // f
-    m = int(spec.margin)
+    m = max(int(spec.margin), margin_at(margin, RUNG + lvl))
     shape_l = ladder.rung_shape(pyr, RUNG + lvl)
     a = np.maximum(o - m, 0)
     b = np.minimum(o + s + m, shape_l)
@@ -464,7 +524,7 @@ def teacher_read(ct, lo, size, spec, pyr=None):
 
 def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1, window=None, halo=None,
                    batch=1, engine_dir=None, acc_dtype=torch.float16, net=None, roi=None,
-                   as_tensor=False, fast=None):
+                   as_tensor=False, fast=None, margin=0):
     """One teacher over one region: the foreground probability as (Z, Y, X) float32 at RUNG 2.
 
     `lo` / `size` are rung-2 voxels. A teacher whose `level` is 0 (recto) runs on the region as it is. A
@@ -476,7 +536,8 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
     `roi` is `teacher_read`'s result when the caller read the CT ahead of time. `as_tensor` returns the
     probability as a float16 tensor ON THE DEVICE instead of a host array, so a producer can fuse and
     quantise there and move only uint8 across the bus. `fast` is `fast_teacher(net, ...)`: what the
-    torch path runs when no TensorRT engine is in use.
+    torch path runs when no TensorRT engine is in use. `margin`: `teacher_read`'s fine-CT context
+    (ignored when `roi` is given: the block carries its own, and its corner says where the box is).
     """
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if net is None:   # `net` is a teacher the CALLER already loaded: a producer loads each one once
@@ -494,10 +555,11 @@ def teacher_region(ct, lo, size, spec, ckpt, device=None, backend="torch", tta=1
             batch = 1
     fn = teacher_fn(eng if eng is not None else (fast if fast is not None else net), spec, tta=tta)
     lo, size = np.asarray(lo, np.int64), np.asarray(size, np.int64)
-    blk, a = teacher_read(ct, lo, size, spec) if roi is None else roi
+    blk, a = teacher_read(ct, lo, size, spec, margin=margin) if roi is None else roi
     odt = torch.float16 if as_tensor else torch.float32
     if lvl == 0:
-        inp = TeacherInputs(blk, spec.normalizer, w, device=dev)
+        inp = TeacherInputs(blk, spec.normalizer, w, device=dev,
+                            core=tuple(int(v) for v in lo - np.asarray(a, np.int64)))
         p = run_region(fn, inp, tuple(size), w, h, batch=batch, planes=1, acc_dtype=acc_dtype,
                        out_dtype=odt)[0]
         return p if as_tensor else p.float().cpu().numpy()
@@ -776,7 +838,7 @@ def student_fn(ckpt_path, device=None, compile=True, mode="max-autotune-no-cudag
 
 def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, device=None,
                    window=None, halo=None, cascade_depth=None, batch=1, rung=RUNG, tta=1, pyr=None,
-                   acc_dtype=torch.float16, umbilicus=None, as_tensor=False):
+                   acc_dtype=torch.float16, umbilicus=None, as_tensor=False, margin=None):
     """One student pass over one region: `{plane name: (Z, Y, X) float32}` in rung-`rung` voxels
     (`as_tensor`: float16 tensors left on the device, for a producer that encodes there).
 
@@ -786,15 +848,19 @@ def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, 
 
     Every plane comes out of ONE sliding-window pass -- one forward per window, every head read off that
     output -- and every plane is blended with the same Gaussian and zeroed wherever the CT is air.
+
+    `margin` (rung-2 voxels; None: the checkpoint's `infer_margin`) is the fine-CT context read around
+    the box (`StudentInputs`), scaled to `rung` by `margin_at`; the planes are still exactly the box.
     """
     st = student if isinstance(student, Student) else student_fn(student, device=device)
     names = st.plane_names(heads)
     w = int(window if window is not None else st.cfg.infer_window)
     h = int(halo if halo is not None else st.cfg.infer_halo)
     d = int(cascade_depth if cascade_depth is not None else st.cfg.cascade_depth)
+    m = margin_at(margin if margin is not None else getattr(st.cfg, "infer_margin", 0), int(rung))
     inp = StudentInputs(ct, ax, lo, size, st.layout, meta=meta, rung=int(rung), ctx=st.cfg.ctx,
                         window=w, halo=h, sign=sign, cascade_depth=d, head0=st.head0, device=st.dev,
-                        pyr=pyr, batch=batch)
+                        pyr=pyr, batch=batch, margin=m)
     fn = st.plane_fn(names, int(rung))
     if int(tta) > 1:
         fn = flips_chan(fn, int(tta), radial=True)

@@ -971,3 +971,84 @@ def test_the_compiled_student_compiles_once_for_every_region_shape_and_checkpoin
     infer.student_region(s, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 64), **kw)
     assert len(graphs) == 1, graphs
     torch._dynamo.reset()
+
+
+# --------------------------------------------------------------------------- #
+# the fine-CT margin: real context past a region's faces, the store still exactly the region
+# --------------------------------------------------------------------------- #
+def test_margin_geometry_and_the_zero_margin_is_the_old_pass(student_env):
+    """`margin` grows the box the inputs are read for, clipped to the volume and never inside the box;
+    windows that miss the box are dropped; 0 is the old box, the old windows and the old output."""
+    e = student_env
+    S = ladder.rung_shape(e.pyr, 2)
+    a, s = infer.margin_box((0, 64, 0), (128, 128, 128), 32, S)
+    assert list(a) == [0, 32, 0] and list(s) == [160, 192, 160]        # clipped at 0, never past the box
+    assert infer.margin_at(64, 2) == 64 and infer.margin_at(64, 4) == 16 and infer.margin_at(64, 6) == 16
+    assert infer.margin_at(0, 4) == 0 and infer.margin_at(256, 3) == 128
+
+    lo, size = (0, 64, 0), (64, 64, 64)
+    old = _student_inputs(e.cfg, e.ax, e.meta, lo, size, cascade_depth=0)
+    assert old.core == (0, 0, 0) and old.offs == infer.offsets(old.shape, WIN, HALO)
+    new = _student_inputs(e.cfg, e.ax, e.meta, lo, size, cascade_depth=0, margin=16)
+    assert new.core == (0, 16, 0) and new.shape == (80, 96, 80) and new.lo == (0, 48, 0)
+    for o in new.offs:                    # every window kept meets the box on every axis
+        assert all(o[k] < new.core[k] + size[k] and o[k] + WIN > new.core[k] for k in range(3))
+    assert np.array_equal(new.roi[:64, 16:80, :64].numpy(),
+                          ladder.read_rung(e.pyr, 2, lo, size, dtype=np.uint8))
+
+    # margin 0: the pass is bit-for-bit the one over the full, unfiltered tiling
+    p0 = infer.run_region(_head0_of, old, size, WIN, HALO, offs=old.offs)
+    pa = infer.run_region(_head0_of, old, size, WIN, HALO, offs=infer.offsets(old.shape, WIN, HALO))
+    assert torch.equal(p0, pa)
+
+
+def _face_err(e, st, margin, depth=0):
+    """max |A - B| on A's +x face slab, where A = x [0, 64) and B = x [0, 128) of the same rows: the
+    fixture's slab runs across x, so A's neighbour at x >= 64 is bright right across the face."""
+    kw = dict(sign=1.0, heads=["recto"], meta=e.meta, device="cpu", window=WIN, halo=HALO,
+              cascade_depth=depth, margin=margin)
+    A = infer.student_region(st, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 64), **kw)["recto"]
+    B = infer.student_region(st, e.cfg.ct, e.ax, (0, 64, 0), (64, 64, 128), **kw)["recto"]
+    ct = ladder.read_rung(e.pyr, 2, (0, 64, 56), (64, 64, 8), dtype=np.uint8)
+    assert (ct > 0).sum() > 1000                      # the face really cuts the slab
+    return float(np.abs(A[..., 56:] - B[..., 56:64]).max()), A
+
+
+def test_margin_removes_the_region_face_seam(student_env, student_ckpt):
+    """THE SEAM. With no margin, A's face is predicted from CT that stops at the face (the conv padding
+    past it is zeros) while B sees the slab go on: the two disagree there. With a margin, A reads the
+    slab past its face and its face is B's prediction up to the blend of a different window grid."""
+    e = student_env
+    st = infer.student_fn(student_ckpt, device="cpu", compile=False)
+    e0, _ = _face_err(e, st, 0)
+    em, A = _face_err(e, st, 2 * WIN)
+    assert A.shape == (64, 64, 64)
+    assert em < 0.25 * e0 and em < 0.02, (e0, em)
+
+
+def test_margin_is_recorded_and_the_store_is_unchanged(tmp_path, student_env, student_ckpt):
+    """With a margin the stores are the region -- same shape, same origin -- and say which margin."""
+    e = student_env
+    out = str(tmp_path / "out")
+    assert _produce(out, e.cfg, student_ckpt, "--sign", "-1", "--margin", "16") == 0
+    a = stores.open_store(stores.store_path(out, "verso", (0, 0, 0), 0))
+    assert a.shape == (128, 128, 128) and a.attrs["origin_zyx"] == [0, 0, 0]
+    assert a.attrs["margin"] == 16 and a.attrs["window"] == WIN and a.attrs["halo"] == HALO
+
+
+def test_teacher_margin_keeps_the_box_and_zero_is_the_old_read(ct_origin, fake_teacher, has_volcomp):
+    if not has_volcomp:
+        pytest.skip("volcomp is required to read the CT fixture")
+    spec = teachers.TEACHERS["fake"]
+    lo, size = np.array((0, 64, 0)), np.array((64, 64, 64))
+    pyr = ladder.rungs(ct_origin.path)
+    blk, a = infer.teacher_read(ct_origin.path, lo, size, spec, pyr=pyr, margin=0)
+    assert np.array_equal(a, lo) and blk.shape == (64, 64, 64)
+    blk, a = infer.teacher_read(ct_origin.path, lo, size, spec, pyr=pyr, margin=16)
+    assert list(a) == [0, 48, 0] and blk.shape == (80, 96, 80)
+    kw = dict(device="cpu", backend="torch", window=PATCH, halo=4)
+    p0 = infer.teacher_region(ct_origin.path, lo, size, spec, fake_teacher.ckpt, margin=0, **kw)
+    pm = infer.teacher_region(ct_origin.path, lo, size, spec, fake_teacher.ckpt, margin=16, **kw)
+    ct = ladder.read_rung(pyr, 2, lo, size, dtype=np.uint8)
+    assert pm.shape == p0.shape == (64, 64, 64)
+    assert np.all(pm[ct == 0] == 0) and pm.max() > 0

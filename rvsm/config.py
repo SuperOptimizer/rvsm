@@ -150,7 +150,7 @@ RUNG_ITEM_KEYS = ("ct", "tgt", "w", "tch", "lo", "cyx", "sym", "rung", "norm", "
                   "rmax", "meta")
 
 # Fields a resume is allowed to differ in: a longer run, a different eval cadence, different hardware.
-FINGERPRINT_EXCLUDE = ("steps", "eval_every", "workers", "gpus", "rounds", "ct_seed", "ckpt_act", "compile",
+FINGERPRINT_EXCLUDE = ("infer_margin", "steps", "eval_every", "workers", "gpus", "rounds", "ct_seed", "ckpt_act", "compile",
                        "vram_train_gb", "vram_produce_gb", "pin_memory", "gpu_prefetch", "verso_min_dice",
                        "self_p_mid_step", "self_p_end", "self_p_end_step",
                        # the cascade source: paris4 switched mix -> self (drop 0.1 -> 0.3) at step 12000 on
@@ -303,6 +303,9 @@ class Config:
     calibrate: bool = True             # refit the temperatures after every eval
     infer_window: int = 256            # sliding-window edge at inference
     infer_halo: int = 32               # window overlap discarded on each side
+    infer_margin: int = 64             # rung-2 voxels of fine CT read around a region at inference (the
+                                       # windows tile the padded box, the output is cropped back): no seam
+                                       # at a region face. Scaled by rung (`infer.margin_at`); 0 = none
     cascade_depth: int = 3             # coarse-to-fine passes per inference region
     tta: int = 1                       # test-time augmentations (1 = none)
     min_regions_before_train: int = 8  # cold start: regions the producer finishes before training begins
