@@ -1029,7 +1029,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             jlog(out, "produce", {"kind": "fields", "region": list(lo), "round": round_,
                                   "s": round(time.time() - t0, 2), "cursor": cursor, "gen": g,
                                   "device": fdev or "cpu",
-                                  "skipped": (rep or {}).get("skipped_blocks")})
+                                  "skipped": (rep or {}).get("skipped_blocks"),
+                                  "graphs": (rep or {}).get("graphs")})
         finally:
             with lock:
                 busy.discard(lo)

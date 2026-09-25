@@ -427,6 +427,17 @@ def medial_torch(band, cap=None):
     return band & (d2 >= E.max_filter3(d2))
 
 
+def _medial_flagged(band, cap):
+    """`medial_torch` without its synchronising check: (the capped medial surface, a device bool that
+    is True where the cap saturated -- the result is then NOT the uncapped one and must be discarded)."""
+    import torch
+    from rvsm import edt as E
+    d2, _ = E.edt2(~band, indices=False, cap=cap)
+    sat = torch.any(band & torch.isinf(d2)) if cap is not None else torch.zeros((), dtype=torch.bool,
+                                                                                 device=band.device)
+    return band & (d2 >= E.max_filter3(d2)), sat
+
+
 def face_distance_torch(surf, dy, dx, cap=None):
     """`face_distance` of a bool (B,Z,Y,X) batch: (d, u, ix int32 (3,B,Z,Y,X)). A block with no surface
     voxel has u = +inf (and d = +-inf) everywhere instead of `None`. With `cap` (`edt_cap`), a voxel
@@ -851,19 +862,15 @@ def edt_cap(reach):
     return float(math.ceil(max(2.0 * float(reach), g)) + 1)
 
 
-def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, dev):
-    """The tensor core of `block_fields_torch` for a batch: `recto` / `verso` (B,Z,Y,X) uint8 (verso
-    may be None), `dy` / `dx` / `core` / `cover` broadcastable to it. Returns (midline, thickness,
-    valid) tensors and a (B, len(SUPPORT)) int64 tensor of support counts in `SUPPORT` order, all on
-    the device."""
+def _stage_a(rec, ver, dy, dx, thr, reach, tmin, tmax, core, cover, dev, flagged=False):
+    """Rules 1-3 of a batch (the fixed-shape part before the pair checks): a dict of device tensors --
+    ev, reason, the bands br / bv, the signed distances dr / dv, the nearest indices ixr / ixv, t, and
+    `cand` (the flat mask of the voxels the pair checks take). `flagged`: the medial transforms are
+    not checked (no sync, `_medial_flagged`) and `sat` says whether that result must be discarded."""
     import torch
     from rvsm import edt as E
-    rec = _tt(recto, dev)
     shape = tuple(int(v) for v in rec.shape)
-    B = shape[0]
-    dy, dx = _tt(dy, dev, torch.float32), _tt(dx, dev, torch.float32)
-    core = torch.ones(shape, dtype=torch.bool, device=dev) if core is None else \
-        _tt(core, dev, torch.bool).expand(shape)
+    core = torch.ones(shape, dtype=torch.bool, device=dev) if core is None else core.expand(shape)
     ev = E.binary_dilation(core)
     reason = torch.zeros(shape, dtype=torch.uint8, device=dev)
 
@@ -872,30 +879,66 @@ def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, d
 
     lvl = int(round(thr * 255))
     br = rec >= lvl
-    del rec
     cap = edt_cap(reach) if EDT_CAP else None
     mcap = MEDIAL_CAP if EDT_CAP else None
-    dr, ur, ixr = face_distance_torch(medial_torch(br, mcap), dy, dx, cap)
+    sats = []
+
+    def med(band):
+        if not flagged:
+            return medial_torch(band, mcap)
+        mm, sat = _medial_flagged(band, mcap)
+        sats.append(sat)
+        return mm
+    dr, ur, ixr = face_distance_torch(med(br), dy, dx, cap)
     fail(ur > reach, "no_recto")                 # also every voxel of a block without a recto face
-    bv = torch.zeros_like(br) if verso is None else _tt(verso, dev) >= lvl
-    dv, uv, ixv = face_distance_torch(medial_torch(bv, mcap), dy, dx, cap)
+    bv = torch.zeros_like(br) if ver is None else ver >= lvl
+    dv, uv, ixv = face_distance_torch(med(bv), dy, dx, cap)
     fail(uv > reach, "no_verso")                 # ... and without a verso face
     if cover is not None:
-        fail(_tt(cover, dev, torch.float32) <= torch.maximum(ur, uv) + COVER_MARGIN, "coverage")
+        fail(cover <= torch.maximum(ur, uv) + COVER_MARGIN, "coverage")
     del ur, uv
     t = dv - dr
     fail((t < tmin) | (t > tmax), "thickness")
-    sel = torch.nonzero(((reason == 0) & ev).reshape(-1)).squeeze(1)       # one sync per batch
+    out = dict(ev=ev, reason=reason, br=br, bv=bv, dr=dr, dv=dv, ixr=ixr, ixv=ixv, t=t,
+               cand=((reason == 0) & ev).reshape(-1))
+    if flagged:
+        out["sat"] = sats[0] | sats[1]
+    return out
+
+
+def _stage_b(S, dy, dx, reach, dev, sel=None):
+    """Rule 4 of a batch: the pair checks over the candidates (`sel`, default the `nonzero` of
+    S["cand"], which synchronises), their codes written into S["reason"]. The data-dependent part."""
+    import torch
+    if sel is None:
+        sel = torch.nonzero(S["cand"]).squeeze(1)                       # one sync per batch
     if sel.numel():
+        reason = S["reason"]
+        shape = tuple(int(v) for v in reason.shape)
         wn = int(np.ceil(4.0 * float(reach))) + 2
-        if not (dev.type == "cuda" and
-                _pair_checks_triton(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, wn, reason.view(-1))):
-            reason.view(-1)[sel] = _pair_checks_torch(sel, shape, br, bv, dr, dv, ixr, ixv, dy, dx, wn)
-    del ixr, ixv, sel, br, bv
+        args = (sel, shape, S["br"], S["bv"], S["dr"], S["dv"], S["ixr"], S["ixv"], dy, dx, wn)
+        if not (dev.type == "cuda" and _pair_checks_triton(*args, reason.view(-1))):
+            reason.view(-1)[sel] = _pair_checks_torch(*args)
+
+
+def _stage_c(S, core, dev, drop=False):
+    """Rule 5 and the support counts of a batch (fixed-shape): (midline, thickness, valid, counts).
+    `drop`: S's distances are released as soon as the midline is formed."""
+    import torch
+    from rvsm import edt as E
+    reason, ev, t = S["reason"], S["ev"], S["t"]
+    shape = tuple(int(v) for v in reason.shape)
+    B = shape[0]
+    core = torch.ones(shape, dtype=torch.bool, device=dev) if core is None else core.expand(shape)
+
+    def fail(bad, key):
+        reason.masked_fill_((reason == 0) & ev & bad, _REASON[key])
+
     pair = (reason == 0) & ev
     zero = torch.zeros((), dtype=torch.float32, device=dev)
-    m = torch.where(pair, 0.5 * (dr + dv), zero)
-    del dr, dv
+    m = torch.where(pair, 0.5 * (S["dr"] + S["dv"]), zero)
+    if drop:
+        del S["dr"], S["dv"]
     full = pair.clone()
     for a in (1, 2, 3):
         for s in (1, -1):
@@ -921,6 +964,26 @@ def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, d
     counts = torch.cat((core.reshape(B, -1).sum(1, keepdim=True), cnt[:, 1:],
                         valid.reshape(B, -1).sum(1, keepdim=True)), 1)
     return torch.where(valid, m, zero), torch.where(valid, t, zero), valid, counts
+
+
+def _block_fields_t(recto, verso, dy, dx, thr, reach, tmin, tmax, core, cover, dev):
+    """The tensor core of `block_fields_torch` for a batch: `recto` / `verso` (B,Z,Y,X) uint8 (verso
+    may be None), `dy` / `dx` / `core` / `cover` broadcastable to it. Returns (midline, thickness,
+    valid) tensors and a (B, len(SUPPORT)) int64 tensor of support counts in `SUPPORT` order, all on
+    the device. Three stages: `_stage_a` (rules 1-3), `_stage_b` (rule 4, data-dependent), `_stage_c`
+    (rule 5, the counts); `_FieldGraphs` replays a and c as CUDA graphs."""
+    import torch
+    rec = _tt(recto, dev)
+    ver = None if verso is None else _tt(verso, dev)
+    dy, dx = _tt(dy, dev, torch.float32), _tt(dx, dev, torch.float32)
+    core = None if core is None else _tt(core, dev, torch.bool)
+    cover = None if cover is None else _tt(cover, dev, torch.float32)
+    S = _stage_a(rec, ver, dy, dx, thr, reach, tmin, tmax, core, cover, dev)
+    del rec, ver
+    _stage_b(S, dy, dx, reach, dev)
+    for key in ("ixr", "ixv", "br", "bv", "cand"):
+        del S[key]
+    return _stage_c(S, core, dev, drop=True)
 
 
 def _support(row):
@@ -1179,9 +1242,14 @@ def _block_inputs_torch(host, rsh, axis_r_vox, halo, dev):
     """(dy, dx, core, cover) of a batch on `dev` from `_host_inputs`: dy (B,Z,Y,1) and dx (B,Z,1,X)
     float32 (computed in float64, as `axis_offsets`), the core mask with the axis exclusion, and
     `cover_distance` (B,Z,Y,X)."""
-    import torch
     yy, xx, cy, cx = (_to_dev(a, dev) for a in host[:4])
     cov = [_to_dev(c, dev) for c in host[4]]
+    return _block_inputs_dev(yy, xx, cy, cx, cov, rsh, axis_r_vox, halo, dev)
+
+
+def _block_inputs_dev(yy, xx, cy, cx, cov, rsh, axis_r_vox, halo, dev):
+    """`_block_inputs_torch` from its host inputs already on the device."""
+    import torch
     B = int(yy.shape[0])
     Z, Y, X = (int(v) for v in rsh)
     dy = yy[:, None, :, None] - cy[:, :, None, None]
@@ -1293,6 +1361,120 @@ class _SlabStore:
             return _window(self.r4, lo, shape)
 
 
+# the fixed-shape stages of a full device batch as CUDA graphs (`_FieldGraphs`); RVSM_FIELDS_GRAPHS=0
+# runs every batch eagerly
+GRAPHS = os.environ.get("RVSM_FIELDS_GRAPHS", "1") not in ("0", "false", "no")
+
+
+class _FieldGraphs:
+    """The fixed-shape stages of `_fields_torch`'s full batches -- the block inputs (axis offsets, core,
+    coverage) and rules 1-3 (`_stage_a`: thresholds, medial and face transforms, per-voxel rules), and
+    rule 5 with the counts and the encoding (`_stage_c`) -- captured once as two CUDA graphs and
+    replayed, so a batch costs two graph launches for them instead of ~190 kernel launches. The
+    data-dependent part (`_stage_b`: `nonzero`, the pair checks) stays eager between the two, reading
+    and writing the graphs' static tensors.
+
+    One graph pair for one key at a time -- (batch size, window shape, rung parameters, encoding) --
+    captured on the SECOND full batch with that key (the first runs eagerly, which compiles every
+    kernel), used only for full batches (every window with both faces, `batch` of them): a smaller or
+    faceless batch runs eagerly. A new key, `clear()` (between rungs, on a yield of the card, at the
+    end of a region) releases the graphs and their memory.
+
+    Exactness: a replay runs the same kernels on the same values as the eager stages, so the bytes are
+    the same (tested). The medial transforms are capped; their saturation flag (`_medial_flagged`) is
+    copied to pinned host memory inside graph A and read after the batch's `nonzero` has synchronised
+    anyway, and a saturated batch is recomputed eagerly (the uncapped fallback).
+
+    Memory: graph A's pool holds the eager stage's peak for the batch plus its static outputs (the
+    distances, nearest indices, bands, reason, ev, t) for as long as the graphs live -- about what the
+    eager path's caching allocator keeps reserved between batches anyway (~0.9 GB per 224^3 block,
+    measured in docs/fields_perf_notes.md), but it is not returned to the driver by
+    `torch.cuda.empty_cache()` until `clear()`."""
+
+    def __init__(self, dev):
+        import torch
+        self.dev = dev
+        self.clear()                 # `seen`: the key of the last full batch (captured on its second)
+        self.sat = torch.zeros((), dtype=torch.bool).pin_memory()
+        self.stats = {"captured": 0, "replayed": 0, "saturated": 0}
+
+    def clear(self):
+        had = getattr(self, "g", None) is not None
+        self.key = self.seen = None
+        self.g = self.S = self.io = self.inp = self.par = None
+        if had:                     # a dead graph pool is not reused by eager allocations: return it
+            import torch
+            torch.cuda.current_stream(self.dev).synchronize()
+            torch.cuda.empty_cache()
+
+    def run(self, key, rec, ver, host, rsh, axis_r_vox, halo, thr, rk, tn, tx, sl, cap):
+        """(enc, counts) of a full batch through the graphs, or None: the caller computes it eagerly
+        (the first batch of a key, or no graph could be captured)."""
+        if key != self.key:
+            if key != self.seen:
+                self.clear()
+                self.seen = key
+                return None
+            self.clear()
+            try:
+                self._capture(key, rec, ver, host, rsh, axis_r_vox, halo, thr, rk, tn, tx, sl, cap)
+            except Exception as e:  # noqa: BLE001  -- e.g. an op the capture refuses: eager from here
+                import warnings
+                warnings.warn(f"rvsm.targets: fields graphs unusable ({e!r}); running eagerly")
+                global GRAPHS
+                GRAPHS = False
+                self.clear()
+                return None
+        return self._replay(rec, ver, host, rk)
+
+    def _fill(self, rec, ver, host):
+        import torch
+        vals = [rec, ver] + list(host[:4]) + list(host[4])
+        for dst, a in zip(self.inp, vals):
+            dst.copy_(torch.from_numpy(np.ascontiguousarray(a)).pin_memory(), non_blocking=True)
+
+    def _capture(self, key, rec, ver, host, rsh, axis_r_vox, halo, thr, rk, tn, tx, sl, cap):
+        import torch
+        dev = self.dev
+        self.inp = [torch.empty(np.shape(a), dtype=getattr(torch, np.asarray(a).dtype.name), device=dev)
+                    for a in [rec, ver] + list(host[:4]) + list(host[4])]
+        self._fill(rec, ver, host)
+        pool = torch.cuda.graph_pool_handle()
+        ga, gc = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(ga, pool=pool, capture_error_mode="thread_local"):
+            i = self.inp
+            dy, dx, core, cover = _block_inputs_dev(i[2], i[3], i[4], i[5], i[6:9], rsh, axis_r_vox, halo, dev)
+            S = _stage_a(i[0], i[1], dy, dx, thr, rk, tn, tx, core, cover, dev, flagged=True)
+            self.sat.copy_(S.pop("sat"), non_blocking=True)
+        with torch.cuda.graph(gc, pool=pool, capture_error_mode="thread_local"):
+            m, t, ok, cnt = _stage_c(S, core, dev)
+            enc = _encode_torch(m[sl], t[sl], ok[sl], cap)
+            del m, t, ok
+        self.g = (ga, gc)
+        self.S, self.io = S, (dy, dx, core, cover, enc, cnt)
+        self.par = (thr, rk, tn, tx, sl, cap)
+        self.key = key
+        self.stats["captured"] += 1
+
+    def _replay(self, rec, ver, host, rk):
+        import torch
+        self._fill(rec, ver, host)
+        ga, gc = self.g
+        dy, dx, core, cover, enc, cnt = self.io
+        ga.replay()
+        sel = torch.nonzero(self.S["cand"]).squeeze(1)                  # synchronises: `sat` is in
+        if bool(self.sat):
+            self.stats["saturated"] += 1                                # recompute uncapped, eagerly
+            thr, rk, tn, tx, sl, cap = self.par
+            m, t, ok, c = _block_fields_t(self.inp[0], self.inp[1], dy, dx, thr, rk, tn, tx, core, cover,
+                                          self.dev)
+            return _encode_torch(m[sl], t[sl], ok[sl], cap), c
+        _stage_b(self.S, dy, dx, rk, self.dev, sel=sel)
+        gc.replay()
+        self.stats["replayed"] += 1
+        return enc, cnt
+
+
 def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_lock=None):
     """`region_fields`' blocks on a torch `device`, in task order, each result handed to `take`.
 
@@ -1352,9 +1534,13 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
     # nothing of the fields is left on the device there, so it only waits for its own stream first
     yield_point = getattr(gpu_lock, "yield_point", None)
 
+    graphs = _FieldGraphs(dev) if (GRAPHS and dev.type == "cuda") else None
+
     def flush():
         if stream is not None:
             stream.synchronize()
+            if graphs is not None:
+                graphs.clear()              # the graphs' pools go back with the rest
             torch.cuda.empty_cache()
     with gpu_lock, torch.no_grad(), ctx, cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fcut") as cutter:
         nxt = cutter.submit(cut, 0) if groups else None
@@ -1364,23 +1550,31 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
             rsh, rec, ver, host, (hr, hv) = nxt.result()
             nxt = cutter.submit(cut, gi + 1) if gi + 1 < len(groups) else None
             k, n = int(group[0][0]), group[0][2]
-            dy, dx, core, cover = _block_inputs_torch(host, rsh, float(axis_r_um) / ladder.rung_um(k),
-                                                      halo, dev)
+            axr = float(axis_r_um) / ladder.rung_um(k)
             rk, tn, tx = rung_params(k, reach, tmin, tmax)
             sl = (slice(None),) + tuple(slice(int(halo), int(halo) + int(v)) for v in n)
             stats["blocks"] += len(group)
             full = hr & hv
-            if full.all() or not SKIP_FACELESS:
-                m, t, ok, cnt = _block_fields_t(_to_dev(rec, dev), None if ver is None else _to_dev(ver, dev),
-                                                dy, dx, thr, rk, tn, tx, core, cover, dev)
-                enc = _encode_torch(m[sl], t[sl], ok[sl], cap)
-                del m, t, ok
+            res = None
+            if graphs is not None and GRAPHS and ver is not None and full.all() and len(group) == batch:
+                key = (k, len(group), rsh, axr, int(halo), thr, rk, tn, tx, cap, EDT_CAP)
+                res = graphs.run(key, rec, ver, host, rsh, axr, halo, thr, rk, tn, tx, sl, cap)
+            if res is not None:
+                enc, cnt = res
             else:
-                enc, cnt = _faceless(rec, ver, hr, hv, dy, dx, core, cover, thr, rk, tn, tx, cap, sl, n,
-                                     dev)
-                stats["no_recto"] += int((~hr).sum())
-                stats["no_verso"] += int((hr & ~hv).sum())
-            del dy, dx, core, cover
+                dy, dx, core, cover = _block_inputs_torch(host, rsh, axr, halo, dev)
+                if full.all() or not SKIP_FACELESS:
+                    m, t, ok, cnt = _block_fields_t(_to_dev(rec, dev),
+                                                    None if ver is None else _to_dev(ver, dev),
+                                                    dy, dx, thr, rk, tn, tx, core, cover, dev)
+                    enc = _encode_torch(m[sl], t[sl], ok[sl], cap)
+                    del m, t, ok
+                else:
+                    enc, cnt = _faceless(rec, ver, hr, hv, dy, dx, core, cover, thr, rk, tn, tx, cap, sl, n,
+                                         dev)
+                    stats["no_recto"] += int((~hr).sum())
+                    stats["no_verso"] += int((hr & ~hv).sum())
+                del dy, dx, core, cover
             if stream is not None:                 # one read-back per batch
                 he = torch.empty(enc.shape, dtype=torch.uint8, pin_memory=True)
                 hc = torch.empty(cnt.shape, dtype=torch.int64, pin_memory=True)
@@ -1398,6 +1592,9 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
                 rung_done(k)
         del src
         stats["skipped"] = stats["no_recto"] + stats["no_verso"]
+        if graphs is not None:
+            stats["graphs"] = dict(graphs.stats)
+            graphs.clear()
         if stream is not None:              # still under the lock: the next pass finds the card clean
             stream.synchronize()
             torch.cuda.empty_cache()        # hand the fields' blocks back to the process's other users
@@ -1629,9 +1826,11 @@ def region_fields(root, lo, ax, round_=0, jobs=1, rungs=(2, 3, 4), axis_r_um=AXI
         byk = {k: (k, Sk, paths, want) for k, Sk, paths, want in todo}
         with cf.ThreadPoolExecutor(1, thread_name_prefix="rvsm-fwrite") as wr:
             futs = []
-            rep["skipped_blocks"] = _fields_torch(
+            st = _fields_torch(
                 init, tasks, device, take, rung_done=lambda k: futs.append(wr.submit(write_rung, *byk[k])),
                 batch=batch, gpu_lock=gpu_lock)
+            rep["graphs"] = st.pop("graphs", None)       # captured / replayed / saturated, or None
+            rep["skipped_blocks"] = st
             for f in futs:
                 f.result()
         return rep

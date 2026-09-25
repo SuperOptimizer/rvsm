@@ -839,3 +839,46 @@ def test_fused_pair_checks_are_the_torch_pair_checks(slab_region, tmp_path, monk
             rs[fused] = slab_region(name=f"f{name}{int(fused)}", n=128, **kw)
             targets.region_fields(rs[fused].root, rs[fused].lo, rs[fused].ax, rungs=(2, 3), device="cuda", **KW)
         _same_stores(rs[False], rs[True])
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="no CUDA device")
+@pytest.mark.parametrize("B", [1, 3])
+def test_fields_graphs_write_the_same_bytes(slab_region, tmp_path, monkeypatch, B):
+    """The fixed-shape stages of full device batches replayed as CUDA graphs (`_FieldGraphs`) against
+    the eager path: byte-identical stores on the curved region (graphs captured and replayed at rungs
+    2 and 3), a region whose recto band saturates the medial cap (replayed batches recomputed eagerly,
+    the uncapped fallback), and the paired / split slabs (full, faceless and partial batches mixed)."""
+    import types
+    monkeypatch.setattr(targets, "FIELD_BATCH", B)
+    lo = (0, 0, 0)
+
+    def thick(root):
+        n = 128
+        z, y, x = np.meshgrid(np.arange(n), np.arange(n), np.arange(n), indexing="ij")
+        rec = np.where(np.abs(x - 60) <= 20, 255, 0).astype(np.uint8)     # 41 voxels thick: depth 21
+        ver = np.where(np.abs(x - 85) <= 1, 255, 0).astype(np.uint8)
+        for name, v in (("recto", rec), ("verso", ver)):
+            stores.write(stores.store_path(root, name, lo), v, lo, rung=2, channels=(name,), q=8)
+        zs = np.arange(0, n + 1, 16, dtype=np.float64)
+        return np.stack([zs, np.full_like(zs, 64.0), np.full_like(zs, -400.0)])
+    reps = {}
+    for name, make in (("curved", _curved_region), ("thick", thick)):
+        roots = {}
+        for g in (False, True):
+            monkeypatch.setattr(targets, "GRAPHS", g)
+            root = str(tmp_path / f"{name}{int(g)}")
+            ax = make(root)
+            reps[(name, g)] = targets.region_fields(root, lo, ax, rungs=(2, 3), device="cuda", **KW)
+            roots[g] = types.SimpleNamespace(root=root, lo=lo)
+        _same_stores(roots[False], roots[True])
+    assert reps[("curved", False)]["graphs"] is None
+    assert reps[("curved", True)]["graphs"]["replayed"] > 0
+    if B == 1:                       # at 3 the thick region has no full batch past the first
+        assert reps[("thick", True)]["graphs"]["saturated"] > 0
+    for name, kw in (("pair", dict(recto_x=80, verso_x=70)), ("split", dict(recto_x=100, verso_x=20))):
+        rs = {}
+        for g in (False, True):
+            monkeypatch.setattr(targets, "GRAPHS", g)
+            rs[g] = slab_region(name=f"g{name}{int(g)}", n=128, **kw)
+            targets.region_fields(rs[g].root, rs[g].lo, rs[g].ax, rungs=(2, 3), device="cuda", **KW)
+        _same_stores(rs[False], rs[True])
