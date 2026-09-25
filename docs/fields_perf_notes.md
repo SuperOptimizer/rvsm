@@ -2,7 +2,22 @@
 
 ## Per-block device profile (RTX 5080, one 224^3 rung-2 block with sheets, B = 1)
 
-After the 2026-09-25 round (items A-D below):
+After the 2026-09-25 round 3 (items E-H below):
+
+| part | device time | launches |
+|---|---|---|
+| whole block (`_block_fields_t`) | 14.9 ms device, 17.4 ms wall | 89 kernels eager; per production batch 127 API calls eager, 25 with the graphs |
+| stage B: forest merge 1.9, reciprocal kernel (with the finds) 1.2, box Gaussians 1.8, normals + walk, `nonzero` | 5.6 ms | 16 (14 under the graphs: the forest is in graph A) |
+| face transforms incl. signed distance, index planes and reach rules (`edt.face_edt`: `_first` x2, `_pass` x2, `_pass_face` x2) | 3.4 ms | 6 |
+| medial transforms (`edt2`, no indices) | 2.2 ms | 6 |
+| max-filter (medial) | 1.1 ms | 2 |
+| the rest of stage A (thresholds, medial compare, dilation, coverage, thickness) | ~2.1 ms | ~57 |
+| stage C: rule 5, outputs / encoding, counts (`_stage5`) | 0.4 ms | 2 (1 kernel + the counts memset) |
+
+Production batch (host inputs to encoded cores, `gprof.py` harness): B = 1 eager 16.0 ms device /
+127 API calls, graphs 15.9 ms / 25; B = 3 eager 54.4 ms / 127, graphs 55.3 ms / 25.
+
+Round 2's table (after 88827c0):
 
 | part | device time | launches |
 |---|---|---|
@@ -28,6 +43,58 @@ The same block before the round (re-measured at 5e91243^ on the same laptop): 42
 
 Behind Thunder's GPU proxy the same region was ~75 s at batch 3 (launch-latency bound), against
 ~40 s on the laptop then. Launches and syncs cost more there than device time.
+
+## Done 2026-09-25, round 3 (all byte-identical: fixtures bitwise vs numpy, synthetic 1024^3 region vs HEAD at batch 1 and 3, graphs on and off)
+
+Per block = the block above, B = 1. "API" = kernel launches + memcpy/memset + graph launches of the
+production batch path (host inputs to encoded cores).
+
+| item | commit | block device ms | block launches | batch API eager / graphs | notes |
+|---|---|---|---|---|---|
+| before | a65b30e | 23.6 | 190 | 228 / 28 | batch device 24.9 eager, 23.2 graphs |
+| E: rule 5 + outputs + encoding + counts in one kernel | 58256c3 | 19.7 | 127 | 165 / 28 | stage C 4.31 ms / 65 -> 0.39 ms / 2 |
+| F: face distance arithmetic + reach rules in the last EDT pass | 78334e1 | 14.9 | 89 | 127 / 28 | face part ~8.2 ms / ~44 -> 3.4 ms / 6 |
+| G: graph pool per key | 8b0c4ff | 14.9 | 89 | 127 / 25 | pool 0.77 -> 0.65 GB (B = 1), 2.30 -> 1.93 GB (B = 3) |
+| H: mixed / short batches replay | bec8fbc | 14.9 | 89 | 127 / 25 | batch 3: replayed 112 -> 127 of the region's batches |
+
+- **E** (`_stage_c`, kernel `_stage5`): per voxel the pair test at itself and its six neighbours (the
+  codes are only read, so every voxel sees the pre-rule-5 codes), the midline's central differences
+  at the full-stencil voxels straight from dr / dv (their neighbours are pair voxels), the gradient
+  rule, valid, and either the masked midline / thickness / valid volumes (`block_fields_torch`) or the
+  encoded core window (the producer), plus the counts row (one reduced atomic per value and program).
+  torch's float32 steps each rounded on its own (`*_rn`). The torch steps stay for the CPU and
+  RVSM_FIELDS_FUSED=0.
+- **F** (`edt.face_edt`, kernel `_pass_face`): the face transform's last pass computes u = sqrt(v), the
+  side (y - iy) * dy + (x - ix) * dx (rounded product, rounded product, rounded sum), d, writes the
+  three index planes directly (no stack) and applies the no_recto / no_verso reach rule to the codes.
+- **G**: (1) the index planes are int16 (numpy's `face_distance` does the same below 2^15): 2 x 68 MB
+  instead of 2 x 135 MB per block, the largest statics; (2) the union-find forest is computed in
+  graph A and, with one Gaussian buffer, allocated at the end of the capture, reusing the transients'
+  dead pool memory (the pool did not grow); the Gaussian's middle pass writes into the dead forest
+  (eager too: `gaussian3_box(out=)`); (3) `empty_cache()` before a capture, so the pool is not
+  stacked on the first batch's cached eager blocks; (4) any batch of another key drops the graphs
+  (`drop_other`), not only a graph-eligible one.
+- **H**: a batch with at least one face pair goes through the graphs; its faceless windows are
+  computed in full (the SKIP_FACELESS equivalence: the same bytes as `_faceless`), a short batch is
+  padded with air windows (`_pad_batch`). A batch without any face pair stays eager (`_faceless`).
+  Stats: `graphed_faceless`, `graphed_padded`.
+
+**Memory now** (synthetic 1024^3 region, `max_memory_reserved`):
+
+| | graph pool per key | eager peak allocated per batch | region peak reserved, graphs | region peak reserved, eager |
+|---|---|---|---|---|
+| B = 1, before | 0.81 GB | 0.74 GB | 1.51 GB | 0.99 GB |
+| B = 1, now | 0.65 GB | 0.59 GB | 1.31 GB | 0.91 GB |
+| B = 3, before | 2.43 GB | 2.21 GB | 4.45 GB | 2.61 GB |
+| B = 3, now | 1.93 GB | 1.78 GB | 2.87 GB | 2.36 GB |
+
+The remaining gap between graphs and eager at B = 1 is the pool beside the eager cache of the
+batches that still run eagerly while it lives (the faceless ones, whose recto-only transforms
+allocate), plus `_SlabStore`'s pooling on the helper thread's stream (~0.18 GB cached there).
+
+Laptop region times (synthetic 1024^3, rungs 2-4): 22.9 s (batch 1, graphs), 24.4 s (batch 1, eager),
+24.0 s (batch 3, graphs), 25.9 s (batch 3, eager); +-2 s run to run. The device work per block is
+now well under the store decode and the encode tail.
 
 ## Done 2026-09-25 (all byte-identical: fixtures bitwise vs numpy, synthetic 1024^3 region vs HEAD at batch 1 and 3)
 
@@ -61,7 +128,7 @@ the production batch path (host inputs to encoded cores, `gprof.py`-style harnes
   (rung, batch size, parameters) key, dropped on a new key, a fields yield and at region end. The
   medial saturation flag is copied to pinned memory in graph A and read after `nonzero`'s sync; a
   saturated batch is recomputed eagerly.
-  **Memory cost**: graph pool 0.81 GB at B = 1, 2.43 GB at B = 3 while the key's graphs live, on top of
+  **Memory cost** (round 2; round 3's numbers above): graph pool 0.81 GB at B = 1, 2.43 GB at B = 3 while the key's graphs live, on top of
   the eager allocations (stage B, eager batches). Peak reserved over the synthetic region: batch 1
   0.99 -> 1.51 GB, batch 3 2.61 -> 4.45 GB. If the producer budget cannot take it, RVSM_FIELDS_GRAPHS=0.
 - **D**: one Triton reduction per 4096 voxels and volume, 11 atomic adds per program, straight into
@@ -92,7 +159,21 @@ checks folded into one) are what should move the ~75 s.
 - **8b, pool rungs 3 / 4 fields from rung 2:** not what the code computes (rungs 3 / 4 are recomputed
   from the pooled recto / verso), so not byte-identical.
 
-## Next steps, ranked (2026-09-25)
+## Next steps, ranked (2026-09-25, after round 3)
+
+1. **Stage B** (5.6 ms, 14-16 launches, the largest part now): the forest merge (1.9 ms) could run only
+   over the band voxels the candidates' face points can reach; the box Gaussians (1.8 ms) could be
+   one kernel for the three passes over a box in shared memory.
+2. **The rest of stage A** (~2.1 ms, ~57 launches eager; one graph launch under the graphs): the
+   thresholds, the medial compare, the dilation, the coverage and thickness rules into one or two
+   kernels (the coverage and thickness rules into the verso face pass's epilogue would also drop u
+   from the verso transform: ~45 MB less pool per block).
+3. **Medial transforms** (2.2 ms + 1.1 ms max-filter): the transforms carry an unused index output
+   (`_first` writes it); a no-index `_first` and the 3^3 max-compare fused into one kernel.
+4. **Graph memory**: int16 carries inside the passes (the index intermediates of the verso face
+   transform are the pool's peak), and the verso u above; each ~45 MB per block.
+
+## Round 2's next steps (2026-09-25; 1-4 done in round 3 as E, F, G, H)
 
 1. **Fuse stage C into one kernel** (~4.3 ms, 65 launches eager): pair, the 6-neighbour stencil, the
    midline central differences (computable from dr / dv / pair at the neighbours), both fails, valid,

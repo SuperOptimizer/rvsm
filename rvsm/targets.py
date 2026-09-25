@@ -1420,7 +1420,7 @@ def _encode_torch(m, t, ok, cap):
     return torch.stack((mu, tu))
 
 
-FIELD_BATCH = 3      # blocks per device batch: ~0.83 GB of VRAM each at 224^3, 2.5 GB at 3
+FIELD_BATCH = 3      # blocks per device batch: ~0.6 GB of VRAM at 224^3 (eager peak), 1.8 GB at 3
 # a device block whose window has no recto (or no verso) voxel at the threshold is answered without its
 # transforms (`_faceless`): the same bytes and support counts. RVSM_FIELDS_SKIP=0 computes every block
 SKIP_FACELESS = os.environ.get("RVSM_FIELDS_SKIP", "1") not in ("0", "false", "no")
