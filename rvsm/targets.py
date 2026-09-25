@@ -1393,6 +1393,18 @@ class _SlabStore:
 GRAPHS = os.environ.get("RVSM_FIELDS_GRAPHS", "1") not in ("0", "false", "no")
 
 
+MAX_CAPTURES = 8     # graph captures per region; past that (yield churn) the batches run eagerly
+
+
+def _rss_gb():
+    """This process's resident set, GB (Linux; None elsewhere)."""
+    try:
+        with open("/proc/self/statm") as f:
+            return round(int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2 ** 30, 2)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class _FieldGraphs:
     """The fixed-shape stages of `_fields_torch`'s full batches -- the block inputs (axis offsets, core,
     coverage) and rules 1-3 (`_stage_a`: thresholds, medial and face transforms, per-voxel rules), and
@@ -1409,8 +1421,13 @@ class _FieldGraphs:
 
     Exactness: a replay runs the same kernels on the same values as the eager stages, so the bytes are
     the same (tested). The medial transforms are capped; their saturation flag (`_medial_flagged`) is
-    copied to pinned host memory inside graph A and read after the batch's `nonzero` has synchronised
-    anyway, and a saturated batch is recomputed eagerly (the uncapped fallback).
+    a device flag of graph A, read (one byte) after the batch's `nonzero` has synchronised anyway, and
+    a saturated batch is recomputed eagerly (the uncapped fallback). The graphs hold no host memory
+    of their own (no memcpy node into host memory); the host inputs go through one pinned staging set
+    per key, allocated at capture and reused, instead of a pinned allocation per input per batch. At
+    most `MAX_CAPTURES` captures per region (a yield drops the graphs, so a producer that yields
+    often would otherwise capture again and again); past that, eager. The stats carry the process
+    RSS at the start and end of the region (`rss0_gb`, `rss_gb`).
 
     Memory: graph A's pool holds the eager stage's peak for the batch plus its static outputs (the
     distances, nearest indices, bands, reason, ev, t) for as long as the graphs live -- about what the
@@ -1422,13 +1439,14 @@ class _FieldGraphs:
         import torch
         self.dev = dev
         self.clear()                 # `seen`: the key of the last full batch (captured on its second)
-        self.sat = torch.zeros((), dtype=torch.bool).pin_memory()
-        self.stats = {"captured": 0, "replayed": 0, "saturated": 0}
+        self.stats = {"captured": 0, "replayed": 0, "saturated": 0, "refused": 0}
+        self.rss0 = _rss_gb()
+
 
     def clear(self):
         had = getattr(self, "g", None) is not None
         self.key = self.seen = None
-        self.g = self.S = self.io = self.inp = self.par = None
+        self.g = self.S = self.io = self.inp = self.par = self.stage = self.sat = None
         if had:                     # a dead graph pool is not reused by eager allocations: return it
             import torch
             torch.cuda.current_stream(self.dev).synchronize()
@@ -1443,6 +1461,10 @@ class _FieldGraphs:
                 self.seen = key
                 return None
             self.clear()
+            if self.stats["captured"] >= MAX_CAPTURES:      # e.g. many yields: no capture churn
+                self.stats["refused"] += 1
+                self.seen = key
+                return None
             try:
                 self._capture(key, rec, ver, host, rsh, axis_r_vox, halo, thr, rk, tn, tx, sl, cap)
             except Exception as e:  # noqa: BLE001  -- e.g. an op the capture refuses: eager from here
@@ -1455,16 +1477,21 @@ class _FieldGraphs:
         return self._replay(rec, ver, host, rk)
 
     def _fill(self, rec, ver, host):
-        import torch
+        # through the key's own pinned staging, allocated once at capture (no pinned allocation per
+        # batch); the previous batch's copies are complete (its read-back synchronised the stream)
         vals = [rec, ver] + list(host[:4]) + list(host[4])
-        for dst, a in zip(self.inp, vals):
-            dst.copy_(torch.from_numpy(np.ascontiguousarray(a)).pin_memory(), non_blocking=True)
+        for dst, st, a in zip(self.inp, self.stage, vals):
+            np.copyto(st.numpy(), a)
+            dst.copy_(st, non_blocking=True)
 
     def _capture(self, key, rec, ver, host, rsh, axis_r_vox, halo, thr, rk, tn, tx, sl, cap):
         import torch
         dev = self.dev
+        vals = [rec, ver] + list(host[:4]) + list(host[4])
         self.inp = [torch.empty(np.shape(a), dtype=getattr(torch, np.asarray(a).dtype.name), device=dev)
-                    for a in [rec, ver] + list(host[:4]) + list(host[4])]
+                    for a in vals]
+        self.stage = [torch.empty(np.shape(a), dtype=getattr(torch, np.asarray(a).dtype.name),
+                                  pin_memory=True) for a in vals]
         self._fill(rec, ver, host)
         pool = torch.cuda.graph_pool_handle()
         ga, gc = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
@@ -1472,7 +1499,7 @@ class _FieldGraphs:
             i = self.inp
             dy, dx, core, cover = _block_inputs_dev(i[2], i[3], i[4], i[5], i[6:9], rsh, axis_r_vox, halo, dev)
             S = _stage_a(i[0], i[1], dy, dx, thr, rk, tn, tx, core, cover, dev, flagged=True)
-            self.sat.copy_(S.pop("sat"), non_blocking=True)
+            self.sat = S.pop("sat")            # a device flag, read after the batch's sync
         with torch.cuda.graph(gc, pool=pool, capture_error_mode="thread_local"):
             m, t, ok, cnt = _stage_c(S, core, dev)
             enc = _encode_torch(m[sl], t[sl], ok[sl], cap)
@@ -1490,7 +1517,7 @@ class _FieldGraphs:
         dy, dx, core, cover, enc, cnt = self.io
         ga.replay()
         sel = torch.nonzero(self.S["cand"]).squeeze(1)                  # synchronises: `sat` is in
-        if bool(self.sat):
+        if bool(self.sat.item()):             # the stream is idle after `nonzero`: a 1-byte read
             self.stats["saturated"] += 1                                # recompute uncapped, eagerly
             thr, rk, tn, tx, sl, cap = self.par
             m, t, ok, c = _block_fields_t(self.inp[0], self.inp[1], dy, dx, thr, rk, tn, tx, core, cover,
@@ -1620,8 +1647,8 @@ def _fields_torch(init, tasks, device, take, rung_done=None, batch=None, gpu_loc
         del src
         stats["skipped"] = stats["no_recto"] + stats["no_verso"]
         if graphs is not None:
-            stats["graphs"] = dict(graphs.stats)
             graphs.clear()
+            stats["graphs"] = dict(graphs.stats, rss0_gb=graphs.rss0, rss_gb=_rss_gb())
         if stream is not None:              # still under the lock: the next pass finds the card clean
             stream.synchronize()
             torch.cuda.empty_cache()        # hand the fields' blocks back to the process's other users

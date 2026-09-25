@@ -882,3 +882,39 @@ def test_fields_graphs_write_the_same_bytes(slab_region, tmp_path, monkeypatch, 
             rs[g] = slab_region(name=f"g{name}{int(g)}", n=128, **kw)
             targets.region_fields(rs[g].root, rs[g].lo, rs[g].ax, rungs=(2, 3), device="cuda", **KW)
         _same_stores(rs[False], rs[True])
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="no CUDA device")
+def test_fields_graphs_stop_capturing_past_the_cap_with_the_same_bytes(slab_region, tmp_path, monkeypatch):
+    """A producer that yields the card often drops the graphs every time; past `MAX_CAPTURES` a
+    region stops capturing again (eager batches, `refused`), with the same bytes."""
+    import types
+
+    class Always:
+        n = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *e):
+            pass
+
+        def yield_point(self, flush):
+            Always.n += 1
+            if Always.n % 3:
+                return False
+            flush()
+            return True
+    monkeypatch.setattr(targets, "FIELD_BATCH", 1)
+    monkeypatch.setattr(targets, "MAX_CAPTURES", 1)
+    lo = (0, 0, 0)
+    roots, reps = {}, {}
+    for g in (False, True):
+        monkeypatch.setattr(targets, "GRAPHS", g)
+        root = str(tmp_path / f"cap{int(g)}")
+        ax = _curved_region(root)
+        reps[g] = targets.region_fields(root, lo, ax, rungs=(2, 3), device="cuda", gpu_lock=Always(), **KW)
+        roots[g] = types.SimpleNamespace(root=root, lo=lo)
+    _same_stores(roots[False], roots[True])
+    st = reps[True]["graphs"]
+    assert st["captured"] <= 1 and st["refused"] > 0 and st["rss_gb"] is not None
