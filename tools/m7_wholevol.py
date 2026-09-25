@@ -1034,37 +1034,48 @@ def cmd_finisher(a):
 
 # --------------------------------------------------------------------------- status
 def cmd_status(a):
+    """status.json: per-worker progress and per-volume projected completion. The projection counts
+    non-air WINDOWS (window_estimates.json: {stem: {stride: n}}, from the CT's level 4), not voxels: the
+    air fraction differs 5x between volumes. Rate = the live windows/s of the workers (both GPUs)."""
     vols = load_vols()
+    now = time.time()
     out = {"t": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"), "workers": {}, "volumes": []}
-    rate = []
+    wps = []
     for p in glob.glob(os.path.join(WORK, "state", "worker_*.json")):
         try:
             w = json.load(open(p))
         except (OSError, ValueError):
             continue
         out["workers"][w.get("worker")] = {k: (round(x, 1) if isinstance(x, float) else x) for k, x in w.items()}
-        if w.get("elapsed") and w.get("vox"):
-            rate.append(w["vox"] / w["elapsed"])
-    r = sum(rate) / len(rate) if rate else None     # out voxels/s per worker (this unit so far)
-    nw = 2
-    left = []
+        if w.get("gpu_s") and w.get("win") and now - w.get("t", 0) < 3600:
+            wps.append(w["win"] / max(w.get("elapsed", 1), 1))
+    try:
+        est = json.load(open(os.path.join(HOME, "window_estimates.json")))
+    except (OSError, ValueError):
+        est = {}
+    rate = sum(wps) if wps else None            # windows/s, all workers
+    acc = 0.0
     for v in vols:
         nr = -(-v["shape"][0] // SH)
         done = sum(row_done(v, i) for i in range(nr))
         up = os.path.exists(os.path.join(HOME, "uploaded", v["stem"] + ".json"))
         vox = v["shape"][0] * v["shape"][1] * v["shape"][2]
-        rem = 0 if up else vox * (1 - done / nr)
-        left.append(rem)
-        out["volumes"].append({"vol": v["stem"], "name": v["name"], "Gvox": round(vox / 1e9, 1),
-                               "rows_done": f"{done}/{nr}", "uploaded": up, "store": store_name(v)})
-    if r:
-        acc = 0.0
-        now = time.time()
-        for rec, rem in zip(out["volumes"], left):
-            acc += rem
-            rec["eta_utc"] = dt.datetime.fromtimestamp(now + acc / (r * nw), dt.timezone.utc).strftime(
-                "%Y-%m-%d %H:%MZ") if rem else "done"
-        out["rate_Mvox_s_per_worker"] = round(r / 1e6, 1)
+        try:
+            stride = json.load(open(os.path.join(state_dir(v), "params.json")))["stride"]
+        except (OSError, ValueError, KeyError):
+            stride = int(os.environ.get("M7W_STRIDE", "96"))
+        nwin = est.get(v["stem"], {}).get(str(stride))
+        rec = {"vol": v["stem"], "name": v["name"], "Gvox": round(vox / 1e9, 1), "rows_done": f"{done}/{nr}",
+               "stride": stride, "est_windows": nwin, "uploaded": up, "store": store_name(v)}
+        if up:
+            rec["eta_utc"] = "uploaded"
+        elif rate and nwin:
+            acc += nwin * (1 - done / nr)
+            rec["eta_utc"] = dt.datetime.fromtimestamp(now + acc / rate + 1800, dt.timezone.utc).strftime(
+                "%Y-%m-%d %H:%MZ")
+        out["volumes"].append(rec)
+    if rate:
+        out["windows_per_s_total"] = round(rate, 2)
     js = json.dumps(out, indent=1)
     if a.write:
         with open(os.path.join(HOME, "status.json.tmp"), "w") as f:
