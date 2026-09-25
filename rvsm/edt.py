@@ -11,6 +11,8 @@ the CPU in the tests):
     gaussian3(x, s)      gaussian_filter(x, s, mode="nearest") (truncate 4, per-axis float32 rounding)
     binary_dilation(m)   binary_dilation(m): one step of the 6-neighbour cross, border 0
     label(m)             label(m, ones((3,3,3)))[0] up to a relabelling (only EQUALITY of labels is used)
+    label_forest(m)      its union-find forest on CUDA (for a caller that compares a few voxels' roots)
+    gaussian3_box(...)   gaussian3 of several fields, exact only inside a device-side box per volume
     pool2(v)             ladder.pool2 (2x mean pool of uint8 = floor(sum / 8)), byte for byte
 
 THE EDT. The separable exact construction (Saito & Toriwaki; Maurer et al., which is what scipy runs):
@@ -36,8 +38,8 @@ and round to float32 between passes, but the order of the sum is not guaranteed 
 smoothed value can differ in its last float32 bit (it has matched on every test block so far).
 
 DETERMINISM. Every operator here is a fixed sequence of elementwise ops, gathers, max-pools and
-first-index reductions, plus one scatter-MAX in `label` whose result does not depend on the order the
-atomics land in: no cudnn, no autotuning. Same inputs on the same device -> the same bits.
+first-index reductions, plus atomics in `label` (the torch scatter-max, the union-find's max links)
+whose result does not depend on the order they land in: no cudnn, no autotuning. Same inputs on the same device -> the same bits.
 """
 import math
 

@@ -97,15 +97,17 @@ checks over the candidate voxels. Two implementations of the same rules:
     2-4 on the 8-core production host.
   * torch (`block_fields_torch`, `region_fields(device=...)`), the producer's GPU: `rvsm.edt`'s exact
     EDT (Triton kernels on CUDA) and ndimage replacements, written op for op in the numpy version's
-    float32 order, `FIELD_BATCH` = 3 blocks per device batch. ~50 ms of device time per block on an
-    RTX 5080 laptop GPU, ~0.83 GB of VRAM per block in the batch (2.5 GB at peak); the whole region (the
-    stores decoded one chunk row at a time, pooled on the device, 584 blocks, then the six q=0 writes)
-    ~53 s, of which ~13 s is the volcomp encode of the last stores. Host memory peaks at ~3.4 GB over
-    the process (the two 1 GB rung-2 output arrays the one-write-per-shard rule needs, a few decoded
-    chunk rows, the pooled rungs), no child process. On a GPU behind a proxy what counts is launches and
-    synchronisations, so a batch goes through in ~540 launches (~180 per block, against ~1190 for one
-    block before batching and fused labelling / walk kernels) and ~4 synchronisations (the pair-check
-    compaction, one convergence check per labelling, the one read-back).
+    float32 order, `FIELD_BATCH` = 3 blocks per device batch. ~24 ms of device time per block on an
+    RTX 5080 laptop GPU, ~0.8 GB of VRAM per block in the batch (more while the CUDA graphs live, see
+    `_FieldGraphs`); the whole region (the stores decoded one chunk row at a time, pooled on the device,
+    584 blocks, then the six q=0 writes) ~30 s on the laptop, dominated by the store decode and the
+    volcomp encode. Host memory peaks at ~3.4 GB over the process (the two 1 GB rung-2 output arrays
+    the one-write-per-shard rule needs, a few decoded chunk rows, the pooled rungs), no child process.
+    On a GPU behind a proxy what counts is API calls and synchronisations: the pair checks are a few
+    fused kernels (`_pair_checks_triton`), the labelling a sync-free union-find, and a full batch
+    replays its fixed-shape stages as two CUDA graphs, so it costs ~27 API calls (kernel and graph
+    launches, copies) and 2 synchronisations (the pair-check compaction, the one read-back); an eager
+    batch ~230 calls and 4. docs/fields_perf_notes.md has the per-stage profile.
 
 The two agree: EDT distances are exact integers under a sqrt in both, the nearest-voxel TIES are broken
 the same way (each pass takes the first minimum along its line, in scipy's axis order -- see
@@ -118,7 +120,8 @@ normal test on its threshold.
 Either way every block is computed from the stores alone, with a `halo` of context, and the cores are
 assembled in block order through `_store_block`, so the bytes written do not depend on how the blocks
 were handed out: `jobs=4` is byte-identical to `jobs=1`, and the device path is deterministic on one
-device (no atomics whose order matters, no cudnn, no autotuning).
+device (atomics only where the result does not depend on their order: maxima, minima, integer sums
+and the union-find's roots; no cudnn, no autotuning).
 """
 import hashlib
 import json
