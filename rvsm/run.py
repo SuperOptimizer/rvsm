@@ -739,32 +739,41 @@ def feed_coarse_once(out, lo, round_, block, shape2, pooled=None, gen=0):
 
 
 def commit_sources(out, lo, round_, rungs=(2, 3, 4)):
-    """Commit the region's newest finished sources for every reader once they are coherent: the newest
-    verso and recto (+ its rw) generations, and -- where the region has a verso -- every field store
-    built from exactly those (`targets.fields_current`). Returns the committed bundle, or None when
-    nothing changed or something is still missing. Idempotent: the producer calls it after a fields
-    job, after a reteach of a region without a verso, and for any stale region it finds with nothing
-    left to run (a unit whose commit a restart cut off)."""
+    """Commit the region's newest finished sources for every reader, in two independent parts:
+
+    - the RECTO: the newest finished recto generation, as soon as its rw beside it is finished too
+      (the pair is written recto then rw, each atomically). It does NOT wait for the fields: they are
+      the pair / distance losses' input only, and fields built from the previous recto are the same
+      sheet a voxel or two off -- so a reteach switches the loader, the eval grid and the gate
+      reference at once (paris4 2026-09-25: gating it on the fields queue meant > 1 day of old targets).
+    - the FIELDS with their VERSO: the fields' generation (`targets.field_gen`) and the newest verso,
+      only once every field store built from exactly the newest verso and recto is finished
+      (`targets.fields_current`). A verso still never moves without its fields (pass-4 P4-04).
+
+    Every generation named is a finished store; a half-written one is never committed. Logs a
+    `recto_commit` and / or `fields_commit` line. Returns the committed bundle, or None when nothing
+    moved. Idempotent: the producer calls it after every reteach and fields job, and for any region
+    of the regeneration backlog with nothing left to run (a commit a restart cut off)."""
     from rvsm import stores, targets as TG
     cur = stores.bundle_state(out, lo, round_)
+    want = dict(cur)
     gr = TG.source_recto(out, lo, round_)[0]
-    if gr < 0:
-        return None
-    if int(round_) == 0 and gr > 0 and \
-            not stores.is_done(stores.gen_path(stores.store_path(out, "rw", lo, round_), gr)):
-        return None                                  # a regenerated recto is committed with its rw
-    has_verso = stores.store_gen(out, "verso", lo, round_) >= 0
-    if has_verso:
-        gv = TG.source_verso(out, lo, round_)[0]
-        want = {"gen": max(gv, gr), "verso": gv, "recto": gr}
-    else:
-        want = {"gen": cur["gen"], "verso": cur["verso"], "recto": gr}
+    if gr >= 0 and (int(round_) != 0 or gr == 0 or
+                    stores.is_done(stores.gen_path(stores.store_path(out, "rw", lo, round_), gr))):
+        want["recto"] = gr
+    if stores.store_gen(out, "verso", lo, round_) >= 0 and TG.fields_current(out, lo, round_, rungs):
+        want["gen"] = TG.field_gen(out, lo, round_)
+        want["verso"] = TG.source_verso(out, lo, round_)[0]
     if want == cur:
-        return None
-    if has_verso and not TG.fields_current(out, lo, round_, rungs):
         return None
     stores.commit_bundle(out, lo, round_, want["gen"], verso=want["verso"], recto=want["recto"],
                          t=time.time())
+    if want["recto"] != cur["recto"]:
+        jlog(out, "produce", {"kind": "recto_commit", "region": [int(v) for v in lo], "round": int(round_),
+                              "gen": want["recto"], "was": cur["recto"]}, echo=False)
+    if (want["gen"], want["verso"]) != (cur["gen"], cur["verso"]):
+        jlog(out, "produce", {"kind": "fields_commit", "region": [int(v) for v in lo], "round": int(round_),
+                              "gen": want["gen"], "verso": want["verso"], "was": cur["gen"]}, echo=False)
     return want
 
 
@@ -896,7 +905,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                     continue
             # the backlog's own passes only: a verso the window has not asked for yet is not one
             if _next_job(c0, lo, 0, bool(st_.get("verso_on")) and c0.done("verso", lo), out,
-                         rungs=frungs, regen=rg, teachers=teachers) is None:
+                         rungs=frungs, regen=rg, teachers=teachers) in (None, "fields"):   # the fields read no CT
                 backlog_keys.discard(lo)
                 if lo in keys:
                     cache.release(keys.pop(lo))
@@ -995,11 +1004,14 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                  gen=int(attrs.get("gen", 0)))
             jlog(out, "produce", {"kind": kind, "region": list(lo), "round": round_,
                                   "s": round(time.time() - t0, 2), **(extra or {})})
-            # a reteach of a region without a verso has no fields to rebuild: its recto + rw are
-            # committed now; with a verso, the fields are rebuilt from the new recto and commit it
-            reteach_fields = kind == "reteach" and stores.store_gen(out, "verso", lo, round_) >= 0
-            if kind == "reteach" and not reteach_fields:
+            # a reteach's recto + rw are committed for every reader NOW (`commit_sources`); the fields
+            # rebuilt from them follow on their own. A window / held-out region's rebuild is chained
+            # like a verso's; a backlog region's is fed by `_recto_backlog`, a few at a time, so the
+            # backlog never queues hundreds of ~90 s fields jobs ahead of the window's own
+            if kind == "reteach":
                 commit_sources(out, lo, round_, frungs)
+            reteach_fields = kind == "reteach" and lo not in backlog_keys and \
+                stores.store_gen(out, "verso", lo, round_) >= 0
             # the unit that makes a region's fields possible hands it straight to the fields pool
             # (still busy): waiting for the GPU loop's next pass over the window left the fields
             # of every verso region undone until a whole window of ~1 min verso passes had run
@@ -1646,8 +1658,7 @@ def recto_needs_regen(out, lo, teachers):
 
 def recto_stale(out, lo, teachers):
     """READER side: does the region's COMMITTED round-0 recto come from another teacher set? True
-    until the regenerated recto (and, where the region has a verso, the fields rebuilt from it) is
-    committed: the count `recto_regen` lines report."""
+    until the regenerated recto + rw are committed (at once after the reteach, `commit_sources`)."""
     from rvsm import stores
     if not teachers:
         return False
@@ -1655,10 +1666,21 @@ def recto_stale(out, lo, teachers):
     return stores.is_done(p) and sorted(store_teachers(p)) != sorted(str(t) for t in teachers)
 
 
+def fields_behind(out, lo):
+    """Is the region's committed recto newer than its committed fields (a reteach whose fields
+    rebuild has not landed yet)? Fields built from a recto sit at a generation >= that recto's
+    (`targets.field_gen`), so committed recto > committed fields means they came from an older one.
+    Only a region with a verso has fields."""
+    from rvsm import stores
+    b = stores.bundle_state(out, lo, 0)
+    return b["recto"] > b["gen"] and stores.store_gen(out, "verso", lo, 0) >= 0
+
+
 def recto_regen_todo(out, route, held, teachers):
-    """Every produced round-0 region whose committed recto is stale (`recto_stale`), in priority order:
-    the held-out regions first (the evaluation reference), then walk order, then any other produced
-    region (none, normally)."""
+    """Every produced round-0 region the recto regeneration still owes something: a stale committed
+    recto (`recto_stale`) or fields not yet rebuilt from the new one (`fields_behind`), in priority
+    order: the held-out regions first (the evaluation reference), then walk order, then any other
+    produced region (none, normally)."""
     from rvsm import regions as RG
     if not teachers:
         return []
@@ -1668,11 +1690,12 @@ def recto_regen_todo(out, route, held, teachers):
         rank.setdefault(tuple(int(v) for v in h["lo"]), (0, i))
     for i, lo in enumerate(route or ()):
         rank.setdefault(tuple(int(v) for v in lo), (1, i))
-    stale = [lo for lo in done if recto_stale(out, lo, teachers)]
-    return sorted(stale, key=lambda lo: rank.get(lo, (2, 0)))
+    todo = [lo for lo in done if recto_stale(out, lo, teachers) or fields_behind(out, lo)]
+    return sorted(todo, key=lambda lo: rank.get(lo, (2, 0)))
 
 
 RECTO_TODO_S = 300.0     # the recto regeneration's work list is rescanned (and logged) this often
+RECTO_FIELDS_INFLIGHT = 1   # backlog fields rebuilds queued at once (the window's own fields go first)
 
 
 def _recto_backlog(out, rr, route, held, teachers, cat, verso_on, rungs, busy, lock, skip_until, sized,
@@ -1680,12 +1703,14 @@ def _recto_backlog(out, rr, route, held, teachers, cat, verso_on, rungs, busy, l
     """One idle step of the recto regeneration (the producer calls it when the window has no GPU unit).
 
     `rr` is the producer's state: the work list (`recto_regen_todo`, rescanned every RECTO_TODO_S),
-    and the last count logged. Walks the list in priority order: a region that is no longer stale is
-    dropped, a region with nothing left to run is committed (`commit_sources`: a restart cut its
-    commit off), a `fields` job goes to the fields pool (`submit_fields`, the region marked busy),
-    and the first GPU job (the `reteach`, or a verso regeneration's own pass) is appended to
-    `gpu_units` -- one per call, like the verso backlog. Logs `recto_regen` (remaining count) at every
-    rescan while work remains and `recto_regen_done` once when it reaches zero. Returns the count."""
+    the backlog fields in flight and the last count logged. Walks the list in priority order: a region
+    that owes nothing more is dropped, a region with nothing left to run is committed
+    (`commit_sources`: a restart cut its commit off), a `fields` job goes to the fields pool
+    (`submit_fields`, the region marked busy) while fewer than RECTO_FIELDS_INFLIGHT backlog fields are
+    in flight, and the first GPU job (the `reteach`, or a verso regeneration's own pass) is appended to
+    `gpu_units` -- one per call, like the verso backlog. Logs `recto_regen` (stale rectos remaining,
+    fields rebuilds remaining) at every rescan while work remains and `recto_regen_done` once when both
+    reach zero. Returns the regions still owed something."""
     now = time.time() if now is None else now
     if not teachers:
         return 0
@@ -1695,11 +1720,17 @@ def _recto_backlog(out, rr, route, held, teachers, cat, verso_on, rungs, busy, l
         n, last = len(rr["todo"]), rr.get("n")
         if n:
             held_set = {tuple(int(v) for v in h["lo"]) for h in (held or ())}
-            jlog(out, "produce", {"kind": "recto_regen", "remaining": n, "teachers": list(teachers),
-                                  "heldout_remaining": sum(1 for lo in rr["todo"] if lo in held_set)})
+            st = [lo for lo in rr["todo"] if recto_stale(out, lo, teachers)]
+            jlog(out, "produce", {"kind": "recto_regen", "remaining": len(st),
+                                  "fields_remaining": sum(1 for lo in rr["todo"] if fields_behind(out, lo)),
+                                  "teachers": list(teachers),
+                                  "heldout_remaining": sum(1 for lo in st if lo in held_set)})
         elif last:
             jlog(out, "produce", {"kind": "recto_regen_done", "teachers": list(teachers)})
         rr["n"] = n
+    with lock:
+        infl = {lo for lo in rr.get("fields", ()) if lo in busy}
+    rr["fields"] = infl
     keep = []
     picked = False
     for lo in rr["todo"]:
@@ -1710,7 +1741,8 @@ def _recto_backlog(out, rr, route, held, teachers, cat, verso_on, rungs, busy, l
             if lo in busy:
                 keep.append(lo)
                 continue
-        if not recto_stale(out, lo, teachers):
+        stale = recto_stale(out, lo, teachers)
+        if not stale and not fields_behind(out, lo):
             continue
         keep.append(lo)
         if not sized(lo) or skip_until.get(lo, 0.0) > now:
@@ -1720,12 +1752,15 @@ def _recto_backlog(out, rr, route, held, teachers, cat, verso_on, rungs, busy, l
                         regen=read_state(out).get("verso_regen"), teachers=teachers)
         if job is None:
             commit_sources(out, lo, 0, rungs)
-            if not recto_stale(out, lo, teachers):
+            if not recto_stale(out, lo, teachers) and not fields_behind(out, lo):
                 keep.pop()
         elif job == "fields":
+            if len(infl) >= RECTO_FIELDS_INFLIGHT:
+                continue
             with lock:
                 busy.add(lo)
                 submit_fields(lo)
+            infl.add(lo)
             backlog_keys.add(lo)
         elif job != "teacher":
             gpu_units.append((lo, job))

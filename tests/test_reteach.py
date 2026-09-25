@@ -68,26 +68,30 @@ def test_a_fused_recto_is_regenerated_as_the_next_generation(tmp_path):
     r1 = stores.gen_path(stores.store_path(out, "recto", lo, 0), 1)
     w1 = stores.gen_path(stores.store_path(out, "rw", lo, 0), 1)
     _fake_store(r1, teachers=["m7"], gen=1, regeneration=True)
-    # the recto alone (the unit was cut before its rw): still to do
+    # the recto alone (the unit was cut before its rw): still to do, and never committed half-written
     assert RUN._next_job(cat, lo, 0, True, out, teachers=["m7"]) == "reteach"
+    assert RUN.commit_sources(out, lo, 0) is None
+    assert cat.path("recto", lo) == stores.store_path(out, "recto", lo, 0)
     _fake_store(w1, teachers=["m7"], gen=1)
-    # the old pair stays in place and readable; the fields are rebuilt at generation 1 first
+    # the pair is committed AT ONCE; the old pair stays on disk; the fields follow at generation 1
     assert stores.is_done(stores.store_path(out, "recto", lo, 0))
     assert TG.field_path(out, "midline", 2, lo, 0).endswith(".g1.zarr")
+    assert RUN.commit_sources(out, lo, 0) == {"gen": 0, "verso": 0, "recto": 1}
+    assert cat.path("recto", lo) == r1 and cat.path("rw", lo) == w1
+    assert cat.path("midline", lo) == stores.store_path(out, "midline", lo, 0)   # the old fields, meanwhile
+    assert not RUN.recto_stale(out, lo, ["m7"]) and RUN.fields_behind(out, lo)
     assert RUN._next_job(cat, lo, 0, True, out, teachers=["m7"]) == "fields"
-    assert RUN.commit_sources(out, lo, 0) is None, "no commit before the fields are current"
-    assert cat.path("recto", lo) == stores.store_path(out, "recto", lo, 0)
-    assert cat.path("rw", lo) == stores.store_path(out, "rw", lo, 0)
-    assert RUN.recto_stale(out, lo, ["m7"])
     _fields(out, lo, 1)
     assert RUN._next_job(cat, lo, 0, True, out, teachers=["m7"]) is None
     assert RUN.commit_sources(out, lo, 0) == {"gen": 1, "verso": 0, "recto": 1}
     assert RUN.commit_sources(out, lo, 0) is None                       # idempotent
     c2 = RG.Catalog(out, 0, ttl=0.0)
-    assert c2.path("recto", lo) == r1 and c2.path("rw", lo) == w1       # readers move to the new pair
+    assert c2.path("recto", lo) == r1 and c2.path("rw", lo) == w1
     assert c2.path("verso", lo) == stores.store_path(out, "verso", lo, 0)   # ... the verso stays
     assert c2.path("midline", lo).endswith(".g1.zarr")                   # ... with fields built from both
-    assert not RUN.recto_stale(out, lo, ["m7"])
+    assert not RUN.recto_stale(out, lo, ["m7"]) and not RUN.fields_behind(out, lo)
+    kinds = [r["kind"] for r in RUN.tail_jsonl(os.path.join(out, "logs", "produce.jsonl"), 20)]
+    assert kinds == ["recto_commit", "fields_commit"]
     assert stores.is_done(stores.store_path(out, "recto", lo, 0)), "generation 0 is never touched"
 
     # a later verso regeneration takes the NEXT free generation of the region, never the recto's
@@ -99,6 +103,7 @@ def test_a_fused_recto_is_regenerated_as_the_next_generation(tmp_path):
     assert stores.store_gen(out, "verso", lo, 0) == 2                   # a gap at g1 is fine
     assert TG.field_path(out, "thickness", 3, lo, 0).endswith(".g2.zarr")
     assert RUN._next_job(c2, lo, 0, True, out, regen=regen, teachers=["m7"]) == "fields"
+    assert RUN.commit_sources(out, lo, 0) is None, "a new verso never moves without its fields"
     _fields(out, lo, 2)
     assert RUN.commit_sources(out, lo, 0) == {"gen": 2, "verso": 2, "recto": 1}
     c3 = RG.Catalog(out, 0, ttl=0.0)
@@ -207,6 +212,52 @@ def test_the_loader_and_the_eval_grid_follow_the_committed_recto(synth_run, tmp_
     g1 = sample.val_grid(synth_run.cfg, held, spill=str(d), **kw)
     assert g1.rebuilt == len(g1) and g1.reused == 0               # the region's items were rebuilt
     assert len(g0) == len(g1)
+
+
+def test_a_reteach_switches_the_recto_at_once_and_the_fields_when_they_land(synth_run):
+    """After a reteach with its fields rebuild still pending the loader reads the NEW recto + rw and the
+    OLD fields (and the grid key moves); once the fields land they are committed on their own and the
+    loader reads the new ones (and the grid key moves again)."""
+    root = synth_run.root
+    held = [r for r in synth_run.regions if r["k"] == 2][:1]
+    lo = tuple(int(v) for v in held[0]["lo"])
+
+    def patches():
+        RG.clear_pool()
+        ds = sample.Patches(synth_run.cfg, root=root, ct=synth_run.cfg.ct, ax=synth_run.ax,
+                            region_records=synth_run.regions)
+        ds._open()
+        return ds
+    ds = patches()
+    src0 = sample.grid_sources(ds, held)
+    old_rec = np.asarray(stores.open_store(stores.store_path(root, "recto", lo, 0))[:])
+    old_mid = np.asarray(stores.open_store(stores.store_path(root, "midline", lo, 0))[:])
+    new_rec = np.where(old_rec > 0, np.uint8(90), np.uint8(0))
+    g = stores.next_gen(root, lo, 0)
+    for ch, blk in (("recto", new_rec), ("rw", np.full(new_rec.shape, 77, np.uint8))):
+        stores.write(stores.gen_path(stores.store_path(root, ch, lo, 0), g), blk, lo, rung=2,
+                     channels=(ch,), q=8, attrs={"teachers": ["m7"], "gen": g})
+    assert RUN.commit_sources(root, lo, 0, rungs=(2,)) == {"gen": 0, "verso": 0, "recto": g}
+    ds = patches()
+    src1 = sample.grid_sources(ds, held)
+    assert src1 != src0
+    w = (32, 32, 32)
+    assert np.array_equal(ds._source("recto", 2, lo, w)[0], new_rec[:32, :32, :32])
+    assert (ds._source("rw", 2, lo, w)[0] == 77).all()
+    assert np.array_equal(ds._source("midline", 2, lo, w)[0], old_mid[:32, :32, :32])   # old fields
+    assert RUN.fields_behind(root, lo)
+    new_mid = np.where(old_mid > 0, np.uint8(140), np.uint8(0))
+    for kind in TG.KINDS:
+        stores.write(stores.gen_path(stores.store_path(root, kind, lo, 0), g), new_mid, lo, rung=2,
+                     channels=(kind,), q=0)
+    assert RUN.commit_sources(root, lo, 0, rungs=(2,)) == {"gen": g, "verso": 0, "recto": g}
+    ds = patches()
+    assert sample.grid_sources(ds, held) not in (src0, src1)
+    assert np.array_equal(ds._source("midline", 2, lo, w)[0], new_mid[:32, :32, :32])
+    assert np.array_equal(ds._source("recto", 2, lo, w)[0], new_rec[:32, :32, :32])
+    assert not RUN.fields_behind(root, lo)
+    kinds = [r["kind"] for r in RUN.tail_jsonl(os.path.join(root, "logs", "produce.jsonl"), 20)]
+    assert kinds == ["recto_commit", "fields_commit"]
 
 
 def test_a_reteach_refeeds_the_coarse_rungs_once_per_generation(tmp_path, has_volcomp):
