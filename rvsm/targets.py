@@ -744,7 +744,23 @@ def _pair_kernels():
                     inv = inv | (a_ & vv)
                 tl.store(REASON + s, tl.full([BLOCK], C_CROSS, tl.uint8), mask=act & hit)
 
-            _PAIR_K = (_rec, _normal, _walk)
+            @triton.jit
+            def _counts(R, C, CNT, V, NR: tl.constexpr, BLOCK: tl.constexpr):
+                # the support row of volume b over its core voxels: voxels, reasons 1..NR-1, valid
+                # (reason 0); one reduced atomic add per value and program (integer sums: any order)
+                b = tl.program_id(1)
+                offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+                ok = offs < V
+                base = b.to(tl.int64) * V
+                c = (tl.load(C + base + offs, mask=ok, other=0) != 0) & ok
+                r = tl.load(R + base + offs, mask=ok, other=0).to(tl.int32)
+                row = CNT + b * (NR + 1)
+                tl.atomic_add(row, tl.sum(c.to(tl.int64)))
+                for q in tl.static_range(1, NR):
+                    tl.atomic_add(row + q, tl.sum((c & (r == q)).to(tl.int64)))
+                tl.atomic_add(row + NR, tl.sum((c & (r == 0)).to(tl.int64)))
+
+            _PAIR_K = (_rec, _normal, _walk, _counts)
         except Exception:  # noqa: BLE001
             _PAIR_K = False
     return _PAIR_K
@@ -955,6 +971,14 @@ def _stage_c(S, core, dev, drop=False):
     fail(full & ((gn < GRAD[0]) | (gn > GRAD[1])), "gradient")
     del gn, full, pair
     valid = (reason == 0) & core
+    k = _pair_kernels() if (dev.type == "cuda" and PAIR_FUSED) else False
+    if k:
+        # the counts in one kernel: a scatter-add of every voxel onto ten bins was 4.7 ms of atomics
+        counts = torch.zeros((B, NCOUNT), dtype=torch.int64, device=dev)
+        V = shape[1] * shape[2] * shape[3]
+        k[3][(-(-V // 4096), B)](reason, core.contiguous().view(torch.uint8), counts, V, NR=NCOUNT - 1,
+                                 BLOCK=4096)
+        return torch.where(valid, m, zero), torch.where(valid, t, zero), valid, counts
     bidx = torch.arange(B, device=dev, dtype=torch.int64).view(B, 1, 1, 1)
     nr = NCOUNT - 1                                # reason codes 0..9
     cnt = torch.zeros(B * nr + 1, dtype=torch.int64, device=dev)      # a scatter, not a (syncing) bincount
