@@ -709,13 +709,14 @@ def volume_params(v, stride, plan):
     w = int(rt.deserialize_cuda_engine(open(plan, "rb").read()).get_tensor_shape("x")[-1])
     rec = {"window": w, "stride": int(stride), "plan": plan, "t": time.time()}
     os.makedirs(state_dir(v), exist_ok=True)
-    with open(p + ".tmp", "w") as f:
+    tmp = f"{p}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(rec, f)
     try:
-        os.link(p + ".tmp", p)          # first writer wins
+        os.link(tmp, p)                 # first writer wins
     except FileExistsError:
         pass
-    os.remove(p + ".tmp")
+    os.remove(tmp)
     return json.load(open(p))
 
 
