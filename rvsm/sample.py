@@ -1151,6 +1151,39 @@ class DiskGrid:
         return prefetched(list(self.paths), _load_item, self.ahead)
 
 
+EVAL_MARKER = ".evaluating"      # in a grid directory while an evaluation reads it (`mark_evaluating`)
+
+
+def mark_evaluating(grid, step=None):
+    """Write `<grid dir>/.evaluating` ({pid, host, step, t}) for every directory a DiskGrid's items live
+    in, so a maintenance tool (`rvsm.grid_repack`) can wait for the evaluation to end; returns the
+    marker paths for `unmark_evaluating`. A list grid has no directory and gets none. Never raises."""
+    import json
+    import os
+    import socket
+    import time
+    out = []
+    for d in sorted({os.path.dirname(p) for p in (getattr(grid, "paths", None) or [])}):
+        m = os.path.join(d, EVAL_MARKER)
+        try:
+            with open(m, "w") as f:
+                json.dump({"pid": os.getpid(), "host": socket.gethostname(), "step": step,
+                           "t": round(time.time(), 1)}, f)
+            out.append(m)
+        except OSError:
+            pass
+    return out
+
+
+def unmark_evaluating(marks):
+    import os
+    for m in marks or ():
+        try:
+            os.remove(m)
+        except OSError:
+            pass
+
+
 def prefetched(xs, fn, ahead=2):
     """`fn(x)` for every x, in order, with up to `ahead` of the next results computed on `ahead`
     background threads while the caller holds the current one. A consumer that stops early cancels the

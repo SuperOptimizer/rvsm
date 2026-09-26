@@ -17,10 +17,11 @@ USAGE = """rvsm <command> [options]
   ladder     cfg.toml --sizes 15m,30m6,60m
   status | stop | ledger --rebuild | umbilicus --ct URL --out umbilicus.json
   teachers   fetch [recto,m7] [--cache DIR] [--extras]
+  grid-repack DIR [DIR ...] [--jobs N] [--dry-run] [--force] [--wait S]   (rvsm/grid_repack.py)
 """
 
 COMMANDS = ("run", "produce", "train", "eval", "export", "calibrate", "pretrain", "ladder",
-            "status", "stop", "ledger", "umbilicus", "teachers", "verso")
+            "status", "stop", "ledger", "umbilicus", "teachers", "verso", "grid-repack")
 
 
 def _stack_dumps():
@@ -40,7 +41,7 @@ def main(argv=None):
     if argv and argv[0] in COMMANDS:
         # A subcommand is implemented as a module-level function of the same name, appended below as the
         # commit that owns it lands; the rest still print the usage and say so.
-        fn = globals().get(argv[0])
+        fn = globals().get(argv[0].replace("-", "_"))
         if callable(fn):
             return int(fn(argv[1:]) or 0)
         print(USAGE, end="")
@@ -1157,6 +1158,12 @@ def verso(argv):
     held = RUN.verso_hold(out, argv[0] == "hold", why=" ".join(f.get("why") or ["manual"]))
     print(f"rvsm verso: {'HELD' if held else 'released'} ({os.path.join(out, RUN.VERSO_HOLD_FILE)})")
     return 0
+
+
+def grid_repack(argv):
+    """`rvsm grid-repack`: the grid items' pickle protocol 2 -> 4, in place (`rvsm.grid_repack`)."""
+    from rvsm import grid_repack as GR
+    return GR.main(argv)
 
 
 if __name__ == "__main__":       # kept LAST: `main` dispatches on the functions defined above it

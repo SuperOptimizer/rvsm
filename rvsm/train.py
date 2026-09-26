@@ -1414,19 +1414,24 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         cost = {}
         cap = PanelCapture(layout, _verso_on(out / "eval" / "val.png"), panels=panels.get("p"),
                            region=int(cfg.region))
-        rec = {"step": step, **evaluate(evfwd, grid, dev, layout, cascade=casval, calib_keep=kept,
-                                        cost=cost, capture=cap)}
-        if casmask is not None:
-            # the same fine windows with the MASK cascade source (the pooled target, no noise): the
-            # trajectory of what the model does with a good coarse prediction, beside the self-cascade
-            # one the gates read. A leak by construction, so an upper bracket, never a gate input.
-            tm = time.time()
-            mk = evaluate(evfwd, grid, dev, layout, cascade=casmask, rungs=FINE_RUNGS, band=False)
-            rec.update({"dice_mask": mk["dice"], "bce_mask": mk["bce"],
-                        "dice_best_mask": mk.get("dice_best"),
-                        **{f"dice_mask_r{k}": mk[f"dice_r{k}"] for k in FINE_RUNGS
-                           if f"dice_r{k}" in mk}})
-            rec["mask_s"] = round(time.time() - tm, 1)
+        from rvsm import sample as _S    # `.evaluating` in the grid dir: `rvsm.grid_repack` waits on it
+        marks = _S.mark_evaluating(grid, step)
+        try:
+            rec = {"step": step, **evaluate(evfwd, grid, dev, layout, cascade=casval, calib_keep=kept,
+                                            cost=cost, capture=cap)}
+            if casmask is not None:
+                # the same fine windows with the MASK cascade source (the pooled target, no noise): the
+                # trajectory of what the model does with a good coarse prediction, beside the self-cascade
+                # one the gates read. A leak by construction, so an upper bracket, never a gate input.
+                tm = time.time()
+                mk = evaluate(evfwd, grid, dev, layout, cascade=casmask, rungs=FINE_RUNGS, band=False)
+                rec.update({"dice_mask": mk["dice"], "bce_mask": mk["bce"],
+                            "dice_best_mask": mk.get("dice_best"),
+                            **{f"dice_mask_r{k}": mk[f"dice_r{k}"] for k in FINE_RUNGS
+                               if f"dice_r{k}" in mk}})
+                rec["mask_s"] = round(time.time() - tm, 1)
+        finally:
+            _S.unmark_evaluating(marks)
         t_ev = time.time() - te
         # the PNGs: drawn from the evaluation's own forwards (`PanelCapture`) and rendered on a
         # background thread (`_PngWorker`). `val_png` is now only the hand-off (plus the wait for the
