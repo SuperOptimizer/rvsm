@@ -148,6 +148,66 @@ model step's 14.5 s -- CPU `max_pool3d` is slow, so both look larger there than 
 for `loss_skel`; the precision term is 8 differentiable 3^3 pools plus 2 for the band and the known
 mask, the recall 5 plus the known mask, so expect it in the same range on the card.
 
+### Thinned band target (`thin_band`, `thin_band_width`, `thin_band_soft`)
+
+Off by default (`thin_band = 0`: the targets are bit-identical to before; the code is not entered).
+In an m7-only run the rung-2 recto target is m7's 9.6 µm output upsampled 4x: a soft band 4-8 voxels
+wide. BCE / dice pull the student toward that blur while the thin-sheet terms (`loss_skel`,
+`loss_skel_prec`, the constructed pair, exclusivity, the thickness head) pull it toward a sharp sheet, and
+the two fight: paris4's rung-2 scores were flat. The thinned band is **a fittable sharp target that
+carries m7's continuity**: every sheet m7 found, including the ones the 2.4 µm teacher misses, but as a
+sheet the student can actually draw.
+
+**Definition** (`losses.thin_band`, `losses.thin_apply`; computed in the trainer right after the
+augmentation, on the device, for every rung-2 sample of every step; nothing is cached across steps and
+no store changes). With `t` the recto target probability after the augmentation, `B = t >= 0.5`, `M` the
+medial surface of `B` (`targets.medial_torch`, exact Euclidean EDT -- the same code path as the
+evaluation's `dice_recto_r*_thin`), `d` the exact Euclidean distance to `M` (`edt.edt2`), `w =
+thin_band_width` (4) and `s = thin_band_soft` (1):
+
+- target `t' = clamp(1 - (d - w/2 + s)/s, 0, 1)` inside `B` (1 within `w/2 - s` of `M`, fading to 0 at
+  `w/2`), `t' = 0` outside `B`;
+- weight: inside `B` with `t' = 0` (the band's flanks) **0** -- not punished either way; on the thinned
+  sheet the loader's weight; outside `B` the loader's weight (background supervision as before); a
+  weight that was 0 (unknown) stays 0.
+
+It replaces the recto ROW, so every term reading that row sees it: BCE, dice (`loss_prob_dice`), the
+constructed pair's BCE / dice, ECT, skeleton recall / precision, affinity. The skeleton of the thinned
+sheet is the band's medial surface, i.e. the same skeleton the recall term had. **Rungs >= 3 are
+unchanged** (there the band is 1-2 voxels wide already; a rung-3 variant at half the width was not
+added). **The distance heads keep their own targets**, and that is consistent rather than a conflict:
+the `midline` / `thickness` fields (§6 "Distance-field targets") are already built from the medial
+surfaces of the stored recto and verso bands, so their zero level IS `M`; the thinned sheet is centred on
+the same surface. They do not exist without a verso (paris4 under `VERSO_HOLD` has none, so the pair and
+distance terms are off there anyway).
+
+**With routing** (`teacher_route`, §7): only the GAP changes. There (`c_A = 0` inside the dilated base
+band) the thinned base band `(thin(tb), w · keep)` becomes a DIRECT BCE / dice target where the routing
+alone had none; the skeleton recall from the band and the band penalty are as before; `c_A = 1` voxels
+(the fine teacher's own sharp faces) and the `outside` zone keep exactly the routing's targets. An
+unrouted voxel of a rung-2 sample (a region the regeneration has not reached; its recto is still m7's
+band) gets the standalone thinning.
+
+**Placement.** The thinned sheet sits at the middle of m7's band, which is m7's coarse estimate of the
+face: ±2-4 rung-2 voxels from the true one. The thinning makes the target sharp, not more accurate;
+routing is what fixes the placement where the 2.4 µm teacher is confident, and the two combine (thin
+m7 sheets in the gaps, the fine teacher's faces where it is sure).
+
+**Logging and switching.** Every train row at a rung-2 sample logs `thin_zero`, the share of the recto
+weight the thinning zeroed (the flanks). The three fields are fingerprint-excluded and in
+`LOSS_SWITCH_FIELDS`, so a resume may switch it on (a `loss_switch` sched line). The evaluation is
+unchanged: the reference stays the raw band, and `dice_recto_r2_thin` / `recall_recto_r2_band` /
+`precision_recto_r2_band` already score a thin student against it.
+
+**Cost** (RTX 5080 laptop, a synthetic m7-like band: wavy sheets every 22 voxels, 5-8 voxels wide,
+soft edges, 30 % of the volume; `/home/forrest/rvsm_bench/thin/`): `thin_band` on one 256³ sample
+is **9.4 ms** median (medial EDT + distance EDT, 0.59 GB peak), on one 160³ sample 1.6 ms. A whole
+30m6 step at 160³ (the largest patch that fits the 16 GB card; accum 2, both microbatches rung 2) was
+1.094 s off and 1.021 s on -- the difference is inside the run-to-run noise (the host was also running
+the CPU test suite). Against tnr-0's ~0.35 s per 256³ microbatch the 9.4 ms would be ~2.7 % if the A100
+were no faster at the EDT than the 5080; it is only paid on rung-2 samples. The exact EDT is used, not
+an erosion approximation.
+
 ### The one deliberate deviation from §29.9
 
 §29.9's `u5` flag set **excludes** `--loss-ect`, for attributability: it is experiment 7, a separate arm,
@@ -469,7 +529,8 @@ loss_band = 0.1        # optional; 0 = the band penalty off (the gap-fill masks 
     Deliberate deviation from "every voxel outside the band": a `c_A = 1` face the fine teacher sees and
     m7 does not is NOT penalised -- it is a direct BCE target there and the two terms would fight.
   Every train row logs `route_vox` (the routed share of the batch), `route_ca`, `route_gap`, `route_out`
-  (shares of the routed voxels) and `band`. Rungs 3-4 are unchanged (m7 targets).
+  (shares of the routed voxels) and `band`. Rungs 3-4 are unchanged (m7 targets). With `thin_band = 1`
+  the gap gets a direct target after all: the THINNED base band (§6 "Thinned band target").
 - **Evaluation.** Unchanged code, the committed generations as the reference: the held-out grid's
   `grid_sources` see the new recto / rw / band digests and rebuild exactly the held-out regions' items as
   their regeneration commits (a routed grid also carries the route in `grid_global`); `heldout_rows` /

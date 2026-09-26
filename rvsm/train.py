@@ -1356,12 +1356,23 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         ovE = tgw[:, 2 * nt:] if ovE is not None else None
         # ---- per-rung teacher ROUTING (`config.route_spec`): the routing row leaves the batch here, and
         # at a routed rung-2 sample the recto target / weight become the gap-fill ones (`losses.route_*`)
-        w_cont, route_m = None, None
+        w_cont, route_m, tb = None, None, None
+        orig0 = (tg[:, :1], wt[:, :1])
         if nt > layout.cout_t:
             tb, wb = tg[:, layout.cout_t:layout.cout_t + 1], wt[:, layout.cout_t:layout.cout_t + 1]
             tg, wt = tg[:, :layout.cout_t], wt[:, :layout.cout_t]
             route_m = L.route_masks(tb, wb, dilate=int(cfg.band_dilate))
             tg, wt, w_cont = L.route_apply(tg, wt, tb, route_m)
+        # ---- the THINNED-BAND target (`thin_band`, docs/recipe.md §6): at rung 2 the recto row's wide
+        # m7 band becomes a `thin_band_width`-voxel sheet about its medial surface, the band's flanks
+        # weight 0; under routing only the gap (and unrouted voxels) -- computed here, on the device
+        thin_sel = [i for i, k in enumerate(ks) if k == 2] if int(cfg.thin_band) else []
+        if thin_sel:
+            w_pre = wt[thin_sel, :1] > 0
+            tg, wt = L.thin_apply(tg, wt, thin_sel, width=float(cfg.thin_band_width),
+                                  soft=float(cfg.thin_band_soft), orig=orig0, tb=tb, m=route_m)
+            thin_zero = float((w_pre & (wt[thin_sel, :1] <= 0)).sum() / w_pre.sum().clamp_min(1))
+        del orig0
         ct = ct.to(memory_format=M.memfmt())
         ph.mark("aug")
         nvox += int(np.prod(ct.shape[2:])) * ct.shape[0]
@@ -1399,6 +1410,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         # geometry nobody measured and competed with the recto head in round 0.
         paired = (wd > 0).to(wt.dtype)
         reg_extra = {"pair_support": float(paired.mean())}
+        if thin_sel:
+            reg_extra["thin_zero"] = thin_zero      # share of the rung-2 recto weight the thinning zeroed
         if layout.nprob >= 2:
             lr_, lv_ = L.pair_logits(d, th, half=cfg.pair_band, tau=cfg.pair_tau)
             pb_, pd_ = pair_terms(lr_, lv_, tg[:, :2], wt[:, :2], paired)

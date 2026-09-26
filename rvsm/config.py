@@ -192,11 +192,15 @@ FINGERPRINT_EXCLUDE = ("infer_margin", "steps", "eval_every", "workers", "gpus",
                        # m7 switch, a change of the recto target SOURCE that the producer's regeneration
                        # handles (a routed store records `route`, `run.recto_needs_regen` compares it); the
                        # resume logs a `teacher_switch` sched line. The gap-fill loss knobs go with it
-                       "teacher_route", "loss_band", "band_dilate", "band_eps")
+                       "teacher_route", "loss_band", "band_dilate", "band_eps",
+                       # the THINNED-BAND rung-2 target (docs/recipe.md §6): computed on the device at step
+                       # time from the stored recto, switched on at a resume (`loss_switch` line)
+                       "thin_band", "thin_band_width", "thin_band_soft")
 
 # The loss weights a resume may retune (`run.log_switches` logs a `loss_switch` line when one moved).
 LOSS_SWITCH_FIELDS = ("loss_prob_dice", "loss_pair", "loss_skel", "loss_affinity", "loss_ect",
-                      "loss_selfcons", "loss_skel_prec", "loss_overlap", "loss_band", "band_dilate", "band_eps")
+                      "loss_selfcons", "loss_skel_prec", "loss_overlap", "loss_band", "band_dilate", "band_eps",
+                      "thin_band", "thin_band_width", "thin_band_soft")
 
 # The per-rung teacher routing (`Config.teacher_route`). ONE fine teacher may own the recto targets of
 # rung 2 (`ROUTE_FINE_RUNGS`: the only rung the sampler and the producer know how to route); every other
@@ -355,6 +359,10 @@ class Config:
                                        # is not confident (`losses.band_penalty`); 0 = off
     band_dilate: int = 2               # the base band's dilation radius at the routed rung, in voxels
     band_eps: float = 0.05             # the band penalty's free margin
+    thin_band: int = 0                 # 1: the rung-2 recto target is the THINNED band (`losses.thin_band`):
+                                       # a sheet about the m7 band's medial surface, the band's flanks weight 0
+    thin_band_width: float = 4.0       # the thinned sheet's full width, in rung-2 voxels
+    thin_band_soft: float = 1.0        # its linear fade at the edge, in voxels
 
     # ------------------------------------------------------------------ fixed recipe: rounds + inference
     verso_source: str = "flip"         # verso stores come from the student run with the radial sign flipped

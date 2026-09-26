@@ -452,6 +452,68 @@ def band_penalty(p, outside, w=None, eps=0.05):
     return ((p - float(eps)).clamp_min(0) ** 2 * m).sum() / m.sum().clamp_min(1e-6)
 
 
+# ================================================================ the thinned-band target (rung 2)
+
+THIN_MEDIAL_CAP = 16   # `targets.medial_torch`'s capped EDT (exact: it re-runs uncapped past it)
+
+
+def thin_band(t, width=4.0, soft=1.0, thr=0.5):
+    """(t', keep): the THINNED version of a wide soft band target `t` (B, 1, Z, Y, X), computed on the
+    target's device from nothing but `t` (nothing is cached between steps).
+
+    B = t >= thr, M = its medial surface (`targets.medial_torch`: exact Euclidean EDT, the same code
+    path as the evaluation's `dice_recto_r*_thin`), d = the exact Euclidean distance to M (`edt.edt2`,
+    capped at the sheet's reach), and inside B
+
+        t' = clamp(1 - (d - width/2 + soft) / soft, 0, 1)
+
+    i.e. 1 within width/2 - soft of M, fading linearly to 0 at width/2; t' = 0 outside B. `keep` is the
+    weight multiplier: 0 inside B beyond the thinned sheet (t' == 0 there: the band's coarse flanks are
+    not punished either way), 1 on the sheet and everywhere outside B (background supervision as
+    before). A sample with an empty band has t' = 0 and keep = 1."""
+    from rvsm import edt as E
+    from rvsm.targets import medial_torch
+    half, soft = float(width) / 2.0, max(float(soft), 1e-6)
+    b = t[:, 0] >= float(thr)
+    m = medial_torch(b, cap=THIN_MEDIAL_CAP)
+    d2, _ = E.edt2(m, indices=False, cap=math.ceil(half) + 1)
+    d = torch.sqrt(d2)                                   # +inf beyond the cap and for an empty M
+    bf = b.to(t.dtype)
+    tt = (1.0 - (d - half + soft) / soft).clamp(0.0, 1.0).nan_to_num(0.0).to(t.dtype) * bf
+    keep = 1.0 - bf * (tt <= 0).to(t.dtype)
+    return tt.unsqueeze(1), keep.unsqueeze(1)
+
+
+def thin_apply(tgt, wv, sel, width=4.0, soft=1.0, orig=None, tb=None, m=None):
+    """(tgt, wv) with the recto row's target / weight THINNED (`thin_band`) on the samples `sel` (a
+    list of batch indices: the rung-2 samples). Other rows and other samples are untouched.
+
+    Without routing (`m` None): the recto row becomes (t', w * keep), t' thinned from the recto target
+    itself. With routing (the `route_masks` `m`, the routing row's probability `tb`, and `orig` = the
+    recto row's (target, weight) BEFORE `route_apply`): the GAP voxels (c_A = 0 inside the dilated base
+    band) get (thin(tb), w_orig * keep) as a DIRECT target where route_apply left none; UNROUTED voxels
+    (a region the regeneration has not reached: its rung-2 recto is still the base teacher's) get the
+    standalone thinning of their own recto; c_A = 1 and `outside` voxels keep what route_apply gave."""
+    if not sel:
+        return tgt, wv
+    idx = torch.as_tensor(sel, device=tgt.device)
+    t0, w0 = tgt[idx, :1], wv[idx, :1]
+    if m is None:
+        tt, kp = thin_band(t0, width, soft)
+        t1, w1 = tt, w0 * kp
+    else:
+        to, wo = orig[0][idx], orig[1][idx]
+        gap, unr = m["gap"][idx], 1.0 - m["routed"][idx]
+        tt, kp = thin_band(tb[idx], width, soft)
+        t1, w1 = t0 * (1 - gap) + tt * gap, w0 * (1 - gap) + wo * kp * gap
+        if bool(unr.any()):
+            tr, kr = thin_band(to, width, soft)
+            t1, w1 = t1 * (1 - unr) + tr * unr, w1 * (1 - unr) + wo * kr * unr
+    tgt, wv = tgt.clone(), wv.clone()
+    tgt[idx, :1], wv[idx, :1] = t1, w1
+    return tgt, wv
+
+
 # ================================================ distance regression, Eikonal, normals, pairing, ECT
 
 UNIT = 0.25    # voxels per uint8 code step of a distance store (`rvsm.targets`)
