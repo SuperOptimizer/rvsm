@@ -240,6 +240,10 @@ def test_seed_linked_shards_are_not_charged_and_never_evicted(ct_origin, tmp_pat
     files = [p for p in c.regions[k] if os.path.exists(p)]
     assert files and all(os.stat(p).st_nlink > 1 for p in files)
     assert c.cache_bytes == 0 and set(files) <= c.linked
+    # the accounting says so: nothing charged against the budget, the linked bytes reported apart
+    d = c.disk()
+    assert d["rolling_gb"] == 0 and d["linked"] == len(c.linked) >= len(files)
+    assert abs(d["linked_gb"] * (1 << 30) - sum(c.size[p] for p in c.linked)) < 0.01 * (1 << 30)
     c.release(k)
     c.budget = 0
     c.cache_bytes = 1                           # force an eviction pass

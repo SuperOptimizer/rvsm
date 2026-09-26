@@ -41,12 +41,16 @@ Across restarts (review D10). The constructor rebuilds the inventory from the fi
 the mtime as the last reference (every reference touches it) -- so a shard an earlier process fetched is
 charged and is an eviction candidate like any other; before this, untouched old shards were invisible
 and the disk grew past the budget with every restart (paris4: 122 GB against 64). The accounting is in
-three parts, reported separately by `stats()`:
+three parts, reported separately by `stats()` (and `disk()`, on every region line and backpressure line):
 
     rolling   fetched shards: charged against the budget, evicted LRU
     pinned    the small coarse levels: never evicted, not charged
     linked    shards HARD-LINKED from the local seed mirror: never evicted, not charged
 
+NOTE for anyone reading `du`: the budget governs `rolling` only. `du <root>/ct` counts every linked
+shard at full size, but those bytes are the seed's and are on disk exactly once (`du -sh seed ct`
+together shows it); what the run's CT really costs is the seed plus `rolling`. To shrink it, shrink
+the seed (with the producer stopped: a shard it links as the seed vanishes fails its read).
 A linked shard costs no disk (its inode is the seed's), so evicting it would free nothing and only turn
 a later read of it into another link -- or, worse, into a miss for a visit already under way. Keeping
 every linked shard is what makes a revisit of a seeded level always safe; a shard the seed could not
@@ -663,9 +667,23 @@ class ShardCache:
         if self.remote:
             (b1, n1, s1), dt = self._counts(), max(time.time() - t0, 1e-6)
             mb, got, seeded = (b1 - c0[0]) / (1 << 20), n1 - c0[1], s1 - c0[2]
+            d = self.disk()
             self.log(f"rvsm cache: region {key} {len(paths)} shards in {dt:.1f}s: {got} fetched "
                      f"({mb:.0f} MiB, {mb / dt:.1f} MiB/s), {seeded} from the seed "
-                     f"({self.cache_bytes / (1 << 30):.1f} GB buffered)")
+                     f"({d['rolling_gb']:.1f} GB buffered of a {d['budget_gb']:.0f} GB budget, "
+                     f"{d['linked_gb']:.1f} GB linked from the seed at no extra disk)")
+
+    def disk(self):
+        """What the mirror costs on disk, in GiB: `rolling` (charged, evicted down to the budget) and
+        `linked` (hard links into the seed: the SAME inodes as the seed's files, so `du` of the mirror
+        counts them but the filesystem does not a second time, and evicting them would free nothing
+        while the seed exists -- paris4: `du ct/` 197 GB = 20 rolling + 174 linked, against a 184 GB
+        seed that holds the linked bytes once)."""
+        g = 1 << 30
+        linked = tuple(self.linked)     # one C-level copy: `_log_region` runs outside the caller's lock
+        return {"rolling_gb": round(self.cache_bytes / g, 2), "budget_gb": round(self.budget / g, 2),
+                "linked_gb": round(sum(self.size.get(p, 0) for p in linked) / g, 2),
+                "linked": len(linked)}
 
     def release(self, key):
         """The region is done with: its shards become evictable (the ones no other live region holds)."""

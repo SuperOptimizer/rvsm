@@ -1187,7 +1187,10 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                 time.sleep(IDLE_S)
                 continue
             if free_gb(out) < float(cfg.reserve_gb):
-                jlog(out, "produce", {"kind": "backpressure", "free_gb": round(free_gb(out), 1)})
+                with clock:
+                    ct_disk = cache.disk()
+                jlog(out, "produce", {"kind": "backpressure", "free_gb": round(free_gb(out), 1),
+                                      "reserve_gb": float(cfg.reserve_gb), "ct": ct_disk})
                 time.sleep(IDLE_S * 5)
                 continue
 
