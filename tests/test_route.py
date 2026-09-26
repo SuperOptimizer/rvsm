@@ -391,3 +391,114 @@ def test_the_producer_routes_a_running_round_0(region_cfg, fake_teacher, has_vol
     assert any(float(it["w"][4].float().max()) > 0 for it in items)
     cfg3 = replace(cfg2, rungs=(2,), steps=4, eval_every=1000, out=os.path.join(out, "tr"))
     TR.train(cfg3, patches_factory=lambda: iter(items * 4), device="cpu")
+
+
+# ------------------------------------------------------------------------------ the reteach GPU share
+
+def _stale_backlog(out, n):
+    los = [(0, 0, 128 * i) for i in range(n)]
+    for lo in los:
+        _fake_store(stores.store_path(out, "recto", lo, 0), teachers=["m7"])
+        _fake_store(stores.store_path(out, "rw", lo, 0), teachers=["m7"])
+    return los
+
+
+def _run_reteach(out, lo, ts):
+    """What a routed reteach unit leaves on disk: the next generation's recto, band, rw, committed."""
+    g = stores.next_gen(out, lo, 0)
+    attrs = {"teachers": ["recto", "m7"], "route": ts[2][len(RUN.ROUTE_TOKEN):]}
+    for ch in ("recto", "band", "rw"):
+        _fake_store(stores.gen_path(stores.store_path(out, ch, lo, 0), g), **attrs)
+    RUN.commit_sources(out, lo, 0)
+
+
+def _simulate(out, los, share, hours=3.0, verso_s=65.0, reteach_s=15.0, window=None):
+    """The producer's scheduling of the recto backlog, pass by pass, with the REAL functions
+    (`_recto_rescan`, `_recto_backlog`, `_share_backlog`, `ReteachMeter`) and a window that always
+    holds one verso pass (never idle): each pass runs its units in order and advances the clock by
+    their GPU seconds. Returns (regions regenerated, reteach seconds, all seconds)."""
+    import threading
+    ts = RUN.teacher_set(CFG.Config(teacher_route=ROUTE))
+    rr, meter, busy, keys, lock = {}, RUN.ReteachMeter(), set(), set(), threading.Lock()
+    now, t_end, done, rs, tot, k = 1000.0, 1000.0 + hours * 3600, 0, 0.0, 0.0, 0
+    route = list(los)
+    while now < t_end:
+        cat = RG.Catalog(out, 0, ttl=0.0)
+        RUN._recto_rescan(out, rr, route, [], ts, now=now, meter=meter, share=share)
+        units = list(window(k)) if window else [((9, 9, 9 + k), "verso")]
+        k += 1
+
+        def step(u, now=now, cat=cat):
+            return RUN._recto_backlog(out, rr, route, [], ts, cat, False, (2, 3, 4), busy, lock, {},
+                                      lambda lo: True, u, keys, lambda lo: None, now=now)
+        if units:
+            RUN._share_backlog(out, rr, meter, share, units, [], step, now=now)
+        else:
+            step(units)
+            if not units:
+                now += 5.0                               # an idle pass with nothing left: time moves on
+        for lo, job in units:
+            s = reteach_s if job == "reteach" else verso_s
+            if job == "reteach":
+                _run_reteach(out, lo, ts)
+                done += 1
+                rs += s
+            tot += s
+            meter.add(job, s, now=now)
+            now += s
+    return done, rs, tot
+
+
+def test_the_backlog_drains_at_its_share_while_verso_keeps_the_window_busy(tmp_path):
+    out = str(tmp_path / "sh")
+    los = _stale_backlog(out, 400)
+    done, rs, tot = _simulate(out, los, 0.25)
+    assert 0.20 <= rs / tot <= 0.27, rs / tot
+    assert done >= 150                                   # ~0.25 of 3 h at 15 s a reteach: ~180
+    lines = RUN.tail_jsonl(os.path.join(out, "logs", "produce.jsonl"), 100000)
+    adm = [r for r in lines if r.get("kind") == "recto_backlog_admit"]
+    assert len(adm) == done and all(r["share"] < 0.25 and r["share_target"] == 0.25 for r in adm)
+    # the periodic line: every RECTO_TODO_S of the (busy) run, with the route token and the share
+    reg = [r for r in lines if r.get("kind") == "recto_regen"]
+    assert len(reg) >= int(3 * 3600 / (RUN.RECTO_TODO_S + 100))   # rescans ride the passes (<= 100 s each)
+    assert any(t.startswith(RUN.ROUTE_TOKEN) for t in reg[0]["teachers"])
+    assert reg[-1]["remaining"] < reg[0]["remaining"] and 0.15 < reg[-1]["share"] <= 0.3
+
+
+def test_share_0_is_the_old_idle_only_rule(tmp_path):
+    out = str(tmp_path / "s0")
+    los = _stale_backlog(out, 20)
+    done, rs, _ = _simulate(out, los, 0.0, hours=1.0)
+    assert done == 0 and rs == 0.0                       # a busy window: nothing, as before
+    reg = [r for r in RUN.tail_jsonl(os.path.join(out, "logs", "produce.jsonl"), 1000)
+           if r.get("kind") == "recto_regen"]
+    assert reg and reg[-1]["remaining"] == 20           # ... but the backlog is visible
+    done, _, _ = _simulate(out, los, 0.0, hours=0.2, window=lambda k: [])
+    assert done > 0                                      # an idle window still works through it
+    assert CFG.Config().reteach_share == 0.25
+    assert replace(CFG.Config(), reteach_share=0.0).fingerprint() == CFG.Config().fingerprint()
+
+
+def test_blocking_and_leased_units_keep_their_priority(tmp_path):
+    import threading
+    out = str(tmp_path / "pr")
+    los = _stale_backlog(out, 5)
+    ts = RUN.teacher_set(CFG.Config(teacher_route=ROUTE))
+    rr, meter = {}, RUN.ReteachMeter()
+    cat = RG.Catalog(out, 0, ttl=0.0)
+
+    def step(u):
+        return RUN._recto_backlog(out, rr, los, [], ts, cat, False, (2, 3, 4), set(), threading.Lock(),
+                                  {}, lambda lo: True, u, set(), lambda lo: None)
+    for units, leased in (([((9, 9, 9), "teacher")], []), ([((9, 9, 9), "verso")], [(9, 9, 9)]),
+                          ([((9, 9, 9), "self")], [])):
+        u = list(units)
+        assert RUN._share_backlog(out, rr, meter, 0.25, u, leased, step) == [] and u == units
+    u = [((9, 9, 9), "verso")]
+    got = RUN._share_backlog(out, rr, meter, 0.25, u, [], step)
+    assert got and u[0] == got[0] and u[-1] == ((9, 9, 9), "verso") and got[0][1] == "reteach"
+    # over the share: nothing more
+    meter.add("reteach", 100.0)
+    meter.add("verso", 100.0)
+    u = [((9, 9, 9), "verso")]
+    assert RUN._share_backlog(out, rr, meter, 0.25, u, [], step) == []

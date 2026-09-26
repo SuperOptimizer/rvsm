@@ -929,6 +929,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     teachers = teacher_set(cfg)         # a round-0 recto from another set (or route) is regenerated (`reteach`)
     held_los = [tuple(int(v) for v in h["lo"]) for h in held]
     rr = {"todo": None, "t": 0.0, "n": None, "t_log": 0.0}   # the recto regeneration's work list
+    meter = ReteachMeter()              # the reteach share of the recent GPU time (`cfg.reteach_share`)
+    rshare = float(getattr(cfg, "reteach_share", 0.0) or 0.0)
     # the distance fields: on the producer's own GPU when it has one (`targets.block_fields_torch`,
     # ~2.5 GB of extra VRAM at peak, inside the memory fraction), else a CPU pool of
     # every core at low priority
@@ -1233,15 +1235,25 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         gpu_units.append((lo, job))
                         backlog_keys.add(lo)
                         break
-            if round_ == 0 and not gpu_units:
-                # the RECTO regeneration (a new teacher set, `teacher_names`): every produced region
-                # whose committed recto another set made, worked through -- like the verso backlog --
-                # only when the window has nothing for the GPU; held-out regions first, then walk order
-                _recto_backlog(out, rr, route, held, teachers, cat, verso_on, frungs, busy, lock,
-                               skip_until, lambda lo: region_size(pyr, lo, cfg.region) is not None,
-                               gpu_units, backlog_keys,
-                               lambda lo: pend.append(fielder.submit(fields, lo, round_, time.time(),
-                                                                     cursor)))
+            if round_ == 0:
+                # the RECTO regeneration (a new teacher set or route, `teacher_set`): every produced
+                # region whose committed recto another set made; held-out regions first, then walk order.
+                # Its work list is rescanned and logged on every pass (`recto_regen`), and it runs when
+                # the window has nothing for the GPU -- or, with `reteach_share` > 0, beside the verso
+                # passes while its share of the recent GPU time is under the target (`_share_backlog`)
+                _recto_rescan(out, rr, route, held, teachers, meter=meter, share=rshare)
+
+                def _rstep(units_):
+                    return _recto_backlog(out, rr, route, held, teachers, cat, verso_on, frungs, busy,
+                                          lock, skip_until,
+                                          lambda lo: region_size(pyr, lo, cfg.region) is not None,
+                                          units_, backlog_keys,
+                                          lambda lo: pend.append(fielder.submit(fields, lo, round_,
+                                                                                time.time(), cursor)))
+                if not gpu_units:
+                    _rstep(gpu_units)
+                else:
+                    _share_backlog(out, rr, meter, rshare, gpu_units, lorder, _rstep)
             gate.set_pending(j for _, j in gpu_units)   # the fields make way for these
             _log_starved(out, recs, starved_t, {u[0] for u in units} | {u[0] for u in gpu_units},
                          lambda lo: _next_job(cat, lo, round_, verso_on, out, rungs=frungs,
@@ -1393,6 +1405,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         del planes
                         pooled = None
                     t_gpu = time.time() - t1
+                    meter.add(job, t_gpu)
                     first = job not in peaks
                     peaks[job] = _cuda_peak()
                     gate.set_pending(j for _, j in gpu_units[i + 1:])
@@ -1878,6 +1891,113 @@ RECTO_TODO_S = 300.0     # the recto regeneration's work list is rescanned (and 
 RECTO_FIELDS_INFLIGHT = 1   # backlog fields rebuilds queued at once (the window's own fields go first)
 
 
+def _recto_rescan(out, rr, route, held, teachers, now=None, meter=None, share=None):
+    """Rescan the recto regeneration's work list (`recto_regen_todo`) when it is RECTO_TODO_S old, and
+    log it: `recto_regen` (stale rectos and fields rebuilds remaining, the identity `teachers` -- a
+    routed one carries its `route:<sig>` token -- and, from the producer, the backlog's GPU share)
+    while work remains, `recto_regen_done` once when it reaches zero. The producer calls it on EVERY
+    pass over the window, idle or not, so the backlog is visible even while it gets no GPU time.
+    Returns True when it rescanned."""
+    now = time.time() if now is None else now
+    if not teachers:
+        return False
+    if rr.get("todo") is not None and now - float(rr.get("t", 0.0)) < RECTO_TODO_S:
+        return False
+    rr["todo"] = recto_regen_todo(out, route, held, teachers)
+    rr["t"] = now
+    n, last = len(rr["todo"]), rr.get("n")
+    if n:
+        held_set = {tuple(int(v) for v in h["lo"]) for h in (held or ())}
+        st = [lo for lo in rr["todo"] if recto_stale(out, lo, teachers)]
+        rec = {"kind": "recto_regen", "remaining": len(st),
+               "fields_remaining": sum(1 for lo in rr["todo"] if fields_behind(out, lo)),
+               "teachers": list(teachers),
+               "heldout_remaining": sum(1 for lo in st if lo in held_set)}
+        if meter is not None:
+            rec.update({"share": round(meter.share(now), 4), "share_target": share,
+                        "reteach_s": round(meter.seconds(now, reteach=True), 1),
+                        "gpu_s": round(meter.seconds(now), 1)})
+        jlog(out, "produce", rec)
+    elif last:
+        jlog(out, "produce", {"kind": "recto_regen_done", "teachers": list(teachers)})
+    rr["n"] = n
+    return True
+
+
+SHARE_WINDOW_S = 1200.0   # the reteach share is measured over this much of the producer's recent GPU time
+RETEACH_EST_S = 20.0      # a backlog reteach's GPU seconds before any has been measured
+SHARE_MAX_PER_PASS = 4    # backlog reteaches admitted at most per pass over the window
+
+
+class ReteachMeter:
+    """The producer's GPU seconds per pass over the last SHARE_WINDOW_S, and the share of them that
+    `reteach` passes took (`cfg.reteach_share` is the target)."""
+
+    def __init__(self, window=SHARE_WINDOW_S):
+        self.window = float(window)
+        self.rows = []                   # (t, gpu seconds, is a reteach)
+
+    def add(self, job, gpu_s, now=None):
+        now = time.time() if now is None else now
+        self.rows.append((float(now), max(float(gpu_s), 0.0), str(job) == "reteach"))
+        self._trim(now)
+
+    def _trim(self, now):
+        lo = float(now) - self.window
+        while self.rows and self.rows[0][0] < lo:
+            self.rows.pop(0)
+
+    def seconds(self, now=None, reteach=None):
+        now = time.time() if now is None else now
+        self._trim(now)
+        return sum(s for _, s, r in self.rows if reteach is None or r == bool(reteach))
+
+    def share(self, now=None, extra=0.0):
+        """reteach seconds / all seconds, with `extra` seconds of reteach added to both (a projection
+        of the reteaches just admitted). 0 before any pass has been measured."""
+        tot = self.seconds(now) + float(extra)
+        return (self.seconds(now, reteach=True) + float(extra)) / tot if tot > 0 else 0.0
+
+    def est(self, now=None):
+        """A reteach pass's expected GPU seconds: the mean of the recent ones, else RETEACH_EST_S."""
+        s = [q for _, q, r in self.rows if r]
+        return float(np.mean(s)) if s else RETEACH_EST_S
+
+
+def _share_backlog(out, rr, meter, share, gpu_units, leased, step, now=None):
+    """The recto regeneration's GPU-time SHARE: while the window's GPU units hold no blocking pass (a
+    first-visit `teacher`, a round-r `self`, a LEASED region's anything: they keep their priority) and
+    the reteach share of the last SHARE_WINDOW_S of GPU time is under `share`, admit backlog reteaches
+    -- `step(units)` is `_recto_backlog` appending at most one unit -- at the FRONT of the window's
+    non-blocking units (the verso passes, which a worker never waits on), up to SHARE_MAX_PER_PASS,
+    projecting each admitted pass at `meter.est()` seconds. Logs `recto_backlog_admit` with the share
+    per admitted unit. `share <= 0`: nothing (the backlog then runs only when the window is idle).
+    Returns the admitted units."""
+    now = time.time() if now is None else now
+    if float(share or 0.0) <= 0 or not gpu_units:
+        return []
+    lset = {tuple(int(v) for v in lo) for lo in (leased or ())}
+    if any(j in BLOCKING_JOBS or tuple(int(v) for v in lo) in lset for lo, j in gpu_units):
+        return []
+    got, est = [], meter.est(now)
+    while len(got) < SHARE_MAX_PER_PASS:
+        cur = meter.share(now, extra=est * len(got))
+        if cur >= float(share):
+            break
+        new = []
+        step(new)
+        if not new:
+            break
+        for u in new:
+            jlog(out, "produce", {"kind": "recto_backlog_admit", "region": [int(v) for v in u[0]],
+                                  "job": u[1], "share": round(cur, 4), "share_target": float(share),
+                                  "reteach_s": round(meter.seconds(now, reteach=True), 1),
+                                  "gpu_s": round(meter.seconds(now), 1)}, echo=False)
+        got += new
+    gpu_units[:0] = got
+    return got
+
+
 def _recto_backlog(out, rr, route, held, teachers, cat, verso_on, rungs, busy, lock, skip_until, sized,
                    gpu_units, backlog_keys, submit_fields, now=None):
     """One idle step of the recto regeneration (the producer calls it when the window has no GPU unit).
@@ -1894,20 +2014,7 @@ def _recto_backlog(out, rr, route, held, teachers, cat, verso_on, rungs, busy, l
     now = time.time() if now is None else now
     if not teachers:
         return 0
-    if rr.get("todo") is None or now - float(rr.get("t", 0.0)) >= RECTO_TODO_S:
-        rr["todo"] = recto_regen_todo(out, route, held, teachers)
-        rr["t"] = now
-        n, last = len(rr["todo"]), rr.get("n")
-        if n:
-            held_set = {tuple(int(v) for v in h["lo"]) for h in (held or ())}
-            st = [lo for lo in rr["todo"] if recto_stale(out, lo, teachers)]
-            jlog(out, "produce", {"kind": "recto_regen", "remaining": len(st),
-                                  "fields_remaining": sum(1 for lo in rr["todo"] if fields_behind(out, lo)),
-                                  "teachers": list(teachers),
-                                  "heldout_remaining": sum(1 for lo in st if lo in held_set)})
-        elif last:
-            jlog(out, "produce", {"kind": "recto_regen_done", "teachers": list(teachers)})
-        rr["n"] = n
+    _recto_rescan(out, rr, route, held, teachers, now=now)
     with lock:
         infl = {lo for lo in rr.get("fields", ()) if lo in busy}
     rr["fields"] = infl

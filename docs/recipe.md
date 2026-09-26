@@ -512,6 +512,18 @@ loss_band = 0.1        # optional; 0 = the band penalty off (the gap-fill masks 
   one card, each quantised to uint8 before the next; like every teacher pass the unit holds the GpuGate
   for its whole forward, so it never overlaps a verso pass or the GPU fields. Turning the route off again
   regenerates back to the plain teacher set.
+- **The backlog's GPU share (`reteach_share`, default 0.25, fingerprint-excluded).** The backlog outside
+  the window used to run only when the window had NO GPU unit; once verso is on the window is never
+  idle, and paris4 (2026-09-26, step 85000-89000) regenerated only the regions its window revisited,
+  leaving ~1350 stale. Now, whenever the window's GPU units hold no blocking pass (a first-visit
+  `teacher`, a round-r `self`, any unit of a LEASED region -- those keep their priority), backlog
+  reteaches are admitted at the front of the window's verso passes while the reteach share of the last
+  ~20 min of producer GPU seconds (`run.ReteachMeter`, every reteach counted) is under the target, at most
+  4 per pass; each admitted unit logs `recto_backlog_admit` with the share at admission. `0` is the old
+  idle-only rule. The work list is rescanned and logged (`recto_regen`: stale rectos, fields rebuilds,
+  the identity `teachers` with its `route:<sig>` token, `share` / `share_target` / `reteach_s` /
+  `gpu_s`) every `RECTO_TODO_S` = 300 s on every pass, idle or not. At 0.25 with a ~15 s routed reteach
+  (band reused) beside ~65 s verso passes that is ~60 regions an hour.
 - **Sampler (`sample.Patches`).** A routed config adds ONE trailing target row, `band` (`target_channels`),
   that no head predicts. For a region whose committed generation has a band (`_routed`): at rung 2 the
   recto row is the fine teacher at full weight (rw is no longer a recto weight), and the band row is the

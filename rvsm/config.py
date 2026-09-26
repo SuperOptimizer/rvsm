@@ -193,6 +193,9 @@ FINGERPRINT_EXCLUDE = ("infer_margin", "steps", "eval_every", "workers", "gpus",
                        # handles (a routed store records `route`, `run.recto_needs_regen` compares it); the
                        # resume logs a `teacher_switch` sched line. The gap-fill loss knobs go with it
                        "teacher_route", "loss_band", "band_dilate", "band_eps",
+                       # the recto regeneration's share of the producer's GPU time (`run.ReteachMeter`):
+                       # scheduling only, never what is trained
+                       "reteach_share",
                        # the THINNED-BAND rung-2 target (docs/recipe.md §6): computed on the device at step
                        # time from the stored recto, switched on at a resume (`loss_switch` line)
                        "thin_band", "thin_band_width", "thin_band_soft",
@@ -379,6 +382,11 @@ class Config:
     round_min_steps_after_verso: int = 8000   # round 0 is promoted only this long after verso_on
     verso_min_regions: int = 200       # ... and with at least this many finished verso stores
     verso_regen: bool = True           # regenerate round 0's old verso stores once (verso_regen_gain)
+    reteach_share: float = 0.25        # the recto regeneration backlog's share of the producer's GPU time
+                                       # (reteach seconds / all pass seconds over the last ~20 min): while
+                                       # the window has no blocking pass (first-visit teacher, round-r
+                                       # self, a leased region) a backlog reteach is admitted whenever the
+                                       # share is below this. 0 = the old rule: only when the window is idle
     fields_batch: int = 0              # blocks per GPU fields batch in the producer (~0.83 GB each);
                                        # 0: 1 when the producer's VRAM budget is under 30 GB, else 3
     producer_recycle_fields: int = 0   # the producer exits cleanly (a `recycle`, respawned at once by the
