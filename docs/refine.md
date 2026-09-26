@@ -5,16 +5,17 @@ usrm2 refiner (`usrm2/refine.py`) onto rvsm's stores. It moves every point of a 
 along its normal onto the nearest recto probability peak. It checks each move against the verso
 prediction, keeps render3d's drag anchors fixed, and writes the surface back in the frame it was read in.
 
-## Algorithm (per iteration, search radius `far / 1.5^it`, at least 3)
+## Algorithm (per iteration, search radius from `--far`: default `40,24,16,8`, one number = fixed)
 
 1. **Grid.** Each surface is read, mapped to the fine 2.4 µm frame, and cropped to the rows and columns
    that touch the box. It is then upsampled so the grid pitch is about `--pitch` voxels (`upsample`; node
    (r, c) becomes node (r·up, c·up), so the published nodes are kept exactly).
 2. **Normals.** Normals are hole-tolerant: they are computed on the hole-filled grid (`filled`) and then
    masked back. They are oriented **outward from the umbilicus**, which is also VERSO → RECTO
-   (`export.SIGN_CONVENTION`). With `--local-normal` (the default) they are recomputed from the refined
-   grid every iteration, so the search direction follows the refined shape. `--no-local-normal` keeps
-   the published grid's normals throughout.
+   (`export.SIGN_CONVENTION`). They are computed ONCE, on the published (upsampled) grid, and every node
+   moves only along its own normal for the whole run: its displacement is a scalar. `--local-normal`
+   recomputes them every iteration, as before. That lets nodes slide along the sheet and bunch, which
+   is what the first local-following preview showed.
 3. **Peaks.** The recto probability is sampled along the normal over ±r. The strongest 6 local maxima are
    kept (`local_maxima`), each placed to sub-voxel precision with a parabolic fit. A two-sample plateau
    now counts as ONE peak. usrm2 counted it twice, which let two sheets share one band.
@@ -34,7 +35,11 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
 5. **Joint, order-preserving assignment** (`assign`). Along each ray, the nearest other sheet below and
    above (`ray_neighbours`, over ALL surfaces in the box) and this sheet are matched one-to-one and in
    order to the peaks. The cost is `0.08·|offset − peak| − strength`. Neighbouring sheets can therefore
-   neither merge onto one band nor cross, and a move is also capped 1 voxel short of a neighbour.
+   neither merge onto one band nor cross. Before the match, a candidate is also bounded by half the
+   distance to the nearest other sheet on the ray (else by far), so a wide first pass cannot jump a
+   wrap. Among peaks within `--peak-tol` (0.15) of the strongest, the one nearest the current position
+   wins, not simply the strongest. The neighbour search's lateral tolerance is 0.75 × pitch (at least
+   3).
 6. **Smoothing.** The per-point offsets are smoothed over the (H, W) grid with a Gaussian weighted by
    peak height (`smooth`). σ = `--sigma-vox` voxels along the sheet, default 2 × `--pitch`, so ~10
    at pitch 5 and it follows locally; usrm2's 40 flattened everything under ~100 voxels. The LAST
@@ -43,6 +48,40 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
    `--taper` voxels at the box faces, so a slab-refined surface joins its untouched remainder without a
    step. They are also faded around anchors (below). All sheets move only after all of them have been
    measured.
+7. **Keeping the grid a grid.** After each move:
+   - **Reparametrisation** (`--reparam`, on). For every run of nodes along a grid row, then a column, if
+     some edge's length ratio to the published grid departs from the run's median by more than 15%, the
+     run's nodes slide ALONG their own polyline back to the published arc-length fractions (end nodes
+     fixed). This undoes bunching exactly and keeps the shape. An evenly stretched run, or the slight
+     kink where moves fade out, is left alone.
+   - **Tangential relaxation** (`--relax` 0.5, `--relax-iters` 2). A rest-relative Laplacian
+     (L(P) − L(P_published)), projected onto the refined surface's tangent plane. It keeps the
+     published parametrisation, and it is zero for a pure normal offset of a smooth sheet.
+   - **Fold guard** (`--fold-guard`, on). A node is pulled back by bisection toward its previous
+     position (up to 4 halvings, then fully) if a quad touching it has flipped. A flip means either
+     triangle's (u × v)·n changed sign against the published grid. The same applies if one of the
+     node's grid edges is now shorter than `--min-spacing` (0.4 × pitch) without having been so short
+     when published. The pull-backs are counted as fold events.
+
+   On a published wavy sheet half a wavelength out of phase with its band, the old scheme gives spacing
+   CV 0.87 and 200 folded nodes. The new defaults give CV 0.06, no fold, and a fit within 0.07 voxel
+   (`test_wavy_band_keeps_even_spacing_and_never_folds`). On the synthetic slab, the mean tangential
+   drift is 0.03 voxel.
+8. **Joint mesh solve** (`--mesh-opt`, off). After the snap, torch (on the GPU when there is one)
+   optimises every sheet of the tile together with Adam (`--mesh-steps` 100, `--mesh-lr` 0.1). The
+   variable is each movable node's scalar displacement along its original normal, within 3 voxels.
+   The terms are:
+   - data: 1 − recto (trilinear on the uint8 store);
+   - verso barrier: verso at node + {1, 2} × n;
+   - edge-length (|e| − |e0|)², over u, v and one diagonal;
+   - bending: |L(P) − L(P0)|²;
+   - anti-fold: relu(−J·sign J0);
+   - inter-sheet gap: a hinge below max(thickness, `--min-spacing`) against the nearest OTHER sheet's
+     node along the normal, re-found every 25 steps;
+   - no-crossing: relu of the gap's flip against the published side.
+
+   Tile and grid boundaries, anchors and the taper are fixed, and the fold guard has the last word.
+   Free tangential moves were tried first and random-walked nodes 0.4 voxel sideways.
 
 **Anchors** (`--anchors anchors.jsonl`, render3d's append-only log). The log is replayed (`add` / `del`,
 and a torn last line is ignored), and each record is matched to a surface by its `surface` name (the
@@ -132,9 +171,19 @@ Outputs under `--out`:
 - `png/displacement_hist.png`: the signed normal displacement per surface.
 - `refine_report.json` plus JSON lines on stdout: per-iteration stats (with_peak, capped by a
   neighbour, verso_blocked, thickness), and evalsurf metrics before and after per surface and pooled:
-  recall@2/4, offset mean/std/≤3, merge_frac, continuity and ERL. It also has, per surface (`moves`),
-  the fraction of points that moved more than 2 voxels and the mean and median |move|, with a WARNING
-  when the median is < 0.5 voxel (over-smoothed) or > far/2 (runaway).
+  recall@2/4, offset mean/std/≤3, merge_frac, continuity and ERL. Per surface (`moves`) it has:
+  - the fraction of points that moved more than 2 voxels, and the mean and median |move|, with a
+    WARNING when the median is < 0.5 voxel (over-smoothed) or > max far/2 (runaway);
+  - the first-pass |move| percentiles, with `far_off` when the median is > 10 voxels: how far off the
+    published line really was;
+  - the mean tangential drift (the part of the total move not along the published normal);
+  - fold events;
+  - grid spacing mean and CV, before and after.
+
+  `geometry` pools these numbers. Per tile, `tile_pairs` gives the adjacent-wrap statistics for the
+  published, snapped and (with `--mesh-opt`) final positions: node pairs sampled every 3rd node, pairs
+  closer than max(thickness, min spacing), and crossings.
+- `png/spacing_hist.png`: grid-edge length histograms, published (gray) and refined (green).
 
 ## Warnings
 

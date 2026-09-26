@@ -125,14 +125,16 @@ def assign(pos, stren, below, above, alpha=0.08):
     return out
 
 
-def ray_neighbours(q, n, others, R, lateral=3.0, k=48):
+def ray_neighbours(q, n, others, R, lateral=3.0, k=48, return_index=False):
     """Offsets along the normal of the nearest other-sheet points below (<0) and above (>0) each point, NaN if
-    none. Vectorised over the k nearest other-sheet points (usrm2 looped a ball query per point, which is
-    minutes per iteration at the millions of points a whole slab has)."""
+    none (with return_index: also their indices into `others`, -1 if none). Vectorised over the k nearest
+    other-sheet points (usrm2 looped a ball query per point, which is minutes per iteration at the millions of
+    points a whole slab has)."""
     from scipy.spatial import cKDTree
     below, above = np.full(len(q), np.nan, np.float32), np.full(len(q), np.nan, np.float32)
+    ib_all, ia_all = np.full(len(q), -1, np.int64), np.full(len(q), -1, np.int64)
     if not len(others) or not len(q):
-        return below, above
+        return (below, above, ib_all, ia_all) if return_index else (below, above)
     tree = cKDTree(others)
     kk = min(int(k), len(others))
     for i in range(0, len(q), 200_000):
@@ -140,15 +142,77 @@ def ray_neighbours(q, n, others, R, lateral=3.0, k=48):
         dist, idx = tree.query(q[sl], k=kk, distance_upper_bound=R + lateral)
         dist, idx = dist.reshape(len(dist), -1), idx.reshape(len(idx), -1)
         ok = np.isfinite(dist)
-        d = others[np.minimum(idx, len(others) - 1)] - q[sl][:, None]
+        idc = np.minimum(idx, len(others) - 1)
+        d = others[idc] - q[sl][:, None]
         t = (d * n[sl][:, None]).sum(-1)
         lat = np.linalg.norm(d - t[..., None] * n[sl][:, None], axis=-1)
         ok &= (lat <= lateral) & (np.abs(t) <= R)
-        lo = np.where(ok & (t < -0.5), t, -np.inf).max(1)
-        hi = np.where(ok & (t > 0.5), t, np.inf).min(1)
+        tb = np.where(ok & (t < -0.5), t, -np.inf)
+        ta = np.where(ok & (t > 0.5), t, np.inf)
+        jb, ja = tb.argmax(1), ta.argmin(1)
+        rows = np.arange(len(tb))
+        lo, hi = tb[rows, jb], ta[rows, ja]
         below[sl] = np.where(np.isfinite(lo), lo, np.nan)
         above[sl] = np.where(np.isfinite(hi), hi, np.nan)
-    return below, above
+        ib_all[sl] = np.where(np.isfinite(lo), idc[rows, jb], -1)
+        ia_all[sl] = np.where(np.isfinite(hi), idc[rows, ja], -1)
+    return (below, above, ib_all, ia_all) if return_index else (below, above)
+
+
+def sheet_pairs(P, n, gid, R, lateral, qmask=None):
+    """For every node of a set of sheets (P (N,3), unit normals n (N,3), sheet id gid (N,)) -- or only the
+    `qmask` ones: the nearest node of ANOTHER sheet (any node) above and below along its normal (within R,
+    `lateral`). Returns (i, j) index arrays."""
+    I, J = [], []
+    for g in np.unique(gid):
+        sel = np.nonzero((gid == g) & (True if qmask is None else qmask))[0]
+        if not len(sel):
+            continue
+        q = P[sel]
+        pad = R + lateral + 1.0
+        bl, bh = q.min(0) - pad, q.max(0) + pad
+        oth = np.nonzero((gid != g) & ((P >= bl) & (P <= bh)).all(-1))[0]
+        if not len(oth):
+            continue
+        _, _, ib, ia = ray_neighbours(q, n[sel], P[oth], R, lateral=lateral, return_index=True)
+        for ix in (ib, ia):
+            k = ix >= 0
+            I.append(sel[k])
+            J.append(oth[ix[k]])
+    if not I:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    return np.concatenate(I), np.concatenate(J)
+
+
+def grid_stride_mask(shape, stride):
+    """(H,W) True on every `stride`-th row and column."""
+    m = np.zeros(shape, bool)
+    m[::max(int(stride), 1), ::max(int(stride), 1)] = True
+    return m
+
+
+def pair_stats(grids_ref, grids_now, ns, min_gap, R=24.0, lateral=None, stride=3):
+    """Adjacent-wrap spacing of a tile's sheets: node pairs (from every `stride`-th node to the nearest other
+    sheet along its normal, found on `grids_now`) closer than `min_gap` along the normal, and pairs whose
+    side has flipped against the same pair in `grids_ref` (a crossing). Returns {"pairs", "under_min",
+    "crossings", "stride"} (counts are of the sampled nodes' pairs)."""
+    Ps, Rs, Ns, G, Qm = [], [], [], [], []
+    for k, (a, b, n) in enumerate(zip(grids_ref, grids_now, ns)):
+        ok = np.isfinite(a).all(-1) & np.isfinite(b).all(-1) & np.isfinite(n).all(-1)
+        Ps.append(b[ok])
+        Rs.append(a[ok])
+        Ns.append(n[ok])
+        G.append(np.full(int(ok.sum()), k))
+        Qm.append(grid_stride_mask(ok.shape, stride)[ok])
+    if not Ps or not sum(len(x) for x in Ps):
+        return {"pairs": 0, "under_min": 0, "crossings": 0}
+    P, Rr, N, G, Qm = (np.concatenate(x) for x in (Ps, Rs, Ns, G, Qm))
+    lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_now])))
+    i, j = sheet_pairs(P, N, G, R, lat, qmask=Qm)
+    gn = ((P[j] - P[i]) * N[i]).sum(-1)
+    gr = ((Rr[j] - Rr[i]) * N[i]).sum(-1)
+    return {"pairs": int(len(i)), "under_min": int((np.abs(gn) < min_gap).sum()),
+            "crossings": int((np.sign(gn) * np.sign(gr) < 0).sum()), "stride": int(stride)}
 
 
 # ===================================================================================== the verso term
@@ -348,62 +412,223 @@ def box_taper(g, origin, size, taper):
 
 # ============================================================================================ refine
 
+def far_schedule(far, iters):
+    """Per-iteration search radii: an int is a fixed radius; a sequence is used in order (its last value
+    repeats if `iters` is longer)."""
+    if np.ndim(far) == 0:
+        return [max(3, int(far))] * int(iters)
+    f = [max(3, int(v)) for v in far]
+    return [f[min(i, len(f) - 1)] for i in range(int(iters))]
+
+
+def _nbr_mean(P):
+    """(mean of the valid 4-neighbours, their count) of every node of an (H,W,3) grid."""
+    H, W = P.shape[:2]
+    S = np.zeros_like(P)
+    C = np.zeros((H, W), np.float32)
+    ok = np.isfinite(P).all(-1)
+    Pz = np.where(ok[..., None], P, 0)
+    for sl_dst, sl_src in (((slice(1, None), slice(None)), (slice(None, -1), slice(None))),
+                           ((slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+                           ((slice(None), slice(1, None)), (slice(None), slice(None, -1))),
+                           ((slice(None), slice(None, -1)), (slice(None), slice(1, None)))):
+        S[sl_dst] += Pz[sl_src]
+        C[sl_dst] += ok[sl_src]
+    return S / np.maximum(C, 1)[..., None], C
+
+
+def relax_tangential(P, n, w, iters=2, P0=None):
+    """Laplacian smoothing restricted to the tangent plane: every interior node (4 valid neighbours) moves by
+    w * (neighbour mean - node) with its component along n removed, so grid spacing evens out (bunching is
+    undone) while the node's coordinate along n -- the data -- is untouched. w: (H,W) weights (0 = fixed).
+    P0: the rest grid -- then the target is P0's own Laplacian (L(P) - L(P0)), so a published grid's
+    parametrisation is kept and a pure normal offset of a smooth sheet does not move anything sideways."""
+    nz = np.nan_to_num(n)
+    L0 = None
+    if P0 is not None:
+        m0, _ = _nbr_mean(P0)
+        L0 = np.nan_to_num(m0 - P0)
+    for _ in range(int(iters)):
+        m, C = _nbr_mean(P)
+        L = m - P if L0 is None else (m - P) - L0
+        L = L - (L * nz).sum(-1, keepdims=True) * nz
+        move = np.isfinite(P).all(-1) & (C == 4) & (w > 0)
+        P = np.where(move[..., None], P + w[..., None] * np.nan_to_num(L), P)
+    return P
+
+
+def _reparam_rows(P, P0, w, tol=0.15):
+    """Every run of valid nodes along each grid row redistributed along its own polyline so that the nodes'
+    arc-length fractions match the rest grid P0's on the same run (end nodes fixed), blended by w (H,W) and
+    by the run's distortion: a run is redistributed only when some edge's length ratio to P0 departs from
+    the run's median ratio by more than `tol` (fully from 2 x tol), so an evenly stretched or shrunk run,
+    or a slight kink where the moves fade out, is left alone."""
+    out = P.copy()
+    ok = np.isfinite(P).all(-1) & np.isfinite(P0).all(-1)
+    for r in range(P.shape[0]):
+        m = np.concatenate([[False], ok[r], [False]])
+        st, en = np.nonzero(m[1:] & ~m[:-1])[0], np.nonzero(~m[1:] & m[:-1])[0]
+        for a, b in zip(st, en):
+            if b - a < 3:
+                continue
+            p, p0 = P[r, a:b], P0[r, a:b]
+            sc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=-1))])
+            s0 = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(p0, axis=0), axis=-1))])
+            if sc[-1] <= 1e-6 or s0[-1] <= 1e-6 or (np.diff(sc) <= 0).any():
+                continue
+            q = np.diff(sc) / np.maximum(np.diff(s0), 1e-6)
+            lq = np.abs(np.log(np.maximum(q, 1e-6) / max(float(np.median(q)), 1e-6)))
+            gate = float(np.clip((lq.max() - tol) / tol, 0.0, 1.0))   # the run's worst edge decides
+            if gate <= 0:
+                continue
+            tgt = s0 / s0[-1] * sc[-1]
+            new = np.stack([np.interp(tgt, sc, p[:, k]) for k in range(3)], -1)
+            out[r, a:b] = p + (w[r, a:b] * gate)[:, None] * (new - p)
+    return out
+
+
+def reparam(P, P0, w):
+    """Undo bunching exactly: along every grid row, then every column, nodes are moved ALONG the current
+    (piecewise-linear) surface back to the arc-length fractions they had in the published grid P0 -- the
+    surface's shape is kept, its parametrisation restored. w (H,W): 0 = fixed (outside the box, anchors)."""
+    P = _reparam_rows(P, P0, w)
+    return _reparam_rows(P.transpose(1, 0, 2), P0.transpose(1, 0, 2), w.T).transpose(1, 0, 2).copy()
+
+
+def bad_nodes(P, P0, n0, min_sp):
+    """Nodes of P (H,W,3) that fold or bunch relative to the rest grid P0: incident to a quad whose two
+    triangles' orientation (cross of the u and v edges, dotted with the normal) has flipped against P0's, or
+    with a grid edge shorter than `min_sp` voxels that was not that short in P0."""
+    H, W = P.shape[:2]
+    bad = np.zeros((H, W), bool)
+    fin = np.isfinite(P).all(-1) & np.isfinite(P0).all(-1)
+    if H >= 2 and W >= 2:
+        nq = np.nan_to_num(n0[:-1, :-1] + n0[:-1, 1:] + n0[1:, :-1] + n0[1:, 1:])
+        qok = fin[:-1, :-1] & fin[:-1, 1:] & fin[1:, :-1] & fin[1:, 1:]
+        for G, sgn in ((P0, None), (P, 1)):
+            j1 = (np.cross(G[:-1, 1:] - G[:-1, :-1], G[1:, :-1] - G[:-1, :-1]) * nq).sum(-1)
+            j2 = (np.cross(G[1:, :-1] - G[1:, 1:], G[:-1, 1:] - G[1:, 1:]) * nq).sum(-1)
+            if sgn is None:
+                s1, s2 = np.sign(np.nan_to_num(j1)), np.sign(np.nan_to_num(j2))
+            else:
+                flip = qok & (((s1 != 0) & (np.nan_to_num(j1) * s1 <= 0)) | ((s2 != 0) & (np.nan_to_num(j2) * s2 <= 0)))
+        bad[:-1, :-1] |= flip
+        bad[:-1, 1:] |= flip
+        bad[1:, :-1] |= flip
+        bad[1:, 1:] |= flip
+    for ax_ in (0, 1):
+        a = [slice(None)] * 2
+        b = [slice(None)] * 2
+        a[ax_], b[ax_] = slice(None, -1), slice(1, None)
+        a, b = tuple(a), tuple(b)
+        L = np.linalg.norm(P[b] - P[a], axis=-1)
+        L0 = np.linalg.norm(P0[b] - P0[a], axis=-1)
+        short = fin[a] & fin[b] & (L < min_sp) & (L0 >= min_sp)
+        bad[a] |= short
+        bad[b] |= short
+    return bad
+
+
+def fold_guard(P_prev, P_new, P0, n0, min_sp, steps=4):
+    """P_prev + t * (P_new - P_prev) with t = 1, except at nodes that fold or bunch (`bad_nodes`): their t is
+    halved up to `steps` times, then 0 (the previous position, which passed). Returns (P, n pulled-back nodes)."""
+    D = np.nan_to_num(P_new - P_prev)
+    t = np.ones(P_prev.shape[:2], np.float32)
+    ev = np.zeros(P_prev.shape[:2], bool)
+    for s in range(steps + 16):
+        P = P_prev + t[..., None] * D
+        bad = bad_nodes(P, P0, n0, min_sp) & (t > 0)
+        if not bad.any():
+            break
+        ev |= bad
+        t[bad] = 0.0 if s >= steps else t[bad] * 0.5
+    P = P_prev + t[..., None] * D
+    return np.where(np.isfinite(P_new).all(-1)[..., None], P, np.nan).astype(np.float32), int(ev.sum())
+
+
+def spacing(g):
+    """The lengths (voxels) of every grid edge (u and v) with both ends valid."""
+    out = []
+    for ax_ in (0, 1):
+        d = np.linalg.norm(np.diff(g, axis=ax_), axis=-1)
+        out.append(d[np.isfinite(d)])
+    return np.concatenate(out) if out else np.zeros(0, np.float32)
+
+
 def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=None, chunk=400_000,
                 W=None, thick=None, T=None, verso_thr=None, verso_beta=0.5, verso_block=np.inf, verso_margin=0.5,
-                holds=None, taper=0.0, box=None, sigma_final=None, local_normal=True, log=None):
+                holds=None, taper=0.0, box=None, sigma_final=None, local_normal=False, relax=0.5, relax_iters=2,
+                guard=True, min_spacing=None, peak_tol=0.15, reparam_on=True, diag=None, log=None):
     """Joint refinement of several (H,W,3) zyx grids (NaN = hole) against V, a (Z,Y,X) probability (float in
-    [0,1] or uint8) at `origin`. Each iteration: normals; per point the peaks along the normal ray and the
-    neighbouring sheets on it are matched in order (assign()); the matched peak's offset is smoothed over the
-    grid (confidence-weighted) and the sheet moves.
+    [0,1] or uint8) at `origin`. Each iteration, for every node: the peaks along its normal ray within
+    far[it] and the other sheets on that ray are matched in order (assign()); the matched peak's offset is
+    smoothed over the grid (confidence-weighted); then all sheets move, are relaxed and guarded:
 
+    - the move is a scalar along the node's ORIGINAL (published, upsampled) normal (`local_normal=False`,
+      the default: recomputed normals let nodes slide along the sheet and bunch);
+    - `relax_tangential` (weight `relax`, `relax_iters` sub-steps, taper-weighted; boundary and anchored
+      nodes fixed) keeps the grid spacing even without touching the normal coordinate;
+    - `fold_guard` pulls back (bisection toward the previous position) every node whose incident quads flip
+      or whose spacing drops below `min_spacing` (default 0.4 x the grid pitch).
+    Candidates are bounded by half the distance to the nearest other sheet on the ray (else by far), and
+    among peaks within `peak_tol` of the strongest the one nearest the current position wins.
+
+    far: one radius (every iteration) or a per-iteration schedule (see far_schedule).
     W: the verso probability over the same box (enables `verso_adjust`); thick: a thickness volume in voxels
     over the box (0 = no data); T: a fixed thickness (else estimated from the peaks at iteration 0).
     holds: per grid (H,W) weights in 0..1, 1 = anchored (never moved by the snap). taper: see `box_taper`.
-    sigma: grid cells, one value or one per grid.
-    sigma_final: the smoothing (grid cells, one value or one per grid) of the LAST iteration only, so the
-    final pass follows the band locally while the earlier ones stay robust (default: sigma).
-    local_normal: recompute the normals from the current (refined) grid every iteration, so the search
-    direction follows the refined shape; False keeps the published grid's normals throughout.
+    sigma: grid cells, one value or one per grid. sigma_final: the LAST iteration's (default sigma).
     box: (origin, size) of the region being refined when V covers only part of it (a tile of a slab): points
     must be inside both, and the taper fades at `box`'s faces, not V's.
-    Returns (refined grids, per-iteration stats)."""
+    diag: a dict to receive per-grid "first_move" ((H,W) first-iteration move) and "folds" (pulled-back
+    node counts). Returns (refined grids, per-iteration stats)."""
     o = np.asarray(origin, np.float32)
     grids = [g.copy() for g in grids]
+    rest = [g.copy() for g in grids]
+    radii = far_schedule(far, iters)
+    rmax = max(radii) if radii else 3
     size = np.array(V.shape, np.float32)
     lo_b, hi_b = o, o + size - 1
     bo, bs = (o, size) if box is None else (np.asarray(box[0], np.float32), np.asarray(box[1], np.float32))
     lo_b, hi_b = np.maximum(lo_b, bo), np.minimum(hi_b, bo + bs - 1)
     insides = [np.isfinite(g).all(-1) & ((g >= lo_b) & (g <= hi_b)).all(-1) for g in grids]
-    fades = [box_taper(g, bo, bs, taper) * (1.0 - (np.clip(h, 0, 1) if h is not None else 0.0))
-             for g, h in zip(grids, holds or [None] * len(grids))]
+    hl = [np.clip(h, 0, 1) if h is not None else 0.0 for h in (holds or [None] * len(grids))]
+    fades = [box_taper(g, bo, bs, taper) * (1.0 - h) for g, h in zip(grids, hl)]
     vthr = thr if verso_thr is None else verso_thr
     sigmas = list(np.broadcast_to(np.asarray(sigma, np.float64), (len(grids),)))
     sigmas_f = sigmas if sigma_final is None else list(np.broadcast_to(np.asarray(sigma_final, np.float64), (len(grids),)))
-    n_fixed = None
+    pit = [pitch(g) for g in grids]
+    pm = float(np.nanmedian(pit)) if np.isfinite(pit).any() else 1.0
+    lateral = max(3.0, 0.75 * pm)
+    min_sps = [float(min_spacing) if min_spacing is not None else 0.4 * (p if np.isfinite(p) else pm) for p in pit]
+    n_rest = [normals(g, ax) for g in grids]
     tunit = THICK_UNIT if thick is not None and thick.dtype == np.uint8 else 1.0
     Tg = None if T is None else float(T)
+    if diag is not None:
+        diag["first_move"] = [np.zeros(g.shape[:2], np.float32) for g in grids]
+        diag["folds"] = [0] * len(grids)
     stats = []
     for it in range(iters):
-        r = max(3, int(round(far / (1.5 ** it))))
+        r = radii[it]
+        ch = max(10_000, int(chunk * 25 / (2 * r + 1)))
         st = {"iter": it, "far": r, "points": 0, "with_peak": 0.0, "mean_abs_move": 0.0, "max_move": 0.0,
-              "capped": 0.0}
+              "capped": 0.0, "folds": 0}
         if W is not None:
             st["verso_blocked"] = 0.0
-        if local_normal or n_fixed is None:
+        if local_normal:
             ns = [normals(g, ax) for g in grids]
-            if not local_normal:
-                n_fixed = ns
         else:   # the published normals, masked to the cells that are still points
-            ns = [np.where(np.isfinite(g).all(-1)[..., None], n, np.nan) for g, n in zip(grids, n_fixed)]
+            ns = [np.where(np.isfinite(g).all(-1)[..., None], n, np.nan) for g, n in zip(grids, n_rest)]
         sig_it = sigmas_f if it == iters - 1 else sigmas
-        oks = [ins & np.isfinite(n).all(-1) for ins, n in zip(insides, ns)]
+        oks = [ins & np.isfinite(g).all(-1) & np.isfinite(n).all(-1) for ins, g, n in zip(insides, grids, ns)]
         pts = [g[ok] for g, ok in zip(grids, oks)]
         if W is not None and Tg is None:   # one thickness for the box, from the recto-verso spacing
             q = np.concatenate([p for p in pts if len(p)] or [np.zeros((0, 3), np.float32)])
             nq = np.concatenate([n[ok] for n, ok in zip(ns, oks) if ok.any()] or [np.zeros((0, 3), np.float32)])
-            sub = np.linspace(0, len(q) - 1, min(len(q), 200_000)).astype(np.int64) if len(q) else np.zeros(0, np.int64)
-            rp, rs = local_maxima(profile(V, q[sub] - o, nq[sub], far), far, thr)
-            vp, vs = local_maxima(profile(W, q[sub] - o, nq[sub], far), far, vthr)
+            sub = np.linspace(0, len(q) - 1, min(len(q), 100_000)).astype(np.int64) if len(q) else np.zeros(0, np.int64)
+            rt = min(rmax, 24)
+            rp, rs = local_maxima(profile(V, q[sub] - o, nq[sub], rt), rt, thr)
+            vp, vs = local_maxima(profile(W, q[sub] - o, nq[sub], rt), rt, vthr)
             Tg = thickness_from_peaks(rp, rs, vp, vs)
             if not np.isfinite(Tg):
                 Tg = 8.0
@@ -416,18 +641,21 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 moves.append(np.zeros(g.shape[:2], np.float32))
                 continue
             qi = q - o
-            # other sheets' points that can be within reach (ray_neighbours' bound is r + 3): a tree over the
-            # whole box per sheet is the slab's cost otherwise
-            pad = r + 4.0
+            # other sheets' points that can be within reach: a tree over the whole box per sheet is the slab's
+            # cost otherwise
+            pad = r + lateral + 1.0
             bl, bh = bbs[j][0] - pad, bbs[j][1] + pad
             others = [p[((p >= bl) & (p <= bh)).all(-1)] for k, p in enumerate(pts)
                       if k != j and bbs[k] is not None and (bbs[k][0] <= bh).all() and (bbs[k][1] >= bl).all()]
             others = np.concatenate([p for p in others if len(p)] or [np.zeros((0, 3), np.float32)])
             nn = n[ok]
-            below, above = ray_neighbours(q, nn, others, r)
+            below, above = ray_neighbours(q, nn, others, r, lateral=lateral)
+            # a candidate may not go past half-way to the nearest other sheet on the ray (else far)
+            lo = np.where(np.isfinite(below), below / 2.0, -float(r)).astype(np.float32)
+            hi = np.where(np.isfinite(above), above / 2.0, float(r)).astype(np.float32)
             off, conf = np.zeros(len(q), np.float32), np.zeros(len(q), np.float32)
-            for i in range(0, len(q), chunk):
-                sl = slice(i, i + chunk)
+            for i in range(0, len(q), ch):
+                sl = slice(i, i + ch)
                 pos, stren = local_maxima(profile(V, qi[sl], nn[sl], r), r, thr)
                 if W is not None:
                     vpos, vstren = local_maxima(profile(W, qi[sl], nn[sl], r), r, vthr)
@@ -439,6 +667,10 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                     stren, blocked = verso_adjust(pos, stren, vpos, vstren, Ti, margin=verso_margin,
                                                   beta=verso_beta, block=verso_block)
                     st["verso_blocked"] += float(blocked.any(0).sum())
+                stren = np.where((pos < lo[sl]) | (pos > hi[sl]), -1.0, stren).astype(np.float32)
+                if peak_tol is not None and peak_tol > 0:   # comparable peaks tie: the nearest one wins in assign
+                    smax = stren.max(0, keepdims=True)
+                    stren = np.where((stren > 0) & (stren >= smax - peak_tol), smax, stren).astype(np.float32)
                 d = assign(pos, stren, below[sl], above[sl])
                 hit = np.isfinite(d)
                 off[sl] = np.where(hit, d, 0.0)
@@ -446,9 +678,6 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             if ct is not None:  # masked CT: no evidence
                 idx = np.clip(np.rint(qi).astype(int), 0, np.array(V.shape) - 1)
                 conf[ct[idx[:, 0], idx[:, 1], idx[:, 2]] == 0] = 0
-            # never cross a neighbouring sheet: stay at least 1 voxel on this side of it
-            hi = np.where(np.isfinite(above), above - 1.0, r).astype(np.float32)
-            lo = np.where(np.isfinite(below), below + 1.0, -r).astype(np.float32)
             field, w = np.zeros(g.shape[:2], np.float32), np.zeros(g.shape[:2], np.float32)
             field[ok], w[ok] = np.clip(off, lo, hi), conf
             dd = smooth(field, w, sig_it[j])
@@ -462,8 +691,22 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             st["capped"] += float((np.isfinite(below) | np.isfinite(above)).sum())
             st["mean_abs_move"] += float(np.abs(dd[ok]).sum())
             st["max_move"] = max(st["max_move"], float(np.abs(dd).max()))
+            if diag is not None and it == 0:
+                diag["first_move"][j] = dd.astype(np.float32)
         for j, (g, n, dd) in enumerate(zip(grids, ns, moves)):  # move all sheets after all were measured
-            grids[j] = g + dd[..., None] * np.where(np.isfinite(n), n, 0)
+            nz = np.where(np.isfinite(n), n, 0)
+            new = g + dd[..., None] * nz
+            if reparam_on:            # along the surface, back to the published arc-length fractions
+                new = reparam(new, rest[j], fades[j].astype(np.float32))
+            if relax and relax > 0:   # in the refined surface's own tangent plane: nodes stay on it
+                wr = (relax * fades[j] * (np.isfinite(g).all(-1))).astype(np.float32)
+                new = relax_tangential(new, np.nan_to_num(normals(new, ax)), wr, relax_iters, P0=rest[j])
+            if guard:
+                new, nev = fold_guard(g, new, rest[j], n_rest[j], min_sps[j])
+                st["folds"] += nev
+                if diag is not None:
+                    diag["folds"][j] += nev
+            grids[j] = new
         for k in ("with_peak", "mean_abs_move", "capped", "verso_blocked"):
             if k in st:
                 st[k] = st[k] / max(tot, 1)
@@ -471,6 +714,166 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         if log:
             log(json.dumps(st))
     return grids, stats
+
+
+def mesh_opt(grids, V, origin, n0s, movable, W=None, steps=100, lr=0.1, trust=3.0, verso_t=(1.0, 2.0),
+             w_data=1.0, w_verso=0.3, w_edge=1.0, w_bend=1.0, w_fold=10.0, rest=None, min_gap=8.0,
+             pair_every=25, pair_R=24.0, lateral=None, w_gap=1.0, w_cross=10.0, pair_stride=2, normal_only=True,
+             device=None, log=None):
+    """A JOINT mesh solve over every sheet of a tile (vertices = valid nodes of all grids; edges = grid u,
+    v and one diagonal), initialised from the snap, with Adam on the GPU when there is one:
+
+        data   mean(1 - recto(p))                       (trilinear on the uint8 store)
+        verso  mean_t verso(p + t n)                    (a verso face just outside the recto side: wrong sheet)
+        edge   mean((|e| - |e0|)^2) / pitch^2           (ARAP-lite: keep the snapped edge lengths)
+        bend   mean(|L(p) - L(p0)|^2) / pitch^2         (L = 4-neighbour Laplacian: no new wiggles)
+        fold   mean(relu(-J sign J0)) / pitch^2         (J = the quad's u x v . n)
+        gap    mean(relu(min_gap - s0 g)^2) / min_gap^2 (g = (p_j - p_i) . n_i to the nearest OTHER sheet's
+                                                          node along n_i, re-found every `pair_every` steps;
+                                                          s0 = the pair's side in `rest`, the published grids)
+        cross  mean(relu(-s0 g))                        (no sheet crosses its neighbour)
+
+    Only `movable` nodes move (tile/grid boundaries, anchors and taper stay put), each by at most `trust`
+    voxels, and (normal_only, the default) only along its original normal: Adam's per-coordinate step
+    otherwise random-walks nodes sideways where the objective is flat (0.4 voxel of drift on a test slab). Returns (grids, {term: [first, last]})."""
+    import torch
+    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    o = np.asarray(origin, np.float32)
+    idx, P0, N0, M, R0, GID, QM = [], [], [], [], [], [], []
+    base = 0
+    for k, (g, n, m, r0) in enumerate(zip(grids, n0s, movable, rest or grids)):
+        ok = np.isfinite(g).all(-1) & np.isfinite(n).all(-1) & np.isfinite(r0).all(-1)
+        ix = np.full(g.shape[:2], -1, np.int64)
+        ix[ok] = base + np.arange(int(ok.sum()))
+        base += int(ok.sum())
+        idx.append(ix)
+        P0.append(g[ok] - o)
+        N0.append(n[ok])
+        M.append(m[ok])
+        R0.append(r0[ok] - o)
+        GID.append(np.full(int(ok.sum()), k))
+        QM.append(grid_stride_mask(ok.shape, pair_stride)[ok])
+    if base == 0:
+        return grids, {}
+
+    def pairs(ix, a, b):
+        x, y = ix[a].ravel(), ix[b].ravel()
+        k = (x >= 0) & (y >= 0)
+        return np.stack([x[k], y[k]], -1)
+    E = np.concatenate([np.concatenate([pairs(ix, (slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+                                        pairs(ix, (slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+                                        pairs(ix, (slice(None, -1), slice(None, -1)), (slice(1, None), slice(1, None)))])
+                        for ix in idx])
+    Q = []
+    Lp = []
+    for ix in idx:
+        if ix.shape[0] >= 2 and ix.shape[1] >= 2:
+            q = np.stack([ix[:-1, :-1].ravel(), ix[:-1, 1:].ravel(), ix[1:, :-1].ravel(), ix[1:, 1:].ravel()], -1)
+            Q.append(q[(q >= 0).all(-1)])
+        if ix.shape[0] >= 3 and ix.shape[1] >= 3:
+            c = ix[1:-1, 1:-1]
+            nb = np.stack([ix[:-2, 1:-1], ix[2:, 1:-1], ix[1:-1, :-2], ix[1:-1, 2:]], -1)
+            k = (c >= 0) & (nb >= 0).all(-1)
+            Lp.append(np.concatenate([c[k][:, None], nb[k]], -1))
+    Q = np.concatenate(Q) if Q else np.zeros((0, 4), np.int64)
+    Lp = np.concatenate(Lp) if Lp else np.zeros((0, 5), np.int64)
+    t = lambda a, dt=torch.float32: torch.as_tensor(np.ascontiguousarray(a), dtype=dt, device=dev)  # noqa: E731
+    p0, n0 = t(np.concatenate(P0)), t(np.concatenate(N0))
+    n0np, r0np, gid, qm = np.concatenate(N0), np.concatenate(R0), np.concatenate(GID), np.concatenate(QM)
+    lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids])))
+    pairs = {}
+
+    def find_pairs(pnp):
+        i, j = sheet_pairs(pnp, n0np, gid, pair_R, lat, qmask=qm)
+        s0 = np.sign(((r0np[j] - r0np[i]) * n0np[i]).sum(-1))
+        k = s0 != 0
+        pairs["i"], pairs["j"], pairs["s0"] = t(i[k], torch.long), t(j[k], torch.long), t(s0[k])
+    mv = t(np.concatenate(M).astype(np.float32))[:, None]
+    E_, Q_, L_ = t(E, torch.long), t(Q, torch.long), t(Lp, torch.long)
+    Vt = t(np.asarray(V), torch.uint8) if np.asarray(V).dtype == np.uint8 else t(np.asarray(V) * 255, torch.uint8)
+    Wt = None if W is None else t(np.asarray(W), torch.uint8)
+    shp = torch.tensor(Vt.shape, device=dev)
+
+    def tri(vol, q):
+        f = torch.floor(q)
+        fr = q - f
+        i0 = f.long()
+        out = torch.zeros(len(q), device=dev)
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    ii = i0 + torch.tensor([dz, dy, dx], device=dev)
+                    inb = ((ii >= 0) & (ii < shp)).all(-1)
+                    ic = torch.minimum(torch.clamp(ii, min=0), shp - 1)
+                    v = vol[ic[:, 0], ic[:, 1], ic[:, 2]].float() / 255.0
+                    wgt = (fr[:, 0] if dz else 1 - fr[:, 0]) * (fr[:, 1] if dy else 1 - fr[:, 1]) * \
+                          (fr[:, 2] if dx else 1 - fr[:, 2])
+                    out = out + torch.where(inb, v * wgt, torch.zeros_like(v))
+        return out
+    pch = float(torch.linalg.norm(p0[E_[:, 1]] - p0[E_[:, 0]], dim=-1).median()) if len(E_) else 1.0
+    pch = max(pch, 1e-3)
+    e0 = torch.linalg.norm(p0[E_[:, 1]] - p0[E_[:, 0]], dim=-1)
+    lap = lambda p: p[L_[:, 1:]].mean(1) - p[L_[:, 0]]  # noqa: E731
+    L0 = lap(p0)
+
+    def jac(p):
+        a, b, c = p[Q_[:, 0]], p[Q_[:, 1]], p[Q_[:, 2]]
+        nq = n0[Q_].sum(1)
+        return (torch.linalg.cross(b - a, c - a) * nq).sum(-1)
+    J0s = torch.sign(jac(p0))
+    delta = torch.zeros((len(p0), 1) if normal_only else tuple(p0.shape), device=dev, requires_grad=True)
+    optim = torch.optim.Adam([delta], lr=lr)
+    disp = (lambda d: d * n0 * mv) if normal_only else (lambda d: d * mv)   # noqa: E731
+
+    def terms(p):
+        tr = {"data": (1 - tri(Vt, p)).mean()}
+        if Wt is not None and w_verso:
+            tr["verso"] = torch.stack([tri(Wt, p + tt * n0).mean() for tt in verso_t]).mean()
+        if len(E_):
+            tr["edge"] = ((torch.linalg.norm(p[E_[:, 1]] - p[E_[:, 0]], dim=-1) - e0) ** 2).mean() / pch ** 2
+        if len(L_):
+            tr["bend"] = ((lap(p) - L0) ** 2).sum(-1).mean() / pch ** 2
+        if len(Q_):
+            tr["fold"] = torch.relu(-jac(p) * J0s).mean() / pch ** 2
+        if len(pairs.get("i", [])):
+            i, j, s0 = pairs["i"], pairs["j"], pairs["s0"]
+            gp = ((p[j] - p[i]) * n0[i]).sum(-1) * s0
+            tr["gap"] = (torch.relu(min_gap - gp) ** 2).mean() / min_gap ** 2
+            tr["cross"] = torch.relu(-gp).mean()
+        return tr
+    wts = {"data": w_data, "verso": w_verso, "edge": w_edge, "bend": w_bend, "fold": w_fold, "gap": w_gap,
+           "cross": w_cross}
+    hist = {}
+    for s in range(int(steps) + 1):
+        if (w_gap or w_cross) and s % max(int(pair_every), 1) == 0 and s < steps:
+            find_pairs((p0 + disp(delta.detach())).cpu().numpy())
+        p = p0 + disp(delta)
+        tr = terms(p)
+        if s == 0 or s == steps:
+            for k, v in tr.items():
+                hist.setdefault(k, []).append(round(float(v.detach()), 6))
+        if s == steps:
+            break
+        loss = sum(wts[k] * v for k, v in tr.items())
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+        with torch.no_grad():
+            nrm = torch.linalg.norm(delta, dim=-1, keepdim=True)
+            delta.mul_(torch.clamp(trust / torch.clamp(nrm, min=1e-9), max=1.0))
+    out = (p0 + disp(delta.detach())).cpu().numpy() + o
+    res = []
+    for g, ix in zip(grids, idx):
+        h = g.copy()
+        k = ix >= 0
+        h[k] = out[ix[k]]
+        res.append(h.astype(np.float32))
+    if log:
+        log(json.dumps({"mesh_opt": hist, "nodes": int(base), "device": str(dev)}))
+    del Vt, Wt
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
+    return res, hist
 
 
 def refine(g, V, origin, ax, **kw):
@@ -1083,6 +1486,25 @@ def crop_png(vz, wz, ctz, sb, sa, others, y0, x0, scale, label):
     ImageDraw.Draw(img).text((3, 2), label + "   before | after", fill=(0, 0, 0))
     return img
 
+def spacing_png(path, bins, hist, pitch_vox, size=(520, 220)):
+    """Grid-edge length histograms: published (gray) and refined (green), with the pitch marked."""
+    from PIL import Image, ImageDraw
+    W, H = size
+    img = Image.new("RGB", (W, H + 30), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    top = max(max(int(h.max()) for h in hist.values()), 1)
+    nb = len(bins) - 1
+    bw = (W - 20) / nb
+    for k, col in (("before", (150, 150, 150)), ("after", (0, 160, 0))):
+        pts = [(10 + (i + 0.5) * bw, H - 5 - (H - 20) * hist[k][i] / top) for i in range(nb)]
+        d.line(pts, fill=col, width=2)
+    xp = 10 + (pitch_vox - bins[0]) / (bins[-1] - bins[0]) * (W - 20)
+    d.line([(xp, 10), (xp, H - 5)], fill=(200, 0, 0), width=1)
+    d.text((10, H + 5), f"grid edge length 0..{bins[-1]:g} vox; gray published, green refined, red pitch {pitch_vox:g}",
+           fill=(0, 0, 0))
+    img.save(path)
+    return path
+
 def hist_png(path, moves, far, bins=None, cell=(260, 120)):
     """Small multiples of the signed normal displacement (voxels) per surface: {name: (N,) array}."""
     from PIL import Image, ImageDraw
@@ -1137,6 +1559,11 @@ def load_frame(args):
 def run(args):
     from rvsm import axis as AX
     log = lambda s: print(s, flush=True)   # noqa: E731
+    sched = [int(float(v)) for v in str(args.far).replace(";", ",").split(",") if v.strip()]
+    if args.iters is None:
+        args.iters = len(sched) if len(sched) > 1 else 3
+    args.far_sched = far_schedule(sched if len(sched) > 1 else sched[0], args.iters)
+    args.far = max(args.far_sched)
     o_s, S_s, _ = store_box(args.recto)
     lo, shape = o_s.copy(), S_s.copy()
     if args.z0 is not None:
@@ -1223,8 +1650,11 @@ def run(args):
     # snap's reach). Only one tile's stores and dense grids are in memory at a time.
     sigma_vox = float(args.sigma_vox) if args.sigma_vox is not None else 2.0 * float(args.pitch)
     sigma_fin = float(args.sigma_final) if args.sigma_final is not None else sigma_vox / 2.0
-    log(json.dumps({"sigma_vox": sigma_vox, "sigma_final_vox": sigma_fin, "pitch": args.pitch, "far": args.far,
-                    "iters": args.iters, "local_normal": bool(args.local_normal)}))
+    min_sp = float(args.min_spacing) if args.min_spacing is not None else 0.4 * float(args.pitch)
+    log(json.dumps({"sigma_vox": sigma_vox, "sigma_final_vox": sigma_fin, "pitch": args.pitch,
+                    "far": args.far_sched, "iters": args.iters, "local_normal": bool(args.local_normal),
+                    "relax": args.relax, "reparam": bool(args.reparam), "min_spacing": min_sp, "peak_tol": args.peak_tol,
+                    "mesh_opt": bool(args.mesh_opt)}))
     halo = max(int(args.halo), 3 * int(args.far) + 8, 44, int(np.ceil(3 * max(sigma_vox, sigma_fin))))
     tile = int(args.tile) if args.tile and args.tile > 0 else int(max(shape[1], shape[2]))
     rpad = int(args.far) + 4                     # the snap samples +-far around a halo point
@@ -1242,6 +1672,12 @@ def run(args):
     canv = {z: [np.zeros(cshape, np.uint8), np.zeros(cshape, np.uint8)] for z in zs}
     segs_b, segs_a = {z: [] for z in zs}, {z: [] for z in zs}
     moves = {x["name"]: [] for x in surf}
+    first = {x["name"]: [] for x in surf}          # |first-pass move| of core nodes
+    diagn = {x["name"]: {"folds": 0, "drift_sum": 0.0, "n": 0, "sp_b": [0.0, 0.0, 0], "sp_a": [0.0, 0.0, 0]}
+             for x in surf}
+    sp_bins = np.linspace(0, 3 * float(args.pitch), 61)
+    sp_hist = {"before": np.zeros(60, np.int64), "after": np.zeros(60, np.int64)}
+    tile_pairs = []
     ncrop = 0 if args.no_surface_png else max(int(args.crops), 0)
     cz_lo, cz_hi = lo[0] + args.taper + 4, lo[0] + shape[0] - args.taper - 4
     czs = [float(int(z)) + 0.5 for z in (np.linspace(cz_lo, cz_hi, ncrop) if ncrop > 1 and cz_hi > cz_lo
@@ -1296,17 +1732,43 @@ def run(args):
         pit = [pitch(g) for g in g0]
         sig = [sigma_vox / max(p, 1e-3) if np.isfinite(p) else 2.0 for p in pit]
         sig_f = [sigma_fin / max(p, 1e-3) if np.isfinite(p) else 1.0 for p in pit]
-        g1, st = refine_many(g0, V, rlo.astype(np.float32), ax, far=args.far, sigma=sig,
+        dg = {}
+        g1, st = refine_many(g0, V, rlo.astype(np.float32), ax, far=args.far_sched, sigma=sig,
                              iters=args.iters, thr=args.thr, ct=ct_mask, W=W, thick=thick, T=args.thickness,
                              verso_thr=args.verso_thr, verso_beta=args.verso_beta,
                              verso_block=np.inf if args.verso_block is None else args.verso_block,
                              verso_margin=args.verso_margin, holds=holds, taper=args.taper,
-                             box=(o, s), sigma_final=sig_f, local_normal=bool(args.local_normal), log=None)
-        stats.append({"tile": [cy0, cy1, cx0, cx1], "pieces": len(pieces), "iters": st})
+                             box=(o, s), sigma_final=sig_f, local_normal=bool(args.local_normal),
+                             relax=args.relax, relax_iters=args.relax_iters, guard=args.fold_guard,
+                             min_spacing=min_sp, peak_tol=args.peak_tol, reparam_on=args.reparam, diag=dg, log=None)
+        folds = list(dg.get("folds", [0] * len(g1)))
+        Tt = st[-1].get("thickness", args.thickness or 8.0) if st else (args.thickness or 8.0)
+        min_gap = max(float(Tt), min_sp)
+        n_rest = [normals(g, ax) for g in g0]
+        tp = {"tile": ti + 1, "min_gap": round(min_gap, 3),
+              "published": pair_stats(g0, g0, n_rest, min_gap), "snap": pair_stats(g0, g1, n_rest, min_gap)}
+        if args.mesh_opt:
+            mov = []
+            for g, h in zip(g1, holds):
+                inner = _nbr_mean(g)[1] == 4
+                inb = np.isfinite(g).all(-1) & ((g >= np.maximum(rlo, lo) + 2) & (g <= np.minimum(rhi, lo + shape) - 3)).all(-1)
+                fd = box_taper(g, o, s, args.taper)
+                mov.append(inner & inb & (fd > 0.5) & ((h if h is not None else 0.0) < 0.5))
+            snap = g1
+            g1, mh = mesh_opt(snap, V, rlo.astype(np.float32), n_rest, mov, W=W, steps=args.mesh_steps,
+                              lr=args.mesh_lr, rest=g0, min_gap=min_gap, log=None)
+            for j in range(len(g1)):   # the guard has the last word
+                g1[j], nev = fold_guard(snap[j], g1[j], g0[j], n_rest[j], min_sp)
+                folds[j] += nev
+            tp["mesh_opt"] = mh
+            tp["final"] = pair_stats(g0, g1, n_rest, min_gap)
+        tile_pairs.append(tp)
+        stats.append({"tile": [cy0, cy1, cx0, cx1], "pieces": len(pieces), "iters": st, "pairs": tp})
         log(json.dumps({"tile": ti + 1, "of": len(cores), "core_yx": [cy0, cy1, cx0, cx1], "pieces": len(pieces),
-                        **{k: v for k, v in st[-1].items() if k != "iter"}}))
+                        **{k: v for k, v in st[-1].items() if k != "iter"}, "folds_total": int(sum(folds)),
+                        "pairs": {k: v for k, v in tp.items() if k not in ("tile",)}}))
         Ve = V if circ else read_box(args.eval_store, rlo, rs)
-        for pz, b in zip(pieces, g1):
+        for pi_, (pz, b) in enumerate(zip(pieces, g1)):
             x, a, up = surf[pz["si"]], pz["pub"], surf[pz["si"]]["up"]
             ina = np.isfinite(a).all(-1) & ((a >= o) & (a < o + s)).all(-1)
             core = ina & (a[..., 1] >= cy0) & (a[..., 1] < cy1) & (a[..., 2] >= cx0) & (a[..., 2] < cx1)
@@ -1321,6 +1783,23 @@ def run(args):
             n0 = normals(a, ax)
             dvg = ((b - a) * np.nan_to_num(n0)).sum(-1)
             moves[x["name"]].append(dvg[core].astype(np.float32))
+            dn = diagn[x["name"]]
+            if "first_move" in dg:
+                first[x["name"]].append(np.abs(dg["first_move"][pi_][core]).astype(np.float32))
+            dn["folds"] += int(folds[pi_])
+            tang = (b - a) - dvg[..., None] * np.nan_to_num(n0)
+            tk = core & np.isfinite(tang).all(-1)
+            dn["drift_sum"] += float(np.linalg.norm(tang[tk], axis=-1).sum())
+            dn["n"] += int(tk.sum())
+            for g, key, hk in ((a, "sp_b", "before"), (b, "sp_a", "after")):
+                for axx in (0, 1):
+                    e = np.linalg.norm(np.diff(g, axis=axx), axis=-1)
+                    cm = core[:-1, :] if axx == 0 else core[:, :-1]
+                    e = e[cm & np.isfinite(e)]
+                    dn[key][0] += float(e.sum())
+                    dn[key][1] += float((e * e).sum())
+                    dn[key][2] += int(len(e))
+                    sp_hist[hk] += np.histogram(np.clip(e, 0, sp_bins[-1] - 1e-6), sp_bins)[0]
             for z in czs:
                 cd = cdat[x["name"]][z]
                 for g, dst in ((a, cd[0]), (b, cd[1])):
@@ -1384,6 +1863,7 @@ def run(args):
     png = args.png_dir or os.path.join(args.out, "png")
     os.makedirs(png, exist_ok=True)
     hist_png(os.path.join(png, "displacement_hist.png"), moves, args.far)
+    spacing_png(os.path.join(png, "spacing_hist.png"), sp_bins, sp_hist, float(args.pitch))
     ct_cache = {}
 
     def ct_fn(z, y0, y1, x0, x1, stride=1):
@@ -1446,6 +1926,21 @@ def run(args):
             mr["warning"] = "over-smoothed? median |move| < 0.5 voxel"
         elif len(dv) and mr["median_abs_move"] > args.far / 2:
             mr["warning"] = f"runaway? median |move| > far/2 = {args.far / 2:g} voxels"
+        fm = np.concatenate(first[x["name"]]) if first[x["name"]] else np.zeros(0, np.float32)
+        if len(fm):
+            mr["first_pass_abs_move"] = {q: round(float(np.percentile(fm, v)), 3)
+                                         for q, v in (("p10", 10), ("p50", 50), ("p90", 90), ("max", 100))}
+            log(json.dumps({"first_pass": x["name"], **mr["first_pass_abs_move"]}))
+            if mr["first_pass_abs_move"]["p50"] > 10:
+                mr["far_off"] = True
+        dn = diagn[x["name"]]
+        mr["tangential_drift_mean"] = round(dn["drift_sum"] / max(dn["n"], 1), 4)
+        mr["folds"] = int(dn["folds"])
+        for key, nm in (("sp_b", "spacing_before"), ("sp_a", "spacing_after")):
+            sm, sq, c = dn[key]
+            mu = sm / max(c, 1)
+            sd = float(np.sqrt(max(sq / max(c, 1) - mu * mu, 0.0)))
+            mr[nm] = {"mean": round(mu, 3), "cv": round(sd / max(mu, 1e-9), 4)}
         if "warning" in mr:
             log(f"WARNING: {x['name']}: {mr['warning']} (median {mr['median_abs_move']}, mean {mr['mean_abs_move']})")
         move_rep[x["name"]] = mr
@@ -1465,9 +1960,31 @@ def run(args):
         log(json.dumps(rec))
     pooled = {nm: {q: round(sum(v * w for v, w in vals) / max(sum(w for _, w in vals), 1), 4) for q, vals in t.items()}
               for nm, t in tot.items()}
-    log(json.dumps({"pooled": pooled, "circular": bool(circ)}))
+    far_off = sorted(nm for nm, mr in move_rep.items() if mr.get("far_off"))
+    tot_mv = {}
+    for mr in move_rep.values():
+        for k in ("folds",):
+            tot_mv[k] = tot_mv.get(k, 0) + mr[k]
+    npt = sum(max(diagn[nm]["n"], 0) for nm in diagn)
+    tot_mv["tangential_drift_mean"] = round(sum(diagn[nm]["drift_sum"] for nm in diagn) / max(npt, 1), 4)
+    for key, nm in (("sp_b", "spacing_before"), ("sp_a", "spacing_after")):
+        sm = sum(diagn[k][key][0] for k in diagn)
+        sq = sum(diagn[k][key][1] for k in diagn)
+        c = sum(diagn[k][key][2] for k in diagn)
+        mu = sm / max(c, 1)
+        tot_mv[nm] = {"mean": round(mu, 3), "cv": round(float(np.sqrt(max(sq / max(c, 1) - mu * mu, 0))) / max(mu, 1e-9), 4)}
+    pr = {}
+    for tp in tile_pairs:
+        for stage in ("published", "snap", "final"):
+            if stage in tp:
+                for k in ("pairs", "under_min", "crossings"):
+                    pr.setdefault(stage, {}).setdefault(k, 0)
+                    pr[stage][k] += tp[stage][k]
+    tot_mv["pairs"] = pr
+    log(json.dumps({"pooled": pooled, "circular": bool(circ), "geometry": tot_mv, "far_off": far_off}))
     with open(os.path.join(args.out, "refine_report.json"), "w") as f:
         json.dump({"box": [*lo.tolist(), *shape.tolist()], "tile": tile, "halo": halo, "moves": move_rep,
+                   "geometry": tot_mv, "far_off": far_off, "tile_pairs": tile_pairs, "far": args.far_sched,
                    "sigma_vox": sigma_vox, "sigma_final_vox": sigma_fin, "stats": stats,
                    "pooled": pooled, "circular": bool(circ), "surfaces": [x["name"] for x in surf]}, f, indent=1)
     return 0
@@ -1492,15 +2009,34 @@ def parser():
     ap.add_argument("--z0", type=int, help="fine-frame slab start (cross-section mode)")
     ap.add_argument("--dz", type=int, default=128)
     ap.add_argument("--box", type=int, nargs=6, help="Z Y X DZ DY DX instead of the store / slab box")
-    ap.add_argument("--far", type=int, default=12)
+    ap.add_argument("--far", default="40,24,16,8",
+                    help="search radius per iteration, voxels: a schedule '40,24,16,8' (first pass wide) or one "
+                         "number (fixed)")
     ap.add_argument("--sigma-vox", type=float, default=None,
                     help="displacement smoothing, voxels along the sheet (default 2 x --pitch: follows locally; "
                          "usrm2 used 40 = 2 cells of its 20-voxel grid)")
     ap.add_argument("--sigma-final", type=float, default=None,
                     help="smoothing of the LAST iteration only, voxels (default sigma-vox / 2)")
-    ap.add_argument("--local-normal", action=argparse.BooleanOptionalAction, default=True,
-                    help="recompute the normals from the refined grid every iteration (default on)")
-    ap.add_argument("--iters", type=int, default=3)
+    ap.add_argument("--local-normal", action=argparse.BooleanOptionalAction, default=False,
+                    help="recompute the normals from the refined grid every iteration (default off: every node "
+                         "moves along its ORIGINAL normal, so nodes cannot slide along the sheet and bunch)")
+    ap.add_argument("--iters", type=int, default=None, help="default: the --far schedule's length (3 for one radius)")
+    ap.add_argument("--peak-tol", type=float, default=0.15,
+                    help="peaks within this strength of the strongest tie; the one nearest the current position wins")
+    ap.add_argument("--reparam", action=argparse.BooleanOptionalAction, default=True,
+                    help="after each move, slide nodes along the surface back to the published arc-length "
+                         "fractions per grid row/column (undoes bunching exactly)")
+    ap.add_argument("--relax", type=float, default=0.5, help="tangential Laplacian relaxation weight (0 = off)")
+    ap.add_argument("--relax-iters", type=int, default=2)
+    ap.add_argument("--fold-guard", action=argparse.BooleanOptionalAction, default=True,
+                    help="pull back nodes whose quads flip or whose spacing drops below --min-spacing")
+    ap.add_argument("--min-spacing", type=float, default=None,
+                    help="voxels (default 0.4 x --pitch); also the floor of the mesh stage's inter-sheet gap")
+    ap.add_argument("--mesh-opt", action="store_true",
+                    help="after the snap, a joint torch mesh solve over all sheets of a tile (data, verso, "
+                         "edge, bend, fold, inter-sheet gap and no-crossing terms)")
+    ap.add_argument("--mesh-steps", type=int, default=100)
+    ap.add_argument("--mesh-lr", type=float, default=0.1)
     ap.add_argument("--thr", type=float, default=0.5)
     ap.add_argument("--verso-thr", type=float)
     ap.add_argument("--verso-beta", type=float, default=0.5)

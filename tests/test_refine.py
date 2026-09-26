@@ -464,3 +464,121 @@ def test_pick_crops_spreads_over_z_and_finds_the_big_moves():
     assert picks[1][4] == "largest moves" and picks[1][2] > 800 and picks[1][3] > 5
     xs = [p[2] for p in picks]
     assert min(abs(a - b) for i, a in enumerate(xs) for b in xs[i + 1:]) >= 128
+
+
+# ------------------------------------------------------------------------------------ no bunching, no folds
+
+def wavy_case(A=3.0, lam=40.0):
+    yc = lambda x: 30 + A * np.sin(2 * np.pi * x / lam)   # noqa: E731
+    V = band_volume((20, 64, 128), yc, width=1.2)
+    Z, X = np.meshgrid(np.arange(2, 18, 2, dtype=np.float32), np.arange(2, 126, 2, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, np.full_like(Z, 30.0), X], -1)
+    return V, g, yc
+
+
+def u_spacing_cv(g):
+    e = np.linalg.norm(np.diff(g, axis=1), axis=-1)[1:-1, 2:-2]
+    return float(e.std() / e.mean())
+
+
+def test_wavy_band_keeps_even_spacing_and_never_folds():
+    """A wavy published sheet half a wavelength out of phase with its wavy band: the old scheme (normals
+    recomputed every iteration, no relaxation, no guard) slides nodes down the slopes -- spacing CV ~0.9,
+    folded quads. Normal-only moves + reparametrisation + the guard: even spacing, no fold, on the band."""
+    A, lam = 4.0, 32.0
+    yc = lambda x: 32 + A * np.sin(2 * np.pi * x / lam)   # noqa: E731
+    V = band_volume((20, 64, 128), yc, width=1.2)
+    Z, X = np.meshgrid(np.arange(2, 18, 2, dtype=np.float32), np.arange(2, 126, 2, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, 32 + A * np.sin(2 * np.pi * (X / lam - 0.5)), X], -1).astype(np.float32)
+    kw = dict(far=12, sigma=1.0, iters=6, thr=0.3)
+    (old,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, local_normal=True, relax=0, guard=False, reparam_on=False, **kw)
+    dg = {}
+    (new,), st = R.refine_many([g], V, (0, 0, 0), AX_Y, diag=dg, **kw)
+    n0 = R.normals(g, AX_Y)
+    min_sp = 0.4 * R.pitch(g)
+    assert u_spacing_cv(old) > 0.5 and R.bad_nodes(old, g, n0, min_sp).sum() > 0      # the bug, reproduced
+    assert u_spacing_cv(new) < 0.1, u_spacing_cv(new)
+    assert R.bad_nodes(new, g, n0, min_sp).sum() == 0
+    inner = (slice(1, -1), slice(2, -2))
+    assert np.abs(new[inner][..., 1] - yc(new[inner][..., 2])).mean() < 0.3
+    assert sum(s["folds"] for s in st) == sum(dg["folds"])
+
+
+def test_reparam_restores_the_published_fractions_along_the_surface():
+    g = flat_sheet(10.0, z=(0, 4), x=(0, 12))
+    bunched = g.copy()
+    bunched[..., 2] = 11 * (np.linspace(0, 1, 12) ** 2)[None]           # same line, nodes crowded at x=0
+    out = R.reparam(bunched, g, np.ones(g.shape[:2], np.float32))
+    np.testing.assert_allclose(out, g, atol=1e-5)
+    held = R.reparam(bunched, g, np.zeros(g.shape[:2], np.float32))
+    np.testing.assert_array_equal(held, bunched)
+
+
+def test_fold_guard_pulls_back_a_crossing_node():
+    g = flat_sheet(10.0, z=(0, 6), x=(0, 8)) * np.array([1, 1, 2], np.float32)   # x pitch 2
+    n0 = np.zeros_like(g)
+    n0[..., 1] = 1
+    bad = g.copy()
+    bad[3, 3, 2] += 5.0                                    # slides past two neighbours: folds
+    P, nev = R.fold_guard(g, bad, g, n0, 0.8)
+    assert nev > 0 and R.bad_nodes(P, g, n0, 0.8).sum() == 0
+    ok = g.copy()
+    ok[..., 1] += 1.0                                      # a pure normal move: nothing to guard
+    P, nev = R.fold_guard(g, ok, g, n0, 0.8)
+    assert nev == 0 and np.allclose(P, ok)
+
+
+def test_far_schedule_and_the_half_gap_bound():
+    assert R.far_schedule([40, 24, 16, 8], 6) == [40, 24, 16, 8, 8, 8] and R.far_schedule(12, 3) == [12, 12, 12]
+    # a lone sheet 20 voxels off its band: a wide first pass finds it, a fixed 8 cannot
+    V = band_volume((16, 64, 32), lambda x: 40 + 0 * x)
+    g = flat_sheet(20.0)
+    (a,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, far=[32, 16, 8], sigma=1.0, iters=3, thr=0.3)
+    (b,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, far=8, sigma=1.0, iters=3, thr=0.3)
+    inner = (slice(2, -2), slice(2, -2))
+    assert np.abs(a[inner][..., 1] - 40).mean() < 0.5 and np.abs(b[inner][..., 1] - 20).mean() < 0.5
+    # with a neighbour sheet 16 voxels above, the band 12 above is past half-way: not taken
+    up = flat_sheet(36.0)
+    (c, _), _ = R.refine_many([flat_sheet(24.0), up], band_volume((16, 64, 32), lambda x: 36 + 0 * x),
+                              (0, 0, 0), AX_Y, far=16, sigma=1.0, iters=2, thr=0.3)
+    assert np.abs(c[inner][..., 1] - 24).max() <= 8.01
+
+
+def test_peak_tol_prefers_the_nearer_of_two_comparable_peaks():
+    V = np.maximum(band_volume((16, 64, 32), lambda x: 36 + 0 * x),
+                   0.9 * band_volume((16, 64, 32), lambda x: 27 + 0 * x))
+    g = flat_sheet(24.0)
+    (a,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, far=16, sigma=1.0, iters=2, thr=0.3)
+    inner = (slice(2, -2), slice(2, -2))
+    assert np.abs(a[inner][..., 1] - 27).mean() < 0.5
+
+
+def test_mesh_opt_lowers_the_data_loss_and_keeps_the_spacing():
+    V, g, yc = wavy_case()
+    (snap,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, far=8, sigma=3.0, sigma_final=3.0, iters=2, thr=0.3)
+    n0 = R.normals(g, AX_Y)
+    mov = (R._nbr_mean(snap)[1] == 4)
+    (opt,), h = R.mesh_opt([snap], (V * 255).astype(np.uint8), (0, 0, 0), [n0], [mov], steps=100, lr=0.1,
+                           rest=[g], device="cpu")
+    assert h["data"][1] < h["data"][0]
+    assert abs(u_spacing_cv(opt) - u_spacing_cv(snap)) < 0.05
+    assert R.bad_nodes(opt, g, n0, 0.4 * R.pitch(g)).sum() == 0
+
+
+def test_mesh_opt_is_joint_and_keeps_two_sheets_apart():
+    V = band_volume((16, 64, 32), lambda x: 30 + 0 * x)          # one band, two sheets want it
+    lo_, hi_ = flat_sheet(28.0), flat_sheet(32.0)
+    n0 = [R.normals(lo_, AX_Y), R.normals(hi_, AX_Y)]
+    mov = [R._nbr_mean(x)[1] == 4 for x in (lo_, hi_)]
+    (a, b), h = R.mesh_opt([lo_, hi_], (V * 255).astype(np.uint8), (0, 0, 0), n0, mov, steps=150, lr=0.1,
+                           rest=[lo_, hi_], min_gap=4.0, w_gap=5.0, device="cpu")
+    assert "gap" in h and "cross" in h
+    inner = (slice(2, -2), slice(2, -2))
+    gap = b[inner][..., 1] - a[inner][..., 1]
+    (a0, b0), _ = R.mesh_opt([lo_, hi_], (V * 255).astype(np.uint8), (0, 0, 0), n0, mov, steps=150, lr=0.1,
+                             rest=[lo_, hi_], w_gap=0.0, w_cross=0.0, device="cpu")
+    gap0 = b0[inner][..., 1] - a0[inner][..., 1]
+    assert gap0.mean() < 1.0                                      # alone, each sheet takes the one band
+    assert gap.min() > 2.0 and gap.mean() > 3.0                   # jointly: never merged, never crossed
+    st = R.pair_stats([lo_, hi_], [a, b], n0, 4.0)
+    assert st["crossings"] == 0 and st["pairs"] > 0
