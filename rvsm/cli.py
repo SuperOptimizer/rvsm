@@ -19,11 +19,13 @@ USAGE = """rvsm <command> [options]
   teachers   fetch [recto,m7] [--cache DIR] [--extras]
   grid-repack DIR [DIR ...] [--jobs N] [--dry-run] [--force] [--wait S]   (rvsm/grid_repack.py)
   store-gc   --out DIR [--round R] [--delete] [--gen0] [--min-age-min 30]   (rvsm/store_gc.py)
+  refine     --recto S [--verso S] --paths DIR --umbilicus U --out DIR [--z0 Z --dz 128] [--anchors F]
+             (rvsm/tools/refine/refine.py; docs/refine.md)
 """
 
 COMMANDS = ("run", "produce", "train", "eval", "export", "calibrate", "pretrain", "ladder",
             "status", "stop", "ledger", "umbilicus", "teachers", "verso", "grid-repack",
-            "store-gc")
+            "store-gc", "refine")
 
 
 def _stack_dumps():
@@ -1182,3 +1184,12 @@ def store_gc(argv):
 
 if __name__ == "__main__":       # kept LAST: `main` dispatches on the functions defined above it
     raise SystemExit(main())
+
+
+# --------------------------------------------------------------------------- #
+# `rvsm refine`: snap published tifxyz surfaces onto the recto (+ verso) stores
+# --------------------------------------------------------------------------- #
+def refine(argv):
+    """The `refine` subcommand: rvsm.tools.refine.refine's CLI (see docs/refine.md)."""
+    from rvsm.tools.refine import refine as R
+    return R.main(argv)

@@ -1,0 +1,341 @@
+"""The surface refiner (rvsm/tools/refine/refine.py): the usrm2 tests ported, plus the verso term, the anchor
+field, the frame round trip and an end-to-end slab run over real volcomp stores."""
+import json
+import os
+
+import numpy as np
+import pytest
+
+from rvsm.tools.refine import refine as R
+
+AX_Y = np.array([[0.0, 100.0], [-1000.0, -1000.0], [16.0, 16.0]])   # axis far below: outward = +y
+
+
+def band_volume(shape, y_center, width=2.0):
+    """A soft band at y = y_center(x) inside a (Z,Y,X) volume."""
+    z, y, x = np.mgrid[:shape[0], :shape[1], :shape[2]].astype(np.float32)
+    return np.exp(-0.5 * ((y - y_center(x)) / width) ** 2).astype(np.float32)
+
+
+def flat_sheet(y, z=(2, 14), x=(2, 30)):
+    Z, X = np.meshgrid(np.arange(*z, dtype=np.float32), np.arange(*x, dtype=np.float32), indexing="ij")
+    return np.stack([Z, np.full_like(Z, y), X], -1)
+
+
+# ------------------------------------------------------------------------------------ ported from usrm2
+
+def test_refine_moves_a_shifted_surface_onto_the_band():
+    shape = (24, 64, 64)
+    yc = lambda x: 30 + 4 * np.sin(x / 10.0)  # noqa: E731
+    V = band_volume(shape, yc)
+    xs, zs = np.arange(4, 60, dtype=np.float32), np.arange(2, 22, dtype=np.float32)
+    Z, X = np.meshgrid(zs, xs, indexing="ij")
+    g = np.stack([Z, np.zeros_like(Z), X], -1)
+    g[..., 1] = yc(g[..., 2]) + 3.0
+    g[5:8, 10:14, 1] += 4.0
+    ax = np.array([[0.0, 100.0], [-1000.0, -1000.0], [32.0, 32.0]])
+    g1, stats = R.refine(g, V, (0, 0, 0), ax, far=8, sigma=1.5, iters=3, thr=0.3)
+    err0 = np.abs(g[..., 1] - yc(g[..., 2])).mean()
+    err1 = np.abs(g1[..., 1] - yc(g1[..., 2])).mean()
+    assert err0 > 2.5 and err1 < 0.8, (err0, err1)
+    assert np.isfinite(g1).all() and stats[-1]["with_peak"] > 0.9
+
+
+def test_refine_reads_a_uint8_store_like_a_float_one():
+    shape = (16, 48, 32)
+    V = band_volume(shape, lambda x: 20 + 0 * x)
+    Vu = np.clip(np.rint(V * 255), 0, 255).astype(np.uint8)
+    g = flat_sheet(23.0)
+    a, _ = R.refine(g, V, (0, 0, 0), AX_Y, far=6, sigma=1.0, iters=2, thr=0.3)
+    b, _ = R.refine(g, Vu, (0, 0, 0), AX_Y, far=6, sigma=1.0, iters=2, thr=0.3)
+    assert np.abs(a - b).max() < 0.05 and abs(b[..., 1].mean() - 20) < 0.5
+
+
+def test_refine_leaves_holes_and_outside_points_alone():
+    shape = (16, 32, 32)
+    V = band_volume(shape, lambda x: 16 + 0 * x)
+    g = np.zeros((6, 6, 3), np.float32)
+    g[..., 0], g[..., 2] = np.arange(6)[:, None] * 2 + 2, np.arange(6)[None] * 4 + 4
+    g[..., 1] = 19.0
+    g[2, 2] = np.nan
+    g[0, 0] = (8, 19, 200)  # outside the store
+    g1, _ = R.refine(g, V, (0, 0, 0), AX_Y, far=6, sigma=1.0, iters=2, thr=0.3)
+    assert np.isnan(g1[2, 2]).all() and np.allclose(g1[0, 0], g[0, 0])
+    inside = np.isfinite(g1).all(-1) & (g1[..., 2] < 100)
+    assert np.abs(g1[inside][:, 1] - 16).mean() < 1.0
+
+
+def test_joint_refinement_keeps_two_close_sheets_apart():
+    """Two sheets 6 voxels apart, both published 4 voxels too high: alone, the upper one would jump onto the
+    lower band; jointly, each stays on its own band."""
+    shape = (16, 64, 32)
+    V = np.maximum(band_volume(shape, lambda x: 30 + 0 * x, 1.2), band_volume(shape, lambda x: 36 + 0 * x, 1.2))
+    lower, upper = flat_sheet(34.0), flat_sheet(40.0)  # true 30 and 36, both +4
+    (l1, u1), st = R.refine_many([lower, upper], V, (0, 0, 0), AX_Y, far=8, sigma=1.0, iters=4, thr=0.3)
+    assert abs(l1[..., 1].mean() - 30) < 1.0 and abs(u1[..., 1].mean() - 36) < 1.0, (l1[..., 1].mean(), u1[..., 1].mean())
+    assert st[0]["capped"] > 0.5  # the sheets saw each other on the ray
+
+
+def test_joint_assignment_keeps_two_sheets_ordered_when_both_are_nearest_one_band():
+    """Both published sheets are nearest the UPPER band (36): alone each would land on it and they would
+    merge; jointly the lower one takes the lower band and the order lower < upper holds at every point."""
+    shape = (16, 64, 32)
+    V = np.maximum(band_volume(shape, lambda x: 30 + 0 * x, 1.2), band_volume(shape, lambda x: 36 + 0 * x, 1.2))
+    lower, upper = flat_sheet(34.5), flat_sheet(37.5)
+    alone, _ = R.refine(lower, V, (0, 0, 0), AX_Y, far=8, sigma=1.0, iters=3, thr=0.3)
+    assert abs(alone[..., 1].mean() - 36) < 1.0      # the failure the joint assignment exists for
+    (l1, u1), _ = R.refine_many([lower, upper], V, (0, 0, 0), AX_Y, far=8, sigma=1.0, iters=3, thr=0.3)
+    assert (l1[..., 1] < u1[..., 1] - 3).all()
+    assert abs(l1[..., 1].mean() - 30) < 1.0 and abs(u1[..., 1].mean() - 36) < 1.0
+
+
+def test_assign_prefers_one_peak_per_sheet_in_order():
+    pos = np.array([[-4.0], [2.0], [0.0], [0.0], [0.0], [0.0]], np.float32)   # peaks at -4 and +2
+    stren = np.array([[1.0], [1.0], [-1], [-1], [-1], [-1]], np.float32)
+    assert abs(R.assign(pos, stren, np.array([np.nan]), np.array([np.nan]))[0] - 2.0) < 1e-4
+    assert abs(R.assign(pos, stren, np.array([np.nan]), np.array([6.0]))[0] + 4.0) < 1e-4
+
+
+def test_upsample_densifies_and_keeps_holes():
+    Z, X = np.meshgrid(np.arange(0, 100, 20, dtype=np.float32), np.arange(0, 100, 20, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, 30 + 0.1 * X, X], -1)
+    g[2, 2] = np.nan
+    u = R.upsample(g, 5)
+    assert u.shape == (21, 21, 3)
+    ok = np.isfinite(u).all(-1)
+    v = u[ok][:, 0] / 4
+    assert np.abs(v - np.round(v)).max() < 1e-3 and np.abs(np.diff(u[0, :, 2])).mean() == pytest.approx(4.0, abs=1e-3)
+    assert not ok[10, 10] and ok[0, 0] and ok[20, 20]
+    assert np.allclose(u[::5, ::5][np.isfinite(g).all(-1)], g[np.isfinite(g).all(-1)], atol=1e-3)   # nodes kept
+    assert R.auto_up(g, 4.0) == 5
+
+
+def test_ray_neighbours_finds_the_sheets_on_the_ray():
+    q = np.array([[5.0, 10.0, 5.0]], np.float32)
+    n = np.array([[0.0, 1.0, 0.0]], np.float32)
+    others = np.array([[5, 4, 5], [5, 16.5, 5.5], [5, 13, 9]], np.float32)  # below 6, above 6.5, a lateral miss
+    b, a = R.ray_neighbours(q, n, others, R=8)
+    assert b[0] == pytest.approx(-6.0) and a[0] == pytest.approx(6.5)
+
+
+# ----------------------------------------------------------------------------------------- verso term
+
+def test_verso_first_candidate_is_rejected():
+    """Peaks at -11 (sheet A's recto) and +9 (sheet B's recto); B's verso is at +1, between the vertex and +9:
+    reaching B's recto would cross B's back face, so only A is left."""
+    pos = np.array([[-11.0], [9.0]], np.float32)
+    stren = np.array([[0.9], [0.9]], np.float32)
+    vpos = np.array([[1.0], [-19.0]], np.float32)
+    vstren = np.array([[0.9], [0.9]], np.float32)
+    st, blocked = R.verso_adjust(pos, stren, vpos, vstren, T=8.0)
+    assert blocked[:, 0].tolist() == [False, True] and st[1, 0] < 0 and st[0, 0] > 0.9   # A paired (+ bonus)
+    assert R.assign(pos, st, np.array([np.nan]), np.array([np.nan]))[0] == pytest.approx(-11.0)
+    st2, _ = R.verso_adjust(pos, stren, vpos, vstren, T=8.0, block=0.5)        # the penalised variant
+    assert 0 < st2[1, 0] < st2[0, 0]
+    # a verso AT the vertex (the surface sits on the back face) does not block its own recto one T outward
+    st3, b3 = R.verso_adjust(np.array([[8.0]], np.float32), np.array([[0.9]], np.float32),
+                             np.array([[0.2]], np.float32), np.array([[0.9]], np.float32), T=8.0)
+    assert not b3.any() and st3[0, 0] > 0.9
+
+
+def test_thickness_from_peaks():
+    pos = np.array([[30.0, 31.0, 29.5]], np.float32)
+    stren = np.ones_like(pos)
+    vpos = np.array([[22.0, 23.0, 21.0], [50.0, 50.0, 50.0]], np.float32)
+    assert R.thickness_from_peaks(pos, stren, vpos, np.ones_like(vpos)) == pytest.approx(8.0)
+
+
+def two_sheet_scene(T=8.0):
+    """Sheets A (verso 22 / recto 30) and B (verso 42 / recto 50) along +y (outward)."""
+    shape = (16, 72, 32)
+    c = lambda y: (lambda x: y + 0 * x)  # noqa: E731
+    V = np.maximum(band_volume(shape, c(30), 1.2), band_volume(shape, c(50), 1.2))
+    W = np.maximum(band_volume(shape, c(30 - T), 1.2), band_volume(shape, c(50 - T), 1.2))
+    return V, W
+
+
+def test_verso_term_stops_a_jump_across_the_gap():
+    """A surface of sheet A pushed to y=41, one voxel short of B's verso: on the recto alone it snaps outward
+    onto B (+9, the nearer peak); with the verso the path to B crosses B's back face, so it returns to A."""
+    V, W = two_sheet_scene()
+    g = flat_sheet(41.0)
+    alone, _ = R.refine(g, V, (0, 0, 0), AX_Y, far=12, sigma=1.0, iters=3, thr=0.3)
+    assert abs(alone[..., 1].mean() - 50) < 1.0
+    with_v, st = R.refine(g, V, (0, 0, 0), AX_Y, far=12, sigma=1.0, iters=3, thr=0.3, W=W)
+    assert abs(with_v[..., 1].mean() - 30) < 1.0, with_v[..., 1].mean()
+    assert st[0]["verso_blocked"] > 0.9 and st[0]["thickness"] == pytest.approx(8.0, abs=0.5)
+    # a thickness store gives the same answer (codes of 0.25 voxel)
+    thick = np.full(V.shape, 32, np.uint8)
+    tv, _ = R.refine(g, V, (0, 0, 0), AX_Y, far=12, sigma=1.0, iters=3, thr=0.3, W=W, thick=thick)
+    assert abs(tv[..., 1].mean() - 30) < 1.0
+
+
+# -------------------------------------------------------------------------------------------- anchors
+
+def test_anchor_log_replay_and_field(tmp_path):
+    p = tmp_path / "anchors.jsonl"
+    recs = [{"op": "add", "id": "a1", "surface": "segA", "grid_rc": [5, 5], "from_zyx": [5, 20, 5],
+             "to_zyx": [5, 26, 5], "plane_normal_zyx": [1, 0, 0], "ts": "t"},
+            {"op": "add", "id": "a2", "surface": "segA", "grid_rc": None, "from_zyx": [0, 20, 30],
+             "to_zyx": [0, 10, 30], "plane_normal_zyx": [1, 0, 0], "ts": "t"},
+            {"op": "del", "id": "a2"},
+            {"op": "add", "id": "b1", "surface": "segB.tifxyz", "grid_rc": [0, 0], "from_zyx": [0, 0, 0],
+             "to_zyx": [0, 1, 0], "plane_normal_zyx": [1, 0, 0], "ts": "t"}]
+    p.write_text("\n".join(json.dumps(r) for r in recs) + "\n{\"op\":\"add\",\"id\"")   # a torn last line
+    live = R.read_anchors(str(p))
+    assert sorted(a["id"] for a in live) == ["a1", "b1"]
+    assert [a["id"] for a in live if R.anchor_matches(a, ("segB",))] == ["b1"]
+    Z, X = np.meshgrid(np.arange(0, 40, 2, dtype=np.float32), np.arange(0, 80, 2, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, np.full_like(Z, 20.0), X], -1)             # pitch 2 voxels
+    mine = [a for a in live if R.anchor_matches(a, ("segA",))]
+    f, top = R.anchor_field(g, mine, sigma=6.0, rc_map=lambda rc: (rc[0], rc[1]))
+    assert np.allclose(f[5, 5], (0, 6, 0), atol=1e-4) and top[5, 5] == pytest.approx(1.0)
+    assert np.abs(f[15:, 25:]).max() < 1e-3 and top[15:, 25:].max() < 1e-3      # tapered to zero far away
+    assert 0 < f[5, 7, 1] < 6                                                       # and in between
+    # no grid_rc: the grid point nearest from_zyx
+    f2, _ = R.anchor_field(g, [dict(mine[0], grid_rc=None, from_zyx=[10, 20, 14], to_zyx=[10, 26, 14])], sigma=6.0)
+    assert np.allclose(f2[5, 7], (0, 6, 0), atol=1e-4)
+
+
+def test_anchor_holds_its_cell_against_the_snap():
+    """An anchor drags a patch onto y=26 where the band is at 20: the snap would pull it back, the hold does
+    not let it at the anchor cell, and the far side of the sheet still snaps."""
+    V = band_volume((16, 48, 64), lambda x: 20 + 0 * x, 1.5)
+    g = flat_sheet(20.0, x=(2, 62))
+    a = {"grid_rc": [6, 10], "from_zyx": g[6, 10].tolist(), "to_zyx": (g[6, 10] + (0, 6, 0)).tolist()}
+    f, top = R.anchor_field(g, [a], sigma=2.0, rc_map=lambda rc: rc)
+    g0 = g + f
+    g1, _ = R.refine(g0, V, (0, 0, 0), AX_Y, far=8, sigma=1.0, iters=3, thr=0.3, holds=[top])
+    assert g1[6, 10, 1] == pytest.approx(26.0, abs=0.05)
+    assert abs(g1[6, 50, 1] - 20) < 0.5
+
+
+# --------------------------------------------------------------------------------------------- frames
+
+FINE_TO_LEGACY = np.array([[-0.2384, -0.1936, 0.0021, 11024.0],
+                           [-0.1937, 0.2385, -0.0040, 2861.8],
+                           [-0.0008, 0.0045, 0.3066, -9057.1]])
+
+
+def test_frame_round_trip(tmp_path):
+    p = tmp_path / "transform.json"
+    mov = np.array([[18844.0, 22610.0, 59000.0], [15507.0, 20140.0, 46293.0], [22312.0, 18412.0, 64845.0],
+                    [18687.0, 9133.0, 33095.0]])
+    fix = mov @ FINE_TO_LEGACY[:, :3].T + FINE_TO_LEGACY[:, 3]
+    p.write_text(json.dumps({"fixed_volume": "PHercParis4-20230205180739_masked",
+                             "transformation_matrix": FINE_TO_LEGACY.tolist(),
+                             "fixed_landmarks": fix.tolist(), "moving_landmarks": mov.tolist()}))
+    fr = R.transform_json_frame(str(p))
+    leg_zyx = fix[:, ::-1].astype(np.float32)
+    fine = fr.to_fine(leg_zyx)
+    assert np.abs(fine - mov[:, ::-1]).max() < 0.05                     # legacy -> fine lands on the landmarks
+    assert np.abs(fr.to_src(fine) - leg_zyx).max() < 1e-2
+    # a legacy_to_fine function without an inverse is inverted numerically
+    A = np.linalg.inv(np.vstack([FINE_TO_LEGACY, [0, 0, 0, 1]]))[:3]
+    ff = R.function_frame(lambda xyz: xyz @ A[:, :3].T + A[:, 3])
+    assert np.abs(ff.to_fine(leg_zyx) - fine).max() < 0.05
+    assert np.abs(ff.to_src(ff.to_fine(leg_zyx)) - leg_zyx).max() < 1e-2
+    so = R.scale_offset_frame(7.91 / 2.4, (10, 20, 30))
+    assert np.allclose(so.to_src(so.to_fine(leg_zyx)), leg_zyx, atol=1e-2)
+    # NaN holes pass through
+    assert np.isnan(fr.to_fine(np.array([[np.nan, 1, 2]]))).all()
+
+
+def test_write_back_touches_only_moved_nodes():
+    fr = R.scale_offset_frame(2.0, (100, 100, 100))
+    src = np.random.default_rng(0).uniform(10, 50, (10, 12, 3)).astype(np.float32)
+    src[0, 0] = np.nan
+    fine = fr.to_fine(src)
+    crop, rc = fine[2:7, 3:9], (2, 3)
+    dense = R.upsample(crop, 3)
+    new = dense.copy()
+    new[3, 3] += (0, 4.0, 0)                                   # node (1, 1) of the crop = (3, 4) published
+    out = R.write_back(src, rc, 3, crop, new, fr)
+    moved = np.zeros(src.shape[:2], bool)
+    moved[3, 4] = True
+    assert np.array_equal(out[~moved], src[~moved], equal_nan=True)
+    assert np.allclose(out[3, 4], src[3, 4] + (0, 2.0, 0), atol=1e-3)   # 4 fine voxels = 2 source voxels
+
+
+def test_frame_kind_and_find_surfaces(tmp_path):
+    for seg, frames in (("s1", ("s1-on-20260411134726-2.4um", "s1-on-20230205180739-7.91um", "s1-on-x-45.532um")),
+                        ("s2", ("s2-on-20230205180739-7.91um",))):
+        for f in frames:
+            d = tmp_path / seg / (f + ".tifxyz")
+            d.mkdir(parents=True)
+            (d / "x.tif").write_bytes(b"")
+    found = R.find_surfaces(str(tmp_path))
+    assert [(n, s) for n, s, _ in found] == [("s1-on-20260411134726-2.4um", "s1"), ("s2-on-20230205180739-7.91um", "s2")]
+    assert [R.frame_kind(d) for _, _, d in found] == ["fine", "legacy"]
+    assert R.find_surfaces(str(tmp_path), ("7.91um",))[0][0].endswith("7.91um")
+    assert R.frame_kind(str(tmp_path / "s1" / "s1-on-x-45.532um.tifxyz")) == "coarse"
+
+
+def test_plane_segments_trace_a_flat_sheet():
+    g = flat_sheet(20.0, z=(0, 10), x=(0, 30))
+    s = R.plane_segments(g, 4.5)
+    assert len(s) == 29 and np.allclose(s[..., 0], 20.0) and np.allclose(np.sort(s[..., 1].ravel())[[0, -1]], (0, 29))
+
+
+# ------------------------------------------------------------------------------------ end to end (stores)
+
+def write_tifxyz_raw(d, g, scale=0.05):
+    import tifffile
+    os.makedirs(d, exist_ok=True)
+    for i, c in enumerate("zyx"):
+        tifffile.imwrite(os.path.join(d, f"{c}.tif"), np.where(np.isfinite(g[..., i]), g[..., i], 0).astype(np.float32))
+    v = g[np.isfinite(g).all(-1)]
+    json.dump({"bbox": [v.min(0)[::-1].tolist(), v.max(0)[::-1].tolist()], "format": "tifxyz",
+               "scale": [scale, scale], "type": "seg", "uuid": "x"}, open(os.path.join(d, "meta.json"), "w"))
+
+
+def test_end_to_end_slab_in_the_legacy_frame(tmp_path, has_volcomp):
+    """Two stores (recto, verso) over a 128^3 fine box; one surface published in a 'legacy' frame (fine =
+    legacy * 2 + offset) 3 voxels off its band; refine a 64-deep slab. The refined tifxyz is written back in
+    the legacy frame: inside the slab it sits on the band, outside it is bit-identical, and the PNGs and the
+    report exist."""
+    if not has_volcomp:
+        pytest.skip("volcomp not available")
+    from rvsm import stores
+    o = np.array([128, 256, 384])
+    T = 8.0
+    z, y, x = np.mgrid[:128, :128, :128].astype(np.float32)
+    yc = 60 + 0.1 * x                                   # recto band, box-local
+    rec = np.exp(-0.5 * ((y - yc) / 1.5) ** 2)
+    ver = np.exp(-0.5 * ((y - (yc - T)) / 1.5) ** 2)
+    rp, vp, ep = (str(tmp_path / n) for n in ("recto.zarr", "verso.zarr", "eval.zarr"))
+    stores.write(rp, stores.u8(rec), o, q=0)
+    stores.write(vp, stores.u8(ver), o, q=0)
+    stores.write(ep, stores.u8(np.exp(-0.5 * ((y - yc - 0.3) / 2.0) ** 2)), o, q=0)   # another "teacher"
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": -20000, "x": 448}, {"z": 1000, "y": -20000, "x": 448}]}))
+    # published surface: fine pitch 6, whole z range of the box and beyond, +3 voxels in y
+    zs, xs = np.arange(100, 290, 6, dtype=np.float32), np.arange(390, 506, 6, dtype=np.float32)
+    Z, X = np.meshgrid(zs, xs, indexing="ij")
+    fine = np.stack([Z, o[1] + 60 + 0.1 * (X - o[2]) + 3.0, X], -1)
+    scale, off = 2.0, np.array([10.0, 20.0, 30.0])
+    leg = (fine - off) / scale
+    sd = tmp_path / "paths" / "segA" / "segA-on-20230205180739-7.91um.tifxyz"
+    write_tifxyz_raw(str(sd), leg)
+    out = tmp_path / "out"
+    rc = R.main(["--recto", rp, "--verso", vp, "--paths", str(tmp_path / "paths"), "--umbilicus", str(umb),
+                 "--out", str(out), "--z0", str(o[0] + 32), "--dz", "64", "--legacy-scale", "2.0",
+                 "--legacy-offset", "10", "20", "30", "--far", "8", "--sigma-vox", "8", "--thr", "0.3",
+                 "--eval-store", ep, "--slices", "3", "--taper", "4"])
+    assert rc == 0
+    import tifffile
+    got = np.stack([tifffile.imread(str(out / "segA-on-20230205180739-7.91um" / f"{c}.tif")) for c in "zyx"], -1)
+    assert got.shape == leg.shape
+    gf = got * scale + off
+    err = gf[..., 1] - (o[1] + 60 + 0.1 * (gf[..., 2] - o[2]))
+    inside = (gf[..., 0] >= o[0] + 40) & (gf[..., 0] < o[0] + 88)
+    outside = (fine[..., 0] < o[0] + 32 - 16) | (fine[..., 0] >= o[0] + 96 + 16)
+    assert np.abs(err[inside]).mean() < 0.8, np.abs(err[inside]).mean()
+    assert np.array_equal(got[outside], leg[outside].astype(np.float32))
+    assert (out / "segA-on-20230205180739-7.91um.before" / "x.tif").exists()
+    pngs = sorted(os.listdir(out / "png"))
+    assert "displacement_hist.png" in pngs and sum(p.startswith("slab_z") for p in pngs) == 3
+    rep = json.load(open(out / "refine_report.json"))
+    assert rep["circular"] is False
+    assert rep["pooled"]["after"]["offset_le3"] >= rep["pooled"]["before"]["offset_le3"]
+    assert abs(rep["pooled"]["after"]["offset_mean"]) < abs(rep["pooled"]["before"]["offset_mean"])
