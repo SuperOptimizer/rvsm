@@ -1022,6 +1022,132 @@ def test_a_dead_producer_is_restarted_at_once_then_with_backoff(tmp_path):
     assert w.check() == "restart"                              # immediate again
 
 
+def test_a_recycled_producer_is_respawned_at_once_and_the_backoff_is_untouched(tmp_path):
+    """`producer_recycle_*`: a producer that exits 0 with `recycle` in its last stamp is respawned at the
+    next look even inside a backoff window, and `fails` / `next_at` are exactly what they were -- a
+    recycle is never counted toward RESTART_FATAL. The same stamp from ANOTHER pid, or with a nonzero
+    exit code, is an ordinary death. (The pids are ones no process has: the watch signals a dead
+    producer's group.)"""
+    NOPID = 1 << 30
+    clock = [1000.0]
+    out, procs, spawned, w = _watch(tmp_path, _FakeProc(alive=False, exitcode=1, pid=NOPID), clock)
+    hbp = os.path.join(out, "workers", "produce.json")
+    RUN._write_json(hbp, {"last_ts": clock[0]})
+    assert w.check() == "restart" and w.fails == 1              # a real death first: backoff armed
+    fails, nxt = w.fails, w.next_at
+    for i in range(RUN.RESTART_FATAL + 3):                     # many recycles, all inside the window
+        p = procs["produce"]
+        p.pid, p.alive, p.exitcode = NOPID + 1 + i, False, 0
+        RUN._write_json(hbp, {"pid": p.pid, "phase": "exit", "recycle": True, "reason": "fields 2",
+                              "last_ts": clock[0]})
+        assert w.check() == "recycle"
+        assert (w.fails, w.next_at) == (fails, nxt)
+        assert RUN._read_json(hbp)["phase"] == "spawning"      # the flag is not left for the next one
+    assert len(spawned) == 1 + RUN.RESTART_FATAL + 3
+    sched = RUN.tail_jsonl(os.path.join(out, "logs", "sched.jsonl"), 100)
+    rec = [r for r in sched if r.get("reason") == "recycle"]
+    assert len(rec) == RUN.RESTART_FATAL + 3 and all(r["recycle"] and r["why"] == "fields 2" for r in rec)
+    assert not any(r.get("kind") == "producer_fatal" for r in sched)
+    # not a recycle: the stamp is another process's, or the exit code is not 0
+    p = procs["produce"]
+    p.pid, p.alive, p.exitcode = NOPID + 500, False, 0
+    RUN._write_json(hbp, {"pid": NOPID + 499, "recycle": True, "last_ts": clock[0]})
+    assert w.check() == "backoff" and w.fails == fails
+    RUN._write_json(hbp, {"pid": NOPID + 500, "recycle": True, "last_ts": clock[0]})
+    p.exitcode = -9
+    assert w.check() == "backoff"
+    # a producer THREAD (cpu mode) has no pid: its stamp carries the supervisor's own
+    th = _FakeProc(alive=False, exitcode=None)
+    del th.pid
+    procs["produce"] = th
+    RUN._write_json(hbp, {"pid": os.getpid(), "recycle": True, "last_ts": clock[0]})
+    assert w.check() == "recycle" and w.fails == fails
+
+
+def test_the_malloc_calls_are_guarded_without_glibc(monkeypatch):
+    """`malloc_trim` / `set_mallopt` are no-ops (False / {}) where there is no glibc; with glibc (this
+    Linux host) they run and report what they set, and an env MALLOC_ARENA_MAX wins over the config."""
+    import platform
+    monkeypatch.setattr(RUN, "_LIBC", [])
+    monkeypatch.setattr(platform, "libc_ver", lambda *a, **k: ("musl", "1.2"))
+    assert RUN.glibc() is None
+    assert RUN.malloc_trim() is False
+    assert RUN.set_mallopt(thresholds=True, arena_max=2) == {}
+    monkeypatch.setattr(RUN, "_LIBC", [None])                  # resolved once, remembered
+    assert RUN.malloc_trim() is False
+    monkeypatch.undo()
+    if RUN.glibc() is None:
+        pytest.skip("no glibc on this host")
+    assert RUN.malloc_trim() in (True, False)
+    monkeypatch.setenv("MALLOC_ARENA_MAX", "2")
+    got = RUN.set_mallopt(thresholds=True, arena_max=4)
+    assert got == {"trim_threshold": 1, "mmap_threshold": 1}   # mallopt returns 1 on success
+    assert RUN.set_mallopt(thresholds=False, arena_max=0) == {}
+
+
+def test_the_producer_recycles_after_n_fields_regions_and_the_run_goes_on(region_cfg, fake_teacher,
+                                                                           tmp_path, has_volcomp):
+    """`producer_recycle_fields = 1` on a real run (cpu mode: the producer is a thread): every fields
+    region ends that producer cleanly (a `recycle` sched line with its RSS), the supervisor respawns it
+    at once with the backoff untouched, and the next one carries on from the disk -- every committed
+    store intact and no unit done twice."""
+    if not has_volcomp:
+        pytest.skip("a region store is a volcomp array; no libvolcomp on this host")
+    from rvsm import regions as RG, targets as TG
+    cfg = replace(region_cfg, out=str(tmp_path / "recycle"),
+                  teacher_ckpts={"fake": fake_teacher.ckpt}, mode="cpu", gpus=(), rounds=1,
+                  steps=10 ** 6, eval_every=2, verso_after_steps=0, verso_min_dice=0.0,
+                  round_steps=10 ** 9, heldout=1, workers=0, min_regions_before_train=1,
+                  lookahead_extra=2, reserve_gb=0.001, infer_window=64, infer_halo=8, cascade_depth=1,
+                  verso_regen_gain=10.0, producer_recycle_fields=1)
+    out = cfg.out
+    sched_p = os.path.join(out, "logs", "sched.jsonl")
+    box = {}
+
+    def go():
+        box["ck"] = RUN.run(cfg, out=cfg.out)
+
+    th = threading.Thread(target=go, daemon=True)
+    th.start()
+    t0 = time.time()
+    while time.time() - t0 < 1200 and th.is_alive():
+        rs = [r for r in RUN.tail_jsonl(sched_p, 10 ** 4) if r.get("reason") == "recycle"]
+        if len(rs) >= 2:
+            break
+        time.sleep(1.0)
+    RUN.request_stop(out)
+    th.join(600)
+    assert not th.is_alive(), "the run did not stop"
+    sched = RUN.tail_jsonl(sched_p, 10 ** 5)
+    rec = [r for r in sched if r.get("kind") == "recycle"]
+    restarts = [r for r in sched if r.get("kind") == "restart"]
+    assert len(rec) >= 2, f"the producer never recycled twice: {restarts}"
+    # the trigger is the first region; the fields already queued drain before the exit
+    assert all(r["fields"] >= 1 and r["rss_gb"] > 0 and "producer_recycle_fields" in r["reason"]
+               for r in rec)
+    # every restart was a recycle: nothing died, the backoff never moved
+    assert restarts and all(r["reason"] == "recycle" and r["fails"] == 0 for r in restarts), restarts
+    assert not [r for r in sched if r.get("kind") == "producer_fatal"]
+    log = RUN.tail_jsonl(os.path.join(out, "logs", "produce.jsonl"), 10 ** 5)
+    starts = [r for r in log if r.get("kind") == "start"]
+    # a fresh producer after every respawn (the last recycle may land after STOP: not respawned)
+    assert len(restarts) >= 2 and len(rec) >= len(restarts) and len(starts) == len(restarts) + 1
+    # the fields line carries the RSS before and after malloc_trim
+    fl = [r for r in log if r.get("kind") == "fields"]
+    assert fl and all("rss_gb" in r and "rss_trim_gb" in r for r in fl)
+    # no double work: every unit of every kind, once
+    for kind in ("teacher", "verso", "fields"):
+        keys = [(tuple(r["region"]), r["round"], r.get("gen")) for r in log if r.get("kind") == kind]
+        assert len(keys) == len(set(keys)), (kind, keys)
+    # every committed store intact: the regions the recycled producers finished have current fields
+    frungs = RUN.field_rungs(cfg)
+    for r in fl:
+        assert TG.fields_current(out, tuple(r["region"]), r["round"], rungs=frungs), r["region"]
+    cat = RG.Catalog(out, 0, ttl=0.0)
+    for lo in cat.list_done("verso"):
+        assert stores.is_done(stores.store_path(out, "recto", lo, 0))
+
+
 def test_a_silent_producer_is_replaced_only_once_it_has_exited(tmp_path):
     """A silent producer is terminated (then killed); a new one is spawned only once the old one has
     EXITED -- one that will not die is reported, never duplicated -- and a producer THREAD (cpu mode),

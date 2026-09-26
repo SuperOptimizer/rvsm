@@ -195,7 +195,12 @@ FINGERPRINT_EXCLUDE = ("infer_margin", "steps", "eval_every", "workers", "gpus",
                        "teacher_route", "loss_band", "band_dilate", "band_eps",
                        # the THINNED-BAND rung-2 target (docs/recipe.md §6): computed on the device at step
                        # time from the stored recto, switched on at a resume (`loss_switch` line)
-                       "thin_band", "thin_band_width", "thin_band_soft")
+                       "thin_band", "thin_band_width", "thin_band_soft",
+                       # the producer's host-RSS hygiene (docs/recipe.md §7 "producer RSS creep"): when it
+                       # exits to be respawned, and the glibc malloc knobs it sets -- process housekeeping,
+                       # never what any store holds
+                       "producer_recycle_fields", "producer_recycle_rss_gb", "producer_mallopt",
+                       "producer_arena_max")
 
 # The loss weights a resume may retune (`run.log_switches` logs a `loss_switch` line when one moved).
 LOSS_SWITCH_FIELDS = ("loss_prob_dice", "loss_pair", "loss_skel", "loss_affinity", "loss_ect",
@@ -376,6 +381,13 @@ class Config:
     verso_regen: bool = True           # regenerate round 0's old verso stores once (verso_regen_gain)
     fields_batch: int = 0              # blocks per GPU fields batch in the producer (~0.83 GB each);
                                        # 0: 1 when the producer's VRAM budget is under 30 GB, else 3
+    producer_recycle_fields: int = 0   # the producer exits cleanly (a `recycle`, respawned at once by the
+                                       # supervisor, no backoff) after this many fields regions; 0 = never
+    producer_recycle_rss_gb: float = 0.0   # ... or once its own RSS passes this, checked between units
+    producer_mallopt: bool = True      # glibc M_TRIM_THRESHOLD 64 MB + M_MMAP_THRESHOLD 16 MB at producer
+                                       # start (and malloc_trim(0) after every fields region either way)
+    producer_arena_max: int = 2        # glibc M_ARENA_MAX at producer start (0 = glibc's 8 x cores); an
+                                       # env MALLOC_ARENA_MAX wins. The per-region RSS creep is arenas
     ram_trainer_gb: float = 40.0       # the trainer's own RSS past this: checkpoint and exit cleanly
     ram_host_exit: float = 0.90        # ... or the host's memory in use past this share of MemTotal
     verso_gate_dice: float = 0.6       # ... or earlier, once the held-out recto reaches this dice

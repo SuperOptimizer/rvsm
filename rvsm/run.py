@@ -99,6 +99,8 @@ RESTART_RESET_S = 1800.0    # a producer that has lived this long has earned a f
 RESTART_FATAL = 6           # this many restarts without a healthy run in between is shouted as FATAL
                             # (it stamps once per unit; one teacher region with its first engine
                             # builds is ~10 min on an A100, so the margin is 3x that)
+RECYCLE_MIN_S = 300.0       # a producer lives this long before `producer_recycle_rss_gb` may end it: a
+                            # baseline already over the cap must not become a respawn loop
 WAIT_S = 5.0                # the trainer's sleep when nothing in the lookahead window is ready
 IDLE_S = 2.0                # the producer's sleep when there is nothing to produce
 ROUND_GAIN = 0.02           # "< 2 % remaining gain" is the plateau half of the round gate
@@ -867,6 +869,10 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     finishing the unit in flight. Every region is one json line in `logs/produce.jsonl`."""
     from rvsm import axis as AX, ladder, regions as RG, stores, stream, targets as TG
     out = str(out)
+    # glibc's malloc, before the big allocations: the per-region host-RSS creep is arenas
+    # (docs/recipe.md §7 "producer RSS creep")
+    malloc_set = set_mallopt(thresholds=bool(getattr(cfg, "producer_mallopt", True)),
+                             arena_max=int(getattr(cfg, "producer_arena_max", 0) or 0))
     ncomp = limit_compile_threads()
     if role_gpu is not None and device is None:
         device = f"cuda:{int(role_gpu)}"
@@ -941,7 +947,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                           "regions": len(route), "heldout": len(held), "pinned": pinned,
                           "backend": str(backend), "field_rungs": list(frungs), "jobs": jobs,
                           "fields_device": fdev or "cpu", "compile_threads": ncomp,
-                          "fields_batch": fbatch,
+                          "fields_batch": fbatch, "mallopt": malloc_set, "rss_gb": round(own_rss_gb(), 2),
                           "vram_cap_gb": None if vram_cap is None else round(vram_cap / (1 << 30), 2)})
 
     bank, slot = None, StudentSlot(out, device=device, compile=cfg.compile)
@@ -990,8 +996,20 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     L = k_active + int(cfg.lookahead_extra)
     t_reest = 0.0
 
+    # the RECYCLE (`producer_recycle_fields` / `producer_recycle_rss_gb`): a clean exit like STOP's --
+    # the unit in flight finishes, the writer and the fields drain, the cache closes -- then a `recycle`
+    # line and exit code 0 with `recycle` in produce.json, which the supervisor respawns at once and
+    # never counts as a failure (`ProducerWatch`). The host RSS the process leaked goes with it
+    recycle = {"why": None, "fields": 0}
+    recycle_n = int(getattr(cfg, "producer_recycle_fields", 0) or 0)
+    # the RSS cap is this process's own: a producer THREAD (cpu mode) shares the supervisor's RSS, and
+    # re-starting it would free nothing
+    recycle_gb = float(getattr(cfg, "producer_recycle_rss_gb", 0.0) or 0.0) \
+        if threading.current_thread() is threading.main_thread() else 0.0
+
     def stopping():
-        return stop_requested(out) or (stop is not None and stop.is_set()) or \
+        return recycle["why"] is not None or stop_requested(out) or \
+            (stop is not None and stop.is_set()) or \
             (max_s is not None and time.time() - t_start > float(max_s))
 
     # THE OVERLAP. The GPU thread (this one) only ever runs network passes. Around it:
@@ -1109,11 +1127,20 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             # readers move to them (`commit_sources`)
             commit_sources(out, lo, round_, frungs)
             g = TG.field_gen(out, lo, round_)
+            # the region's host garbage back to the OS (a no-op without glibc); before / after logged
+            rss0 = own_rss_gb()
+            trimmed = malloc_trim()
+            rss1 = own_rss_gb() if trimmed else rss0
             jlog(out, "produce", {"kind": "fields", "region": list(lo), "round": round_,
                                   "s": round(time.time() - t0, 2), "cursor": cursor, "gen": g,
                                   "device": fdev or "cpu",
                                   "skipped": (rep or {}).get("skipped_blocks"),
-                                  "graphs": (rep or {}).get("graphs")})
+                                  "graphs": (rep or {}).get("graphs"),
+                                  "rss_gb": round(rss0, 3), "rss_trim_gb": round(rss1, 3)})
+            with lock:
+                recycle["fields"] += 1
+                if recycle_n and recycle["fields"] >= recycle_n and recycle["why"] is None:
+                    recycle["why"] = f"fields {recycle['fields']} >= producer_recycle_fields {recycle_n}"
         finally:
             with lock:
                 busy.discard(lo)
@@ -1121,6 +1148,11 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     try:
         while not stopping():
             settle()
+            if recycle_gb and recycle["why"] is None and time.time() - t_start > RECYCLE_MIN_S:
+                r_ = own_rss_gb()                           # between units: the RSS cap
+                if r_ > recycle_gb:
+                    recycle["why"] = f"rss {r_:.2f} GB > producer_recycle_rss_gb {recycle_gb:g}"
+                    break
             if time.time() - t_vrep >= VRAM_REPORT_S:
                 vram_report(out, bank, slot, peaks, vram_cap, "periodic")
                 t_vrep = time.time()
@@ -1422,7 +1454,15 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
         except Exception:  # noqa: BLE001
             pass
         hb_stop.set()
-        stamp({"phase": "exit"})
+        if recycle["why"] is not None:
+            rec = {"kind": "recycle", "reason": recycle["why"], "pid": os.getpid(),
+                   "fields": recycle["fields"], "rss_gb": round(own_rss_gb(), 2),
+                   "uptime_s": round(time.time() - t_start, 1)}
+            jlog(out, "sched", rec, echo=False)
+            jlog(out, "produce", rec)
+            stamp({"phase": "exit", "recycle": True, "reason": recycle["why"]})
+        else:
+            stamp({"phase": "exit"})
         jlog(out, "produce", {"kind": "exit", "pid": os.getpid()})
     settle()
     return 0
@@ -3169,9 +3209,35 @@ class ProducerWatch:
                      f"progress for {page / 60:.0f} min (restart at {2 * self.unit_stall_s / 60:.0f}) !!!!")
         return "stalled" if page > 2 * self.unit_stall_s else "stall"
 
+    def _recycled(self, pr):
+        """Did THIS producer exit as a recycle (`producer_recycle_*`)? Its last stamp says `recycle` under
+        its own pid (a thread's pid is ours) and a process exited 0."""
+        hb = self._hb()
+        if not hb.get("recycle"):
+            return False
+        pid = getattr(pr, "pid", None)
+        if pid is None:                         # a producer thread (cpu mode) stamps our pid
+            return hb.get("pid") == os.getpid()
+        return hb.get("pid") == pid and getattr(pr, "exitcode", None) == 0
+
+    def _respawn_recycled(self, pr, now):
+        """A recycle is a HEALTHY exit: respawned at once, whatever the backoff says, and the backoff
+        (`fails`, `next_at`) is left exactly as it was -- never grown, never counted toward FATAL."""
+        hb = self._hb()
+        self.restarts += 1
+        jlog(self.out, "sched", {"kind": "restart", "reason": "recycle", "recycle": True,
+                                 "why": hb.get("reason"), "pid": getattr(pr, "pid", None),
+                                 "restarts": self.restarts, "fails": self.fails}, echo=False)
+        _write_json(os.path.join(self.out, "workers", "produce.json"),
+                    {"pid": None, "phase": "spawning", "last_ts": now})
+        self.procs["produce"] = self.respawn()
+        # `born` is left too: a line of recycled producers is ONE healthy life for RESTART_RESET_S
+        return "recycle"
+
     def check(self):
         """One look. Returns what happened: None (healthy / nothing to do), "stall" (reported),
-        "restart", "backoff", "stuck" (will not exit) or "silent_thread"."""
+        "restart", "recycle" (a clean recycle exit, respawned at once), "backoff", "stuck" (will not
+        exit) or "silent_thread"."""
         pr = self.procs.get("produce")
         if pr is None or stop_requested(self.out):
             return None
@@ -3212,6 +3278,8 @@ class ProducerWatch:
             reason = f"exit {getattr(pr, 'exitcode', None)}"
             # it died on its own: its forkserver and fields pool may not have (P3-09)
             self._kill_group(pr)
+            if self._recycled(pr):
+                return self._respawn_recycled(pr, now)
         if now < self.next_at:
             return "backoff"
         self.fails += 1
@@ -3249,6 +3317,61 @@ def own_rss_gb():
             return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2 ** 30
     except (OSError, ValueError):
         return 0.0
+
+
+# glibc's mallopt parameters (malloc.h). Linux/glibc only: every call below is a no-op elsewhere
+M_TRIM_THRESHOLD, M_MMAP_THRESHOLD, M_ARENA_MAX = -1, -3, -8
+_LIBC = []        # [glibc CDLL or None], resolved once
+
+
+def glibc():
+    """The process's glibc through ctypes, or None (macOS, musl, Windows: no `malloc_trim`, and the
+    mallopt parameter numbers above are glibc's own)."""
+    if not _LIBC:
+        lib = None
+        try:
+            import ctypes
+            import platform
+            if platform.system() == "Linux" and platform.libc_ver()[0] == "glibc":
+                c = ctypes.CDLL("libc.so.6")
+                if hasattr(c, "malloc_trim") and hasattr(c, "mallopt"):
+                    lib = c
+        except (OSError, AttributeError, ValueError):
+            lib = None
+        _LIBC.append(lib)
+    return _LIBC[0]
+
+
+def malloc_trim():
+    """glibc `malloc_trim(0)`: give every arena's free top and free whole pages back to the OS. False
+    where there is no glibc."""
+    c = glibc()
+    if c is None:
+        return False
+    try:
+        return bool(c.malloc_trim(0))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def set_mallopt(thresholds=True, arena_max=0, trim_mb=64, mmap_mb=16):
+    """The producer's malloc settings, once at its start. `thresholds`: M_TRIM_THRESHOLD `trim_mb` and
+    M_MMAP_THRESHOLD `mmap_mb` (the fields' 32.8 MB windows are then mmapped and unmapped on free, not
+    carved from an arena). `arena_max` > 0: M_ARENA_MAX, unless MALLOC_ARENA_MAX is in the environment
+    (glibc read that already). Returns what was set ({} where there is no glibc)."""
+    c = glibc()
+    if c is None:
+        return {}
+    got = {}
+    try:
+        if thresholds:
+            got["trim_threshold"] = int(c.mallopt(M_TRIM_THRESHOLD, int(trim_mb) << 20))
+            got["mmap_threshold"] = int(c.mallopt(M_MMAP_THRESHOLD, int(mmap_mb) << 20))
+        if int(arena_max) > 0 and not os.environ.get("MALLOC_ARENA_MAX"):
+            got["arena_max"] = int(c.mallopt(M_ARENA_MAX, int(arena_max)))
+    except Exception as e:  # noqa: BLE001
+        got["err"] = repr(e)
+    return got
 
 
 RAM_EXIT = {}     # {out: reason} set by the supervisor's heartbeat, read by the trainer every step
