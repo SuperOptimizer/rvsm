@@ -208,6 +208,80 @@ def crop_to_box(g, origin, size, margin=64, pad=8):
     return g[r0:r1, c0:c1], (int(r0), int(c0))
 
 
+def _tif_channels(d):
+    """The z, y, x tifs of a tifxyz as (H,W) arrays: memory maps when uncompressed (vc3d writes them so),
+    else read whole."""
+    import tifffile
+    out = []
+    for c in "zyx":
+        try:
+            out.append(tifffile.memmap(f"{d}/{c}.tif", mode="r"))
+        except Exception:  # noqa: BLE001 - compressed / tiled: no memmap
+            out.append(np.asarray(tifffile.imread(f"{d}/{c}.tif"), np.float32))
+    return out
+
+
+def read_surface_box(d, frame, origin, size, margin=64, pad=8, rows=256):
+    """crop_to_box(frame.to_fine(E.read_surface(d)), origin, size, margin, pad) without holding the whole
+    grid: the tifs are memory-mapped and scanned `rows` rows at a time (fine-frame surfaces by their z
+    channel first), and only the crop is converted. Returns (crop (h,w,3) fine zyx, (r0, c0), (H, W))
+    or None when no point touches the box. A published 2.4 um grid is ~460 MB and a slab needs ~25 of
+    its ~4000 rows."""
+    o, s = np.asarray(origin, np.float32), np.asarray(size, np.float32)
+    lo_m, hi_m = o - margin, o + s + margin
+    ch = _tif_channels(d)
+    H, Wd = ch[0].shape
+    rany, cany = np.zeros(H, bool), np.zeros(Wd, bool)
+    ident = frame is IDENTITY
+
+    def grid(r0, r1, c0=0, c1=None):
+        g = np.stack([np.asarray(c[r0:r1, c0:c1], np.float32) for c in ch], -1)
+        g = np.where((g > 0).all(-1)[..., None], g, np.nan)
+        return g if ident else frame.to_fine(g)
+    for r in range(0, H, rows):
+        r1 = min(r + rows, H)
+        if ident:  # the z channel alone rules out rows
+            z = np.asarray(ch[0][r:r1], np.float32)
+            zr = ((z >= lo_m[0]) & (z < hi_m[0])).any(1)
+            if not zr.any():
+                continue
+            ri = np.where(zr)[0]
+            r, r1 = r + int(ri[0]), r + int(ri[-1]) + 1
+        g = grid(r, r1)
+        k = np.isfinite(g).all(-1) & ((g >= lo_m) & (g < hi_m)).all(-1)
+        rany[r:r1] |= k.any(1)
+        cany |= k.any(0)
+    if not rany.any():
+        del ch
+        return None
+    rr, cc = np.where(rany)[0], np.where(cany)[0]
+    r0, r1 = max(int(rr.min()) - pad, 0), min(int(rr.max()) + pad + 1, H)
+    c0, c1 = max(int(cc.min()) - pad, 0), min(int(cc.max()) + pad + 1, Wd)
+    crop = grid(r0, r1, c0, c1)
+    del ch
+    return crop, (r0, c0), (H, Wd)
+
+
+def column_pieces(g, lo, hi, pad=8):
+    """The column runs of the grid g (H,W,3 zyx) with cells inside [lo, hi), each with its own row range and
+    `pad` cells around it: [(r0, r1, c0, c1)]. Runs closer than 2*pad+1 columns merge, so pieces never
+    share a cell. A sheet crossing a slab at a slant is a thin diagonal band of its grid; its pieces are
+    small where its bounding rectangle is not."""
+    lo, hi = np.asarray(lo, np.float32), np.asarray(hi, np.float32)
+    k = np.isfinite(g).all(-1) & ((g >= lo) & (g < hi)).all(-1)
+    cols = np.nonzero(k.any(0))[0]
+    if not len(cols):
+        return []
+    H, W = k.shape
+    brk = np.nonzero(np.diff(cols) > 2 * pad + 1)[0]
+    out = []
+    for a, b in zip(np.r_[0, brk + 1], np.r_[brk, len(cols) - 1]):
+        ca, cb = int(cols[a]), int(cols[b])
+        rows = np.nonzero(k[:, ca:cb + 1].any(1))[0]
+        out.append((max(int(rows.min()) - pad, 0), min(int(rows.max()) + pad + 1, H),
+                    max(ca - pad, 0), min(cb + pad + 1, W)))
+    return out
+
 def upsample(g, f, order=1):
     """A denser grid: (H,W,3) -> ((H-1)f+1, (W-1)f+1, 3) by spline interpolation of each coordinate (holes filled
     for the interpolation, then re-masked: a new cell is a hole if any of the 4 old cells around it was one).
@@ -276,7 +350,7 @@ def box_taper(g, origin, size, taper):
 
 def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=None, chunk=400_000,
                 W=None, thick=None, T=None, verso_thr=None, verso_beta=0.5, verso_block=np.inf, verso_margin=0.5,
-                holds=None, taper=0.0, log=None):
+                holds=None, taper=0.0, box=None, log=None):
     """Joint refinement of several (H,W,3) zyx grids (NaN = hole) against V, a (Z,Y,X) probability (float in
     [0,1] or uint8) at `origin`. Each iteration: normals; per point the peaks along the normal ray and the
     neighbouring sheets on it are matched in order (assign()); the matched peak's offset is smoothed over the
@@ -286,13 +360,17 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     over the box (0 = no data); T: a fixed thickness (else estimated from the peaks at iteration 0).
     holds: per grid (H,W) weights in 0..1, 1 = anchored (never moved by the snap). taper: see `box_taper`.
     sigma: grid cells, one value or one per grid.
+    box: (origin, size) of the region being refined when V covers only part of it (a tile of a slab): points
+    must be inside both, and the taper fades at `box`'s faces, not V's.
     Returns (refined grids, per-iteration stats)."""
     o = np.asarray(origin, np.float32)
     grids = [g.copy() for g in grids]
     size = np.array(V.shape, np.float32)
     lo_b, hi_b = o, o + size - 1
+    bo, bs = (o, size) if box is None else (np.asarray(box[0], np.float32), np.asarray(box[1], np.float32))
+    lo_b, hi_b = np.maximum(lo_b, bo), np.minimum(hi_b, bo + bs - 1)
     insides = [np.isfinite(g).all(-1) & ((g >= lo_b) & (g <= hi_b)).all(-1) for g in grids]
-    fades = [box_taper(g, o, size, taper) * (1.0 - (np.clip(h, 0, 1) if h is not None else 0.0))
+    fades = [box_taper(g, bo, bs, taper) * (1.0 - (np.clip(h, 0, 1) if h is not None else 0.0))
              for g, h in zip(grids, holds or [None] * len(grids))]
     vthr = thr if verso_thr is None else verso_thr
     sigmas = list(np.broadcast_to(np.asarray(sigma, np.float64), (len(grids),)))
@@ -320,12 +398,19 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         if W is not None:
             st["thickness"] = round(float(Tg), 3)
         moves, tot = [], 0
+        bbs = [(p.min(0), p.max(0)) if len(p) else None for p in pts]
         for j, (g, n, ok, q) in enumerate(zip(grids, ns, oks, pts)):
             if not ok.any():
                 moves.append(np.zeros(g.shape[:2], np.float32))
                 continue
             qi = q - o
-            others = np.concatenate([p for k, p in enumerate(pts) if k != j and len(p)] or [np.zeros((0, 3), np.float32)])
+            # other sheets' points that can be within reach (ray_neighbours' bound is r + 3): a tree over the
+            # whole box per sheet is the slab's cost otherwise
+            pad = r + 4.0
+            bl, bh = bbs[j][0] - pad, bbs[j][1] + pad
+            others = [p[((p >= bl) & (p <= bh)).all(-1)] for k, p in enumerate(pts)
+                      if k != j and bbs[k] is not None and (bbs[k][0] <= bh).all() and (bbs[k][1] >= bl).all()]
+            others = np.concatenate([p for p in others if len(p)] or [np.zeros((0, 3), np.float32)])
             nn = n[ok]
             below, above = ray_neighbours(q, nn, others, r)
             off, conf = np.zeros(len(q), np.float32), np.zeros(len(q), np.float32)
@@ -410,7 +495,7 @@ def anchor_matches(a, names):
     return any(s in (nm, nm + ".tifxyz") or s2 == nm for nm in names)
 
 
-def anchor_field(g, anchors, sigma=48.0, clip=64.0, rc_map=None):
+def anchor_field(g, anchors, sigma=48.0, clip=64.0, rc_map=None, max_dist=None):
     """A (H,W,3) displacement field over the grid g (fine zyx) from anchors [{grid_rc, from_zyx, to_zyx}]
     (zyx already in g's frame), and its (H,W) reach `top` in 0..1.
 
@@ -420,7 +505,8 @@ def anchor_field(g, anchors, sigma=48.0, clip=64.0, rc_map=None):
     The Nadaraya-Watson average reproduces each anchor's displacement exactly at its cell and blends
     conflicting anchors between them; the max_i w_i factor tapers the field to ZERO away from any anchor
     (no information there). |d| is clipped to `clip` voxels. An anchor's cell is `rc_map(grid_rc)` (the
-    published row/col mapped into this grid), else the grid point nearest its `from_zyx`."""
+    published row/col mapped into this grid), else the grid point nearest its `from_zyx` -- skipped when that
+    is farther than `max_dist` voxels (a piece of a surface must not pull in an anchor from elsewhere)."""
     H, Wd = g.shape[:2]
     field = np.zeros((H, Wd, 3), np.float64)
     den = np.zeros((H, Wd), np.float64)
@@ -444,7 +530,11 @@ def anchor_field(g, anchors, sigma=48.0, clip=64.0, rc_map=None):
         if rc is None:
             if not len(gv):
                 continue
-            rc = iv[int(np.argmin(((gv - f) ** 2).sum(-1)))].astype(np.float64)
+            d2 = ((gv - f) ** 2).sum(-1)
+            i = int(np.argmin(d2))
+            if max_dist is not None and d2[i] > float(max_dist) ** 2:
+                continue
+            rc = iv[i].astype(np.float64)
         r, c = float(rc[0]), float(rc[1])
         if not (-3 * s <= r < H + 3 * s and -3 * s <= c < Wd + 3 * s):
             continue
@@ -627,14 +717,25 @@ def write_tifxyz(src_dir, out_dir, g, note, up=1):
     return out_dir
 
 
-def write_back(g_src, crop_rc, up, old_nodes, new_fine, frame, tol=1e-3):
+def copy_tifxyz(src_dir, out_dir, note):
+    """A byte-exact copy of a tifxyz directory, with `note` added to its meta.json as "refined"."""
+    os.makedirs(out_dir, exist_ok=True)
+    for f in os.listdir(src_dir):
+        if os.path.isfile(os.path.join(src_dir, f)) and f != "meta.json":
+            shutil.copy(os.path.join(src_dir, f), os.path.join(out_dir, f))
+    meta = json.load(open(os.path.join(src_dir, "meta.json")))
+    meta["refined"] = note
+    json.dump(meta, open(os.path.join(out_dir, "meta.json"), "w"), indent=1)
+    return out_dir
+
+def write_back(g_src, crop_rc, up, old_nodes, new_fine, frame, tol=1e-3, inplace=False):
     """The full published grid (its own frame) with the nodes the refiner moved replaced: node (r, c) of the
     published grid is node ((r - r0) * up, (c - c0) * up) of the dense crop `new_fine`; `old_nodes` is the
     published crop in the fine frame. Nodes that moved by more than `tol` voxels get
     src + (to_src(new) - to_src(old)), so a node the refiner did not touch is bit-identical."""
     r0, c0 = crop_rc
     o, n = old_nodes, new_fine[::up, ::up]
-    out = g_src.copy()
+    out = g_src if inplace else g_src.copy()
     h, w = o.shape[:2]
     blk = out[r0:r0 + h, c0:c0 + w]
     moved = np.isfinite(o).all(-1) & np.isfinite(n).all(-1) & (np.abs(n - o) > tol).any(-1)
@@ -660,9 +761,9 @@ def read_box(path, lo, shape, near=None, reach=48, block=128, jobs=8):
     """The uint8 (Z,Y,X) of a store over the fine-frame box lo..lo+shape (0 outside the store).
 
     near: (N,3) fine zyx points -- then only the `block`^3 blocks (box-aligned) within `reach` voxels of a
-    point are read and the rest stays 0. The array comes from np.zeros, whose untouched pages the kernel
-    never backs, so a 128 x 8192 x 8192 slab costs only the blocks the surfaces actually visit (a whole
-    slab of recto + verso + thickness would not fit the laptop)."""
+    point are read and the rest stays 0 (untouched np.zeros pages are never backed). That does NOT bound
+    a real slab: ~50 sheets cross an 8192^2 slab and visit nearly every block, so `run` reads one tile
+    at a time instead (docs/refine.md, "Memory")."""
     from concurrent.futures import ThreadPoolExecutor
 
     from rvsm import ladder
@@ -713,13 +814,16 @@ def read_ct(ct, lo, shape, down=1):
 
 # ========================================================================================= metrics
 
-def surface_metrics(Vu, origin, g, ax, thr=0.5, far=40, win=16, r=4, um=2.4, chunk=200_000):
+def surface_metrics(Vu, origin, g, ax, thr=0.5, far=40, win=16, r=4, um=2.4, chunk=200_000, mask=None):
     """evalsurf's per-surface numbers -- recall@r, offset bias/spread, merge_frac (E.metrics), continuity
     (E.continuity_one) and the expected run length (E.erl) -- for the grid g against a uint8 store over
-    `origin`, computed without evalsurf's float copy of the whole store."""
+    `origin`, computed without evalsurf's float copy of the whole store. mask: (H,W) cells to count (a tile's
+    core); the rest of the grid only gives the normals."""
     o = np.asarray(origin, np.float32)
     n = normals(g, ax)
     k = np.isfinite(g).all(-1) & ((g >= o) & (g <= o + np.array(Vu.shape) - 1)).all(-1) & np.isfinite(n).all(-1)
+    if mask is not None:
+        k &= mask
     if not k.any():
         return {"n_points": 0}
     q, nn = g[k] - o, n[k]
@@ -769,23 +873,29 @@ EVAL_KEYS = ("recall@2", "recall@4", "offset_mean", "offset_std", "offset_le3", 
 
 # ========================================================================================== pictures
 
-def compare_png(path, ct, V, origin, before, after, crop=320, scale=3, slab=2.5, dot=2, zi=None):
+def compare_png(path, ct, V, origin, before, after, crop=320, scale=3, slab=2.5, dot=2, zi=None, shape=None):
     """Before | after panels for one surface: a CT z-slice (the one with most surface points unless `zi`), the
     probability band as a red tint, published points (left, green) and refined points (right, magenta),
     cropped and upscaled. `ct`: None (black), an array indexed [z] in box voxels, or a callable
-    ct(zi, y0, y1, x0, x1) -> the (y, x) crop (box voxels). V float or uint8."""
+    ct(zi, y0, y1, x0, x1) -> the (y, x) crop (box voxels). V float or uint8, or a callable
+    V(zi, y0, y1, x0, x1) -> the probability crop in 0..1 (then `shape` is the box shape). before/after are
+    grids or (N,3) point sets."""
     from PIL import Image
     o = np.asarray(origin, np.float32)
-    pts = [g[np.isfinite(g).all(-1) & ((g >= o) & (g < o + np.array(V.shape))).all(-1)] - o for g in (before, after)]
+    shp = np.array(V.shape if shape is None else shape)
+    pts = [g[np.isfinite(g).all(-1) & ((g >= o) & (g < o + shp)).all(-1)] - o for g in (before, after)]
     if not len(pts[0]):
         return None
     if zi is None:
-        zi = int(np.bincount(np.clip(np.rint(pts[0][:, 0]).astype(int), 0, V.shape[0] - 1)).argmax())
-    vz = np.asarray(V[zi], np.float32) / (255.0 if V.dtype == np.uint8 else 1.0)
+        zi = int(np.bincount(np.clip(np.rint(pts[0][:, 0]).astype(int), 0, shp[0] - 1)).argmax())
     yx = [np.rint(p[np.abs(p[:, 0] - zi) <= slab, 1:]).astype(int) for p in pts]
-    cy, cx = (yx[0].mean(0) if len(yx[0]) else np.array(V.shape[1:]) // 2).astype(int)
+    cy, cx = (yx[0].mean(0) if len(yx[0]) else shp[1:] // 2).astype(int)
     y0, x0 = int(max(cy - crop // 2, 0)), int(max(cx - crop // 2, 0))
-    y1, x1 = min(y0 + crop, V.shape[1]), min(x0 + crop, V.shape[2])
+    y1, x1 = int(min(y0 + crop, shp[1])), int(min(x0 + crop, shp[2]))
+    if callable(V):
+        vzc = np.asarray(V(zi, y0, y1, x0, x1), np.float32)
+    else:
+        vzc = np.asarray(V[zi, y0:y1, x0:x1], np.float32) / (255.0 if V.dtype == np.uint8 else 1.0)
     if ct is None:
         cz = np.zeros((y1 - y0, x1 - x0), np.float32)
     elif callable(ct):
@@ -793,7 +903,7 @@ def compare_png(path, ct, V, origin, before, after, crop=320, scale=3, slab=2.5,
     else:
         cz = np.asarray(ct[zi], np.float32)[y0:y1, x0:x1]
     base = np.repeat(cz[..., None], 3, -1) * 0.85
-    base[..., 0] = np.clip(base[..., 0] + 140 * vz[y0:y1, x0:x1], 0, 255)
+    base[..., 0] = np.clip(base[..., 0] + 140 * vzc, 0, 255)
     panel = np.repeat(np.repeat(base, scale, 0), scale, 1)
     panels = []
     for q, col in ((yx[0], (0, 255, 0)), (yx[1], (255, 0, 255))):
@@ -843,31 +953,30 @@ def _draw_segments(img, segs, y0, x0, f, color, width=1):
         d.line([(float(xa), float(ya)), (float(xb), float(yb))], fill=color, width=width)
 
 
-def slab_pngs(out_dir, zs, V, W, ct_fn, origin, befores, afters, max_px=2000, min_px=900, pad=48):
-    """Before | after cross-sections of the whole slab at each absolute z in `zs`: CT grayscale (`ct_fn(z, y0,
-    y1, x0, x1, stride)` -> uint8 at that stride, or None), recto tinted red, verso blue, the unrefined surfaces' polylines magenta
-    (left) and the refined ones green (right, over a dim magenta trace of the originals)."""
+def slab_view(ext, max_px=2000, min_px=900):
+    """(stride, upscale) of a slab picture whose larger side spans `ext` voxels."""
+    stride = max(1, -(-int(ext) // max_px))
+    return stride, (max(1, min_px // max(int(ext), 1)) if stride == 1 else 1)
+
+
+def slab_pngs(out_dir, zs, plane_fn, ct_fn, extent, segs_before, segs_after, max_px=2000, min_px=900):
+    """Before | after cross-sections of the slab at each absolute z in `zs` over extent = ((y0, x0), (y1, x1))
+    (absolute voxels): CT grayscale (`ct_fn(z, y0, y1, x0, x1, stride)` -> uint8 at that stride, or None),
+    recto tinted red and verso blue (`plane_fn(z, stride)` -> (recto, verso) 0..1 over the extent at that
+    stride), the unrefined surfaces' polylines magenta (left) and the refined ones green (right, over a dim
+    magenta trace of the originals). segs_before/after: {z: [(M,2,2) (y, x) segments]}."""
     from PIL import Image
-    o = np.asarray(origin, np.int64)
     os.makedirs(out_dir, exist_ok=True)
+    lo, hi = np.asarray(extent[0], np.int64), np.asarray(extent[1], np.int64)
     outs = []
+    if (hi <= lo).any():
+        return outs
+    stride, up = slab_view(int((hi - lo).max()), max_px, min_px)
     for z in zs:
-        sb = [plane_segments(g, z) for g in befores]
-        sa = [plane_segments(g, z) for g in afters]
-        allp = np.concatenate([s.reshape(-1, 2) for s in sb + sa] or [np.zeros((0, 2))])
-        if not len(allp):
+        sb, sa = segs_before.get(z, []), segs_after.get(z, [])
+        if not sum(len(x) for x in sb + sa):
             continue
-        lo = np.maximum(np.floor(allp.min(0)).astype(np.int64) - pad, o[1:])
-        hi = np.minimum(np.ceil(allp.max(0)).astype(np.int64) + pad, o[1:] + np.array(V.shape[1:]))
-        if (hi <= lo).any():
-            continue
-        ext = int((hi - lo).max())
-        stride = max(1, -(-ext // max_px))
-        up = max(1, min_px // max(ext, 1)) if stride == 1 else 1
-        zi = int(z - o[0])
-        sl = (slice(int(lo[0] - o[1]), int(hi[0] - o[1]), stride), slice(int(lo[1] - o[2]), int(hi[1] - o[2]), stride))
-        vz = np.asarray(V[zi][sl], np.float32) / 255.0
-        wz = np.asarray(W[zi][sl], np.float32) / 255.0 if W is not None else 0.0 * vz
+        vz, wz = plane_fn(z, stride)
         ctz = ct_fn(int(z), int(lo[0]), int(hi[0]), int(lo[1]), int(hi[1]), stride) if ct_fn else None
         base = np.zeros(vz.shape + (3,), np.float32)
         if ctz is not None:
@@ -973,13 +1082,14 @@ def run(args):
     ct = None if args.no_ct else (args.ct or attrs.get("volume") or None)
     legacy = None
 
-    # ---- surfaces
+    # ---- surfaces: only the published rows/cols that touch the box are ever held (read_surface_box)
     todo = []   # (name, segid, dir)
     for d in args.surface or []:
         nm = os.path.basename(d.rstrip("/"))
         todo.append((nm[:-7] if nm.endswith(".tifxyz") else nm, nm, d))
     if args.paths:
         todo += find_surfaces(args.paths, tuple(p for p in args.prefer.split(",") if p))
+    margin = float(args.far) + 16
     surf = []
     for name, sid, d in todo:
         kind = frame_kind(d, args.src_frame)
@@ -1003,35 +1113,23 @@ def run(args):
                 continue
         except Exception:  # noqa: BLE001  - no bbox: read it
             pass
-        gs = E.read_surface(d)
-        gf = fr.to_fine(gs)
-        crop, rc = crop_to_box(gf, o, s, margin=float(args.far) + 16)
-        k = np.isfinite(crop).all(-1) & ((crop >= o) & (crop < o + s)).all(-1) if crop.size else np.zeros(0, bool)
-        if crop.size == 0:
+        got = read_surface_box(d, fr, o, s, margin=margin)
+        if got is None:
             continue
+        crop, rc, full_shape = got
+        k = np.isfinite(crop).all(-1) & ((crop >= o) & (crop < o + s)).all(-1)
         up = auto_up(crop, args.pitch) if args.up == 0 else int(args.up)
-        dense = upsample(crop, up)
-        kd = np.isfinite(dense).all(-1) & ((dense >= o) & (dense < o + s)).all(-1)
-        if int(kd.sum()) < args.min_pts:
+        if int(k.sum()) * up * up < args.min_pts:
             continue
-        surf.append({"name": name, "segid": sid, "dir": d, "frame": fr, "src": gs, "rc": rc, "up": up,
-                     "crop": crop, "pub": dense, "g0": dense, "n_published_inside": int(k.sum())})
+        surf.append({"name": name, "segid": sid, "dir": d, "frame": fr, "rc": rc, "up": up, "crop": crop,
+                     "shape": full_shape, "n_published_inside": int(k.sum()),
+                     "own_r": [], "own_c": [], "own_v": []})
     if not surf:
         raise SystemExit("no surface crosses the box")
-    log(json.dumps({"surfaces": [(x["name"], x["frame"].name, x["up"], int(np.isfinite(x["g0"]).all(-1).sum()))
-                                 for x in surf]}))
+    log(json.dumps({"surfaces": [(x["name"], x["frame"].name, x["up"], x["n_published_inside"]) for x in surf]}))
 
-    # ---- stores: only the blocks the surfaces can reach (see read_box)
-    near = np.concatenate([x["g0"][np.isfinite(x["g0"]).all(-1)] for x in surf])
-    reach = max(3 * int(args.far) + 4, 44)      # three shrinking snaps, and evalsurf's +-40 profile
-    V = read_box(args.recto, lo, shape, near=near, reach=reach)
-    W = read_box(args.verso, lo, shape, near=near, reach=reach) if args.verso else None
-    thick = read_box(args.thickness_store, lo, shape, near=near, reach=reach) if args.thickness_store else None
-    ct_mask = read_ct(ct, lo, shape) if (ct and args.ct_mask) else None
-    log(json.dumps({"read": "stores", "near_points": int(len(near)), "reach": reach}))
-
-    # ---- anchors: shift first, then hold
-    holds = [None] * len(surf)
+    # ---- anchors (converted to the fine frame once; applied per piece)
+    anchors = {}
     if args.anchors:
         live = read_anchors(args.anchors)
         afr = IDENTITY if args.anchor_frame == "fine" else (legacy or load_frame(args))
@@ -1039,47 +1137,151 @@ def run(args):
             raise SystemExit("--anchor-frame legacy needs a legacy frame (--transform)")
         for i, x in enumerate(surf):
             mine = [a for a in live if anchor_matches(a, (x["name"], x["segid"], os.path.basename(x["dir"].rstrip("/"))))]
-            if not mine:
+            if mine:
+                anchors[i] = [dict(a, from_zyx=afr.to_fine(np.array([a["from_zyx"]]))[0].tolist(),
+                                   to_zyx=afr.to_fine(np.array([a["to_zyx"]]))[0].tolist()) for a in mine]
+                log(json.dumps({"anchors": x["name"], "n": len(mine)}))
+
+    # ---- tiles: every published node is refined in the tile whose core holds it, with a halo around the core
+    # wide enough for everything that couples nodes (neighbour sheets, the smoothing and anchor kernels, the
+    # snap's reach). Only one tile's stores and dense grids are in memory at a time.
+    halo = max(int(args.halo), 3 * int(args.far) + 8, 44)
+    tile = int(args.tile) if args.tile and args.tile > 0 else int(max(shape[1], shape[2]))
+    rpad = int(args.far) + 4                     # the snap samples +-far around a halo point
+    circ = not args.eval_store or os.path.abspath(args.eval_store) == os.path.abspath(args.recto)
+    if circ:
+        log("WARNING: metrics below are measured on the SAME store the surfaces were refined against -- the "
+            "gain is circular. Pass --eval-store with a different store (another teacher / the student) for "
+            "a real before/after.")
+    zs = np.linspace(lo[0] + 0.5 + shape[0] / (2 * args.slices), lo[0] + shape[0] - 0.5 - shape[0] / (2 * args.slices),
+                     args.slices) if args.slices > 1 else [lo[0] + shape[0] / 2]
+    zs = [float(int(z)) + 0.5 for z in zs]
+    zmid = int(lo[0] + shape[0] // 2)
+    ext_lo, ext_hi = lo[1:].copy(), lo[1:] + shape[1:]
+    pstride, _ = slab_view(int((ext_hi - ext_lo).max()))
+    cshape = tuple(int(v) for v in -(-(ext_hi - ext_lo) // pstride))
+    canv = {z: [np.zeros(cshape, np.uint8), np.zeros(cshape, np.uint8)] for z in zs}
+    segs_b, segs_a = {z: [] for z in zs}, {z: [] for z in zs}
+    moves = {x["name"]: [] for x in surf}
+    near_mid = {x["name"]: ([], []) for x in surf}
+    met = {x["name"]: {"before": [], "after": []} for x in surf}
+    stats = []
+    cores = [(y0, min(y0 + tile, int(lo[1] + shape[1])), x0, min(x0 + tile, int(lo[2] + shape[2])))
+             for y0 in range(int(lo[1]), int(lo[1] + shape[1]), tile)
+             for x0 in range(int(lo[2]), int(lo[2] + shape[2]), tile)]
+    log(json.dumps({"tiles": len(cores), "tile": tile, "halo": halo}))
+    box_lo, box_hi = lo.astype(np.int64), (lo + shape).astype(np.int64)
+    for ti, (cy0, cy1, cx0, cx1) in enumerate(cores):
+        tlo = np.array([box_lo[0], max(cy0 - halo, box_lo[1]), max(cx0 - halo, box_lo[2])], np.int64)
+        thi = np.array([box_hi[0], min(cy1 + halo, box_hi[1]), min(cx1 + halo, box_hi[2])], np.int64)
+        # pieces: per surface, the column runs of its published crop that reach into this tile (each with its
+        # own row range, so a sheet that crosses the slab at a slant never becomes one huge rectangle)
+        pieces = []
+        for si, x in enumerate(surf):
+            for (r0, r1, c0, c1) in column_pieces(x["crop"], tlo - margin, thi + margin):
+                pc = x["crop"][r0:r1, c0:c1]
+                dense = upsample(pc, x["up"])
+                if int((np.isfinite(dense).all(-1) & ((dense >= tlo) & (dense < thi)).all(-1)).sum()) == 0:
+                    continue
+                pieces.append({"si": si, "r0": r0, "c0": c0, "pub": dense})
+        if not pieces:
+            continue
+        rlo = np.array([box_lo[0], max(int(tlo[1]) - rpad, box_lo[1]), max(int(tlo[2]) - rpad, box_lo[2])], np.int64)
+        rhi = np.array([box_hi[0], min(int(thi[1]) + rpad, box_hi[1]), min(int(thi[2]) + rpad, box_hi[2])], np.int64)
+        rs = rhi - rlo
+        V = read_box(args.recto, rlo, rs)
+        W = read_box(args.verso, rlo, rs) if args.verso else None
+        thick = read_box(args.thickness_store, rlo, rs) if args.thickness_store else None
+        ct_mask = read_ct(ct, rlo, rs) if (ct and args.ct_mask) else None
+        holds, g0 = [], []
+        for pz in pieces:
+            x = surf[pz["si"]]
+            g = pz["pub"]
+            h = None
+            if pz["si"] in anchors:
+                up, pr0, pc0 = x["up"], x["rc"][0] + pz["r0"], x["rc"][1] + pz["c0"]
+                rc_map = lambda rc, pr0=pr0, pc0=pc0, up=up: ((float(rc[0]) - pr0) * up, (float(rc[1]) - pc0) * up)  # noqa: E731
+                pp = pitch(g)
+                fld, top = anchor_field(g, anchors[pz["si"]], sigma=args.anchor_sigma, clip=args.anchor_clip,
+                                        rc_map=rc_map, max_dist=2 * (pp if np.isfinite(pp) else 4.0) + 2)
+                if top.max() > 0:
+                    g, h = g + fld, top
+            g0.append(g)
+            holds.append(h)
+        sig = [args.sigma_vox / max(pitch(g), 1e-3) if np.isfinite(pitch(g)) else 2.0 for g in g0]
+        g1, st = refine_many(g0, V, rlo.astype(np.float32), ax, far=args.far, sigma=sig,
+                             iters=args.iters, thr=args.thr, ct=ct_mask, W=W, thick=thick, T=args.thickness,
+                             verso_thr=args.verso_thr, verso_beta=args.verso_beta,
+                             verso_block=np.inf if args.verso_block is None else args.verso_block,
+                             verso_margin=args.verso_margin, holds=holds, taper=args.taper,
+                             box=(o, s), log=None)
+        stats.append({"tile": [cy0, cy1, cx0, cx1], "pieces": len(pieces), "iters": st})
+        log(json.dumps({"tile": ti + 1, "of": len(cores), "core_yx": [cy0, cy1, cx0, cx1], "pieces": len(pieces),
+                        **{k: v for k, v in st[-1].items() if k != "iter"}}))
+        Ve = V if circ else read_box(args.eval_store, rlo, rs)
+        for pz, b in zip(pieces, g1):
+            x, a, up = surf[pz["si"]], pz["pub"], surf[pz["si"]]["up"]
+            ina = np.isfinite(a).all(-1) & ((a >= o) & (a < o + s)).all(-1)
+            core = ina & (a[..., 1] >= cy0) & (a[..., 1] < cy1) & (a[..., 2] >= cx0) & (a[..., 2] < cx1)
+            if not core.any():
                 continue
-            conv = [dict(a, from_zyx=afr.to_fine(np.array([a["from_zyx"]]))[0].tolist(),
-                         to_zyx=afr.to_fine(np.array([a["to_zyx"]]))[0].tolist()) for a in mine]
-            r0, c0, up = x["rc"][0], x["rc"][1], x["up"]
-            rc_map = lambda rc, r0=r0, c0=c0, up=up: ((float(rc[0]) - r0) * up, (float(rc[1]) - c0) * up)  # noqa: E731
-            fld, top = anchor_field(x["g0"], conv, sigma=args.anchor_sigma, clip=args.anchor_clip, rc_map=rc_map)
-            x["g0"] = x["g0"] + fld
-            holds[i] = top
-            log(json.dumps({"anchors": x["name"], "n": len(mine), "max_shift": float(np.linalg.norm(fld, axis=-1).max())}))
+            # published nodes this tile owns -> the surface's result
+            cn = core[::up, ::up]
+            rr, cc = np.nonzero(cn)
+            x["own_r"].append((rr + pz["r0"]).astype(np.int32))
+            x["own_c"].append((cc + pz["c0"]).astype(np.int32))
+            x["own_v"].append(b[::up, ::up][cn].astype(np.float32))
+            n0 = normals(a, ax)
+            moves[x["name"]].append(((b - a) * np.nan_to_num(n0)).sum(-1)[core].astype(np.float32))
+            for z in zs:
+                for g, dst in ((a, segs_b), (b, segs_a)):
+                    sg = plane_segments(g, z)
+                    if len(sg):
+                        mid = sg.mean(1)
+                        keep = (mid[:, 0] >= cy0) & (mid[:, 0] < cy1) & (mid[:, 1] >= cx0) & (mid[:, 1] < cx1)
+                        if keep.any():
+                            dst[z].append(sg[keep])
+            for g, lst in ((a, near_mid[x["name"]][0]), (b, near_mid[x["name"]][1])):
+                pk = core & (np.abs(g[..., 0] - zmid) <= 3.0)
+                if pk.any():
+                    lst.append(g[pk])
+            for nm, g in (("before", a), ("after", b)):
+                mm = surface_metrics(Ve, rlo, g, ax, thr=args.thr, mask=core)
+                if mm.get("n_points", 0):
+                    met[x["name"]][nm].append(mm)
+        # the slab pictures' recto/verso planes, filled from this tile's core
+        iy = np.arange(cshape[0]) * pstride + ext_lo[0]
+        ix = np.arange(cshape[1]) * pstride + ext_lo[1]
+        sy, sx = np.nonzero((iy >= cy0) & (iy < cy1))[0], np.nonzero((ix >= cx0) & (ix < cx1))[0]
+        if len(sy) and len(sx):
+            for z in zs:
+                zi = int(z - rlo[0])
+                for arr, c in ((V, 0), (W, 1)):
+                    if arr is not None:
+                        canv[z][c][np.ix_(sy, sx)] = arr[zi][np.ix_(iy[sy] - rlo[1], ix[sx] - rlo[2])]
+        del V, W, thick, Ve, ct_mask, g0, g1, pieces
 
-    g0 = [x["g0"] for x in surf]          # published (+ anchor shift): what the snap starts from
-    pub = [x["pub"] for x in surf]        # published: the 'before' of every picture and metric
-    sig = [args.sigma_vox / max(pitch(x["g0"]), 1e-3) if np.isfinite(pitch(x["g0"])) else 2.0 for x in surf]
-    g1, stats = refine_many(g0, V, o, ax, far=args.far, sigma=sig,
-                            iters=args.iters, thr=args.thr, ct=ct_mask, W=W, thick=thick, T=args.thickness,
-                            verso_thr=args.verso_thr, verso_beta=args.verso_beta,
-                            verso_block=np.inf if args.verso_block is None else args.verso_block,
-                            verso_margin=args.verso_margin, holds=holds, taper=args.taper, log=log)
-
-    # ---- write
+    # ---- write: one full published grid in memory at a time
     os.makedirs(args.out, exist_ok=True)
-    moves = {}
-    for x, a, b in zip(surf, pub, g1):
-        n0 = normals(a, ax)
-        dv = ((b - a) * np.nan_to_num(n0)).sum(-1)
-        kd = np.isfinite(a).all(-1) & ((a >= o) & (a < o + s)).all(-1)
-        moves[x["name"]] = dv[kd]
+    for x in surf:
+        dv = np.concatenate(x_m) if (x_m := moves[x["name"]]) else np.zeros(0, np.float32)
+        moves[x["name"]] = dv
+        new = x["crop"].copy()
+        if x["own_r"]:
+            new[np.concatenate(x["own_r"]), np.concatenate(x["own_c"])] = np.concatenate(x["own_v"])
+        x["own_r"] = x["own_c"] = x["own_v"] = None
         note = {"recto": str(args.recto), "verso": str(args.verso or ""), "box": [*lo.tolist(), *shape.tolist()],
                 "far": args.far, "sigma_vox": args.sigma_vox, "iters": args.iters, "thr": args.thr, "up": x["up"],
-                "joint_with": len(surf), "frame": x["frame"].name, "anchors": bool(holds[surf.index(x)] is not None)}
-        full = write_back(x["src"], x["rc"], x["up"], x["crop"], b, x["frame"])
-        write_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), x["src"], {"unrefined_input": True})
+                "joint_with": len(surf), "frame": x["frame"].name, "anchors": bool(anchors.get(surf.index(x))),
+                "tile": tile, "halo": halo}
+        src = E.read_surface(x["dir"])
+        full = write_back(src, x["rc"], 1, x["crop"], new, x["frame"], inplace=True)
+        del src, new
+        copy_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), {"unrefined_input": True})
         write_tifxyz(x["dir"], os.path.join(args.out, x["name"]), full, note)
-        if args.write_dense:
-            dn = dict(note, crop_rc=list(x["rc"]))
-            write_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".dense.before"), x["frame"].to_src(a),
-                         {"unrefined_input": True, "up": x["up"], "crop_rc": list(x["rc"])}, up=x["up"])
-            write_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".dense"), x["frame"].to_src(b), dn, up=x["up"])
-        log(json.dumps({"wrote": os.path.join(args.out, x["name"]), "mean_abs_move": float(np.abs(dv[kd]).mean()) if kd.any() else 0.0,
-                        "p95_abs_move": float(np.percentile(np.abs(dv[kd]), 95)) if kd.any() else 0.0}))
+        del full
+        log(json.dumps({"wrote": os.path.join(args.out, x["name"]), "mean_abs_move": float(np.abs(dv).mean()) if len(dv) else 0.0,
+                        "p95_abs_move": float(np.percentile(np.abs(dv), 95)) if len(dv) else 0.0}))
 
     # ---- pictures
     png = args.png_dir or os.path.join(args.out, "png")
@@ -1098,48 +1300,53 @@ def run(args):
                 log(f"CT read failed ({e!r}); drawing without CT")
                 ct_cache[key] = None
         return ct_cache[key]
-    zs = np.linspace(lo[0] + 0.5 + shape[0] / (2 * args.slices), lo[0] + shape[0] - 0.5 - shape[0] / (2 * args.slices),
-                     args.slices) if args.slices > 1 else [lo[0] + shape[0] / 2]
-    for p in slab_pngs(png, [float(int(z)) + 0.5 for z in zs], V, W, ct_fn, lo, pub, g1):
+
+    def plane_fn(z, stride):
+        assert stride == pstride
+        return canv[z][0].astype(np.float32) / 255.0, canv[z][1].astype(np.float32) / 255.0
+    for p in slab_pngs(png, zs, plane_fn, ct_fn, (ext_lo, ext_hi), segs_b, segs_a):
         log(p)
+    del canv, segs_b, segs_a
     if not args.no_surface_png:
-        for x, a, b in zip(surf, pub, g1):
-            ka = np.isfinite(a).all(-1) & ((a >= o) & (a < o + s)).all(-1)
-            if not ka.any():
+        zi = int(zmid - lo[0])
+
+        def vcrop(zi, y0, y1, x0, x1):
+            return read_box(args.recto, (int(lo[0]) + zi, int(lo[1]) + y0, int(lo[2]) + x0), (1, y1 - y0, x1 - x0))[0] / 255.0
+        cz = (lambda zi, y0, y1, x0, x1: ct_fn(int(lo[0]) + zi, int(lo[1]) + y0, int(lo[1]) + y1,
+                                               int(lo[2]) + x0, int(lo[2]) + x1)) if ct else None
+        for x in surf:
+            bp, ap = near_mid[x["name"]]
+            if not bp:
                 continue
-            zi = int(np.bincount(np.clip(np.rint(a[ka][:, 0] - o[0]).astype(int), 0, V.shape[0] - 1)).argmax())
-            cz = (lambda zi, y0, y1, x0, x1: ct_fn(int(lo[0]) + zi, int(lo[1]) + y0, int(lo[1]) + y1,
-                                                   int(lo[2]) + x0, int(lo[2]) + x1)) if ct else None
-            p = compare_png(os.path.join(png, x["name"] + ".png"), cz, V, o, a, b, zi=zi)
+            p = compare_png(os.path.join(png, x["name"] + ".png"), cz, vcrop, o, np.concatenate(bp),
+                            np.concatenate(ap), zi=zi, shape=tuple(int(v) for v in shape))
             if p:
                 log(p)
 
-    # ---- metrics
-    circ = not args.eval_store or os.path.abspath(args.eval_store) == os.path.abspath(args.recto)
-    Ve = V if circ else read_box(args.eval_store, lo, shape, near=near, reach=reach)
-    if circ:
-        log("WARNING: metrics below are measured on the SAME store the surfaces were refined against -- the "
-            "gain is circular. Pass --eval-store with a different store (another teacher / the student) for "
-            "a real before/after.")
+    # ---- metrics: per surface, the tiles' numbers pooled by their point counts
     tot = {"before": {}, "after": {}}
-    for x, a, b in zip(surf, pub, g1):
-        rec = {"surface": x["name"], "eval_store": str(args.eval_store or args.recto), "circular": bool(circ)}
-        for nm, g in (("before", a), ("after", b)):
-            m = surface_metrics(Ve, o, g, ax, thr=args.thr)
-            rec[nm] = {q: round(m[q], 4) for q in EVAL_KEYS if q in m}
-            rec["points"] = m.get("n_points", 0)
+    for x in surf:
+        rec = {"surface": x["name"], "eval_store": str(args.eval_store or args.recto), "circular": bool(circ),
+               "tiles": len(met[x["name"]]["before"])}
+        for nm in ("before", "after"):
+            ms = met[x["name"]][nm]
+            npt = sum(m["n_points"] for m in ms)
+            rec[nm] = {}
             for q in EVAL_KEYS:
-                if q in m and np.isfinite(m[q]):
-                    tot[nm].setdefault(q, []).append((m[q], m["n_points"]))
+                vals = [(m[q], m["n_points"]) for m in ms if q in m and np.isfinite(m[q])]
+                if vals:
+                    v = sum(a * w for a, w in vals) / max(sum(w for _, w in vals), 1)
+                    rec[nm][q] = round(v, 4)
+                    tot[nm].setdefault(q, []).append((v, npt))
+            rec["points"] = npt
         log(json.dumps(rec))
     pooled = {nm: {q: round(sum(v * w for v, w in vals) / max(sum(w for _, w in vals), 1), 4) for q, vals in t.items()}
               for nm, t in tot.items()}
     log(json.dumps({"pooled": pooled, "circular": bool(circ)}))
     with open(os.path.join(args.out, "refine_report.json"), "w") as f:
-        json.dump({"box": [*lo.tolist(), *shape.tolist()], "stats": stats, "pooled": pooled, "circular": bool(circ),
-                   "surfaces": [x["name"] for x in surf]}, f, indent=1)
+        json.dump({"box": [*lo.tolist(), *shape.tolist()], "tile": tile, "halo": halo, "stats": stats,
+                   "pooled": pooled, "circular": bool(circ), "surfaces": [x["name"] for x in surf]}, f, indent=1)
     return 0
-
 
 def parser():
     ap = argparse.ArgumentParser(prog="rvsm refine", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1174,6 +1381,11 @@ def parser():
     ap.add_argument("--pitch", type=float, default=4.0)
     ap.add_argument("--taper", type=float, default=8.0, help="voxels over which moves fade out at the box faces")
     ap.add_argument("--min-pts", type=int, default=50)
+    ap.add_argument("--tile", type=int, default=1024,
+                    help="yx core of a tile, voxels (0 = the whole box at once); bounds the memory: one tile's "
+                         "stores and grids at a time")
+    ap.add_argument("--halo", type=int, default=160,
+                    help="voxels of context around a tile core (>= 3x the smoothing and anchor sigmas)")
     ap.add_argument("--anchors", help="render3d anchors.jsonl")
     ap.add_argument("--anchor-frame", default="fine", choices=("fine", "legacy"))
     ap.add_argument("--anchor-sigma", type=float, default=48.0, help="voxels")
@@ -1185,7 +1397,6 @@ def parser():
     ap.add_argument("--slices", type=int, default=4)
     ap.add_argument("--png-dir")
     ap.add_argument("--no-surface-png", action="store_true")
-    ap.add_argument("--write-dense", action="store_true", help="also write the dense refined crop (<name>.dense)")
     return ap
 
 

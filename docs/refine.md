@@ -67,15 +67,48 @@ coordinates are taken as fine-frame voxels unless `--anchor-frame legacy` is giv
   which fetches the transform from S3.
 - The refined surface is written back in its ORIGINAL frame and at its ORIGINAL grid shape. Moved nodes
   become `src + (to_src(new) − to_src(old))`. Nodes that were not moved (outside the box or slab) stay
-  bit-identical. Holes are written as -1, as vc3d writes them. `--write-dense` also writes the dense
-  refined crop as `<name>.dense` (meta scale × up, `crop_rc` recorded).
+  bit-identical. Holes are written as -1, as vc3d writes them.
 
 ## Cross-section mode and outputs
 
 `--z0 Z --dz 128` restricts the box to that fine z slab of the recto store and refines, jointly, every
-surface under `--paths` that crosses it. The stores are read only in the 128³ blocks within reach of a
-surface point (`read_box(near=...)`; the rest of the `np.zeros` array is never paged in), so a
-128 × 8192² slab fits on the laptop. Outputs under `--out`:
+surface under `--paths` that crosses it. Outputs are listed below.
+
+### Memory: tiles and pieces
+
+A 128 × 8192² slab of the 2.4 µm volume is crossed by about 51 published segments. Their full grids are
+19 GB, and at pitch 4 their slab crops are about 1.1 G dense points: the sheets cross the slab at a slant,
+so each crop's bounding rectangle is ~40× the band inside the box. Each store is 8.6 GB over the slab.
+None of that is ever held. Instead:
+
+- **Surfaces** are memory-mapped (`read_surface_box`) and scanned 256 rows at a time; fine-frame ones are
+  ruled out by their z channel first. Only the published rows/cols that touch the box stay in memory,
+  at published resolution (~0.5 GB for the whole slab). Loading all 81 candidates takes ~20 s and
+  0.43 GB.
+- **Tiles.** The slab is refined in yx tiles (`--tile`, default 1024 voxels) with a halo (`--halo`,
+  default 160, at least 3·far + 8 and 44). The halo covers everything that couples nodes: the
+  neighbour-sheet search (far + 3), the smoothing kernel (3 × `--sigma-vox` 40) and the anchor kernel
+  (3 × `--anchor-sigma` 48). The stores are read densely only over one tile (core + halo + far + 4;
+  ~240 MB per store at the defaults). The taper still fades at the SLAB's faces, never at a tile's.
+- **Pieces.** Within a tile, each surface is cut into column runs of its grid that reach into the tile,
+  each with its own row range (`column_pieces`), and upsampled only there. Two wraps of one segment
+  are separate pieces, so they also keep each other apart as neighbour sheets. `ray_neighbours` only
+  sees the other sheets' points inside a piece's bbox + reach.
+- **Ownership.** A published node is taken from the tile whose core holds its published position.
+  Results are kept as (row, col, value) at published resolution. After the last tile, each surface is
+  re-read whole, one at a time, and written back.
+- **Metrics and pictures** are gathered per tile, from core points only. Metrics are pooled per
+  surface by point count, so continuity and ERL are per-tile numbers pooled, not whole-surface runs.
+  The slab pictures show the whole box at stride ⌈extent/2000⌉. The per-surface zoom is at the slab's
+  middle z.
+
+`--tile 48` against `--tile 0` (one tile) on the test fixture agrees to 0.05 voxel
+(`test_tiled_slab_matches_one_tile`). A synthetic slab at the real tile density (45 sheets over
+128 × 2048², ~465k points per tile, 4 tiles) took 2:19 at a 1.44 GB peak RSS. The real slab is 64
+tiles: expect ~40 min and a ~2–2.5 GB peak. The extra is the published crops plus one full grid
+(≤ 460 MB, ×3 transient) at write-back. `--tile 768` lowers the per-tile part.
+
+Outputs under `--out`:
 
 - `<name>/`: the refined tifxyz. `<name>.before/`: a copy of the published input.
 - `png/slab_z<Z>.png`: `--slices` z slices of the slab, with before | after panels. They show CT in
@@ -100,11 +133,21 @@ surface point (`read_box(near=...)`; the rest of the `np.zeros` array is never p
 
 ## Command (laptop)
 
+Slab lo [55552, 13696, 13312], shape [128, 8192, 8192] (fine zyx). The z0/dz pick the slab; y/x come
+from the store's own extent. The midline store is not an input to the refiner. The command is capped
+at 6 GB so a mistake cannot take the WSL VM down:
+
 ```
 VOLCOMP_LIB=/home/forrest/volume-compressor/build/release/libvolcomp.so \
+systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=0 \
 /home/forrest/rvsm/.venv/bin/python -m rvsm.tools.refine.refine \
   --recto /home/forrest/refine/pred/recto.zarr --verso /home/forrest/refine/pred/verso.zarr \
   --thickness-store /home/forrest/refine/pred/thickness.zarr \
   --paths /home/forrest/refine/paths --transform /home/forrest/refine/transform.json \
-  --z0 <slab z0> --dz 128 --out /home/forrest/refine/refined [--anchors anchors.jsonl] [--eval-store S]
+  --umbilicus /home/forrest/refine/umbilicus/20260411134726-umbilicus-20260524235033.json \
+  --z0 55552 --dz 128 --tile 1024 --halo 160 --no-ct \
+  --out /home/forrest/refine/refined_z55552 [--anchors anchors.jsonl] [--eval-store S]
 ```
+
+Drop `--no-ct` for CT under the pictures. CT is read strided, one plane per picture, from the store's
+`volume` attribute or `--ct`. `--ct-mask` reads full-resolution CT over each tile.

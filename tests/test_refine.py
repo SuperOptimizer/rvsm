@@ -339,3 +339,81 @@ def test_end_to_end_slab_in_the_legacy_frame(tmp_path, has_volcomp):
     assert rep["circular"] is False
     assert rep["pooled"]["after"]["offset_le3"] >= rep["pooled"]["before"]["offset_le3"]
     assert abs(rep["pooled"]["after"]["offset_mean"]) < abs(rep["pooled"]["before"]["offset_mean"])
+
+
+# ------------------------------------------------------------------------------------ bounded memory (slab mode)
+
+def slanted_grid(H=40, W=60, step=6.0, slope=1.5):
+    """A published-like grid whose rows are NOT z: z rises along the columns too, so a z slab cuts a diagonal
+    band through it (the real 2.4 um segments cross a 128-voxel slab this way)."""
+    r, c = np.mgrid[:H, :W].astype(np.float32)
+    z = 100 + step * r + slope * c
+    x = 390 + step * c
+    y = 316 + 0.1 * (x - 384)
+    g = np.stack([z, y, x], -1)
+    g[5:8, 10:14] = np.nan
+    return g
+
+
+def test_read_surface_box_equals_crop_of_the_full_read(tmp_path):
+    g = slanted_grid()
+    d = str(tmp_path / "s.tifxyz")
+    write_tifxyz_raw(d, g)
+    o, s = np.array([160, 256, 384], np.float32), np.array([64, 128, 128], np.float32)
+    for fr in (R.IDENTITY, R.scale_offset_frame([1.0, 1.0, 1.0], [0.0, 0.0, 0.0])):
+        crop, rc, shp = R.read_surface_box(d, fr, o, s, margin=10, rows=7)
+        ref, rc_ref = R.crop_to_box(fr.to_fine(R.E.read_surface(d)), o, s, margin=10)
+        assert shp == g.shape[:2] and rc == rc_ref
+        np.testing.assert_array_equal(np.isnan(crop), np.isnan(ref))
+        np.testing.assert_allclose(np.nan_to_num(crop), np.nan_to_num(ref))
+    assert R.read_surface_box(d, R.IDENTITY, o + 5000, s) is None
+
+
+def test_column_pieces_split_a_band_and_never_share_a_cell():
+    g = slanted_grid(H=40, W=200, slope=0.3)
+    g[:, 90:130] = np.nan                                  # a gap: two runs
+    ps = R.column_pieces(g, (160, 0, 0), (224, 1000, 2000), pad=4)
+    assert len(ps) == 2
+    cells = np.zeros(g.shape[:2], int)
+    for r0, r1, c0, c1 in ps:
+        cells[r0:r1, c0:c1] += 1
+        assert (r1 - r0) < g.shape[0]                      # each piece has its own (smaller) row range
+    assert cells.max() == 1
+    k = np.isfinite(g).all(-1) & (g[..., 0] >= 160) & (g[..., 0] < 224)
+    assert (cells[k] == 1).all()                           # every in-box cell is in a piece
+
+
+def test_tiled_slab_matches_one_tile(tmp_path, has_volcomp):
+    """The same slab refined as one tile and as 3x3 tiles (a 48-voxel core, the minimum halo): the published
+    nodes each tile owns end up where the one-tile run puts them."""
+    if not has_volcomp:
+        pytest.skip("volcomp not available")
+    import tifffile
+
+    from rvsm import stores
+    o = np.array([128, 256, 384])
+    z, y, x = np.mgrid[:128, :128, :128].astype(np.float32)
+    yc = 60 + 0.1 * x
+    rp, vp = str(tmp_path / "recto.zarr"), str(tmp_path / "verso.zarr")
+    stores.write(rp, stores.u8(np.exp(-0.5 * ((y - yc) / 1.5) ** 2)), o, q=0)
+    stores.write(vp, stores.u8(np.exp(-0.5 * ((y - (yc - 8)) / 1.5) ** 2)), o, q=0)
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": -20000, "x": 448}, {"z": 1000, "y": -20000, "x": 448}]}))
+    g = slanted_grid(H=34, W=22, step=6.0)
+    g[..., 1] = o[1] + 60 + 0.1 * (g[..., 2] - o[2]) + 3.0          # 3 voxels off the band
+    write_tifxyz_raw(str(tmp_path / "paths" / "segB" / "segB-on-20260411134726-2.4um.tifxyz"), g)
+    outs = {}
+    for t in (0, 48):
+        out = tmp_path / f"out{t}"
+        assert R.main(["--recto", rp, "--verso", vp, "--paths", str(tmp_path / "paths"), "--umbilicus", str(umb),
+                       "--out", str(out), "--z0", str(o[0] + 32), "--dz", "64", "--far", "8", "--sigma-vox", "8",
+                       "--thr", "0.3", "--thickness", "8", "--slices", "2", "--taper", "4", "--tile", str(t),
+                       "--no-surface-png"]) == 0
+        outs[t] = np.stack([tifffile.imread(str(out / "segB-on-20260411134726-2.4um" / f"{c}.tif")) for c in "zyx"], -1)
+        rep = json.load(open(out / "refine_report.json"))
+        assert len(rep["stats"]) == (1 if t == 0 else 9)
+    a, b = outs[0], outs[48]
+    moved = np.abs(a - np.where(np.isfinite(g), g, -1)).max(-1) > 1e-3
+    assert moved.sum() > 20
+    np.testing.assert_allclose(a, b, atol=0.05)
+    assert (tmp_path / "out48" / "png" / "displacement_hist.png").exists()
