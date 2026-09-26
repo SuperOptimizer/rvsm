@@ -442,7 +442,7 @@ def _pool_eval(acc):
 
 @torch.no_grad()
 def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None, band=True,
-             cost=None):
+             cost=None, capture=None):
     """bce / dice / mae over the validation grid, plus the metrics the layout makes meaningful.
 
     Every entry is a compact rung sample (`sample.rung_item`), whose input is built on the device by
@@ -489,6 +489,9 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None, 
     `rungs` scores only the windows of those rungs (the mask-cascade pass scores the fine ones).
 
     The affinity heads are a training-only head: never scored, never drawn.
+
+    `capture` (a `PanelCapture`, whole-grid passes only) is handed every window's forward, so the
+    validation PNGs are drawn from THIS pass instead of re-reading and re-running their items.
     """
     was = net.training
     net.eval()
@@ -498,7 +501,7 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None, 
     bsum, tsum, band_s = {}, {}, 0.0   # band / continuity sums per rung (`_sheet_sums`), their cost
     if rungs is not None and hasattr(grid, "of_rungs"):
         grid = grid.of_rungs(rungs)      # a DiskGrid: the other rungs' items are not even read
-    for item in grid:
+    for gi, item in enumerate(grid):
         b = _batch(item)
         rung = _rungs_of(b)[0]
         if rungs is not None and int(rung) not in rungs:
@@ -522,12 +525,18 @@ def evaluate(net, grid, dev, layout, cascade=None, calib_keep=None, rungs=None, 
         if calib_keep is not None:     # the calibration's logits, off THIS forward (see calib.keep)
             from rvsm import calib as _cal
             _cal.keep(calib_keep, logit, tgt, w, rung)
+        p = torch.sigmoid(logit)
+        if capture is not None and rungs is None:     # the validation PNGs' slices (`PanelCapture`)
+            try:
+                capture.add(gi, item, x, tgt, ww, p)
+            except Exception as e:  # noqa: BLE001  -- the pictures must never cost the metrics
+                print("[train] val_png capture:", repr(e), flush=True)
+                capture.broken, capture = repr(e), None
         if float(w.sum()) <= 0:
             # no probability weight anywhere in the window (a held-out box with no store at this rung):
             # it says nothing, so it is not scored
             continue
         scored += 1
-        p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tgt >= 0.5).float()
         a = per.setdefault(int(rung), {"bce": 0.0, "w": 0.0, "tp": 0.0, "den": 0.0, "ae": 0.0,
                                        "ov": 0.0, "vox": 0.0, "sp": 0.0, "sd": 0.0,
@@ -657,21 +666,8 @@ def _radius_frac(item):
     return r / rmax if rmax > 0 else float("nan")
 
 
-def region_panels(grid, region=1024, n=4):
-    """[(region origin, radius fraction, grid INDICES)] -- one validation panel per held-out region, in
-    the grid's order (the held-out order): the `n` windows of that region with the highest target
-    foreground fraction (recto >= 0.5 where weighted). One pass over the grid, once per run. Indices,
-    not items: a grid item is ~300 MB in memory, and holding 32 of them for the run was ~9 GB of
-    trainer RSS (paris4 step 30000); they are re-read from the DiskGrid at each evaluation."""
-    per = {}
-    order = []
-    for i, it in enumerate(grid):
-        r = _region_of_item(it, region)
-        if r not in per:
-            per[r] = []
-            order.append(r)
-        t, w = (q[0] for q in prep.full_tw(it))
-        per[r].append((float(((t >= 128) & (w > 0)).float().mean()), i, _radius_frac(it)))
+def _pick_panels(order, per, n):
+    """`region_panels`' choice from its per-region (foreground, index, radius fraction) lists."""
     out = []
     for r in order:
         best = sorted(per[r], key=lambda q: -q[0])[:int(n)]
@@ -680,21 +676,106 @@ def region_panels(grid, region=1024, n=4):
     return out
 
 
+def _panel_stat(item, region):
+    """(region origin, target foreground fraction, radius fraction) of one grid item."""
+    t, w = (q[0] for q in prep.full_tw(item))
+    return (_region_of_item(item, region), float(((t >= 128) & (w > 0)).float().mean()),
+            _radius_frac(item))
+
+
+def region_panels(grid, region=1024, n=4):
+    """[(region origin, radius fraction, grid INDICES)] -- one validation panel per held-out region, in
+    the grid's order (the held-out order): the `n` windows of that region with the highest target
+    foreground fraction (recto >= 0.5 where weighted). One pass over the grid. Indices, not items: a
+    grid item is ~300 MB in memory, and holding 32 of them for the run was ~9 GB of trainer RSS
+    (paris4 step 30000). The trainer does not call this: `PanelCapture` makes the same choice inside
+    `evaluate`'s own pass, so the grid is not read a second time."""
+    per = {}
+    order = []
+    for i, it in enumerate(grid):
+        r, fg, fr = _panel_stat(it, region)
+        if r not in per:
+            per[r] = []
+            order.append(r)
+        per[r].append((fg, i, fr))
+    return _pick_panels(order, per, n)
+
+
 def write_region_panels(out, step, net, panels, dev, layout, cascade=None, grid=None):
     """val_<step>_r<k>.png for every held-out region k, and val_<step>_regions.txt: k, the region's
     rung-2 origin (z, y, x) and its radius fraction from the umbilicus. `panels` holds grid indices
-    (`region_panels`); each panel's four items are read from `grid` only while it is drawn."""
+    (`region_panels`); each panel's four items are read from `grid` only while it is drawn. This is the
+    SYNCHRONOUS path (it re-reads and re-runs the panel items); the trainer uses `PanelCapture`."""
+    import os
+    rows = {}
+    for k, (_, _, idx) in enumerate(panels):
+        # a DiskGrid's subset is read with the grid's prefetch, one item decoded ahead of the drawing
+        items = grid.subset(idx) if hasattr(grid, "subset") else [grid[i] for i in idx]
+        name = os.path.join(str(out), "eval", f"val_{int(step):06d}_r{k}.png")
+        rows[k] = _panel_rows(name, net, items, dev, layout, cascade=cascade)
+        del items
+    _write_region_pngs(out, step, panels, lambda k, idx: rows[k])
+
+
+def _write_region_pngs(out, step, panels, rows_of):
+    """The panel PNGs and the regions.txt index; `rows_of(k, idx)` gives panel k's row data."""
     import os
     lines = ["k\tregion_origin_zyx\tradius_frac\tpanel"]
     for k, (r, frac, idx) in enumerate(panels):
         name = f"val_{int(step):06d}_r{k}.png"
-        # a DiskGrid's subset is read with the grid's prefetch, one item decoded ahead of the drawing
-        items = grid.subset(idx) if hasattr(grid, "subset") else [grid[i] for i in idx]
-        val_png(os.path.join(str(out), "eval", name), net, items, dev, layout, cascade=cascade)
-        del items
+        _render_png(os.path.join(str(out), "eval", name), rows_of(k, idx))
         lines.append(f"{k}\t{r[0]},{r[1]},{r[2]}\t{frac:.3f}\t{name}")
     with open(os.path.join(str(out), "eval", f"val_{int(step):06d}_regions.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def _panel_row(x, t, ww, p, nprob, on):
+    """One window's row data for `_render_png`: the middle z-slice of the CT channel, and of the target
+    and prediction channels drawn (the recto, plus the verso when it is on), as CPU numpy. `x`, `t`,
+    `ww`, `p` are a batch of one's input, target, weight and PROBABILITY (sigmoid of the nprob logits)."""
+    nch = 1
+    if nprob >= 2:
+        show = on if on is not None else bool(float(ww[0, 1].sum()) > 0)
+        nch = 2 if show else 1
+    z = x.shape[2] // 2
+    return (x[0, 0, z].cpu().numpy(), t[0, :nch, z].cpu().numpy(), p[0, :nch, z].cpu().numpy())
+
+
+def _render_png(path, rows):
+    """CT (gray) | target | prediction for each row (`_panel_row`), the rows stacked, saved to `path`."""
+    from PIL import Image
+    out = []
+    for c, tt, pp in rows:
+        c = (c - c.min()) / (c.max() - c.min() + 1e-6) * 255 * 0.9
+        gray = np.repeat(c[..., None], 3, -1)
+
+        def overlay(chans, gray=gray):   # channel 0 red, channel 1 blue, mixed on one tile
+            a = [np.clip(v, 0, 1)[..., None] for v in chans]
+            cols = [np.array([255, 40, 40]), np.array([40, 90, 255])]
+            wsum = sum(a)
+            al = np.maximum.reduce(a) * 0.85
+            col = sum(ai * ci for ai, ci in zip(a, cols)) / np.maximum(wsum, 1e-6)
+            return gray * (1 - al) + col * al
+        out.append(np.concatenate([gray, overlay(list(tt)), overlay(list(pp))], 1))
+    Image.fromarray(np.concatenate(out, 0).astype(np.uint8)).save(path)
+
+
+def _panel_rows(path, net, grid, dev, layout, cascade=None, verso=None):
+    """`_panel_row` of the first four items of `grid`, each read and run through `net` here."""
+    rows = []
+    was = net.training
+    net.eval()
+    on = _verso_on(path) if verso is None else bool(verso)
+    with torch.no_grad():
+        for item in grid[:4]:
+            b = _batch(item)
+            x, t, ww = prep.prepare(b, dev, cascade=cascade)
+            with prep.autocast(dev):
+                y = net(x.to(memory_format=M.memfmt()))
+            y = (y[0] if isinstance(y, (list, tuple)) else y).float()
+            rows.append(_panel_row(x, t, ww, torch.sigmoid(y[:, :layout.nprob]), layout.nprob, on))
+    net.train(was)
+    return rows
 
 
 def val_png(path, net, grid, dev, layout, cascade=None, verso=None):
@@ -708,42 +789,109 @@ def val_png(path, net, grid, dev, layout, cascade=None, verso=None):
     whole prediction tile blue over the recto), so only the recto is drawn. `verso`: True / False, or
     None to read `verso_on` from the run's state.json (two levels above `path`), falling back to
     whether the patch carries any verso target weight. The affinity and distance heads are never drawn.
-    """
-    from PIL import Image
-    rows = []
-    was = net.training
-    net.eval()
-    on = _verso_on(path) if verso is None else bool(verso)
-    with torch.no_grad():
-        for item in grid[:4]:
-            b = _batch(item)
-            x, t, ww = prep.prepare(b, dev, cascade=cascade)
-            with prep.autocast(dev):
-                y = net(x.to(memory_format=M.memfmt()))
-            y = (y[0] if isinstance(y, (list, tuple)) else y).float()
-            p = torch.sigmoid(y[:, :layout.nprob])[0].cpu()
-            x, t = x[0].cpu(), t[0].cpu()
-            nch = 1
-            if layout.nprob >= 2:
-                show = on if on is not None else bool(float(ww[0, 1].sum()) > 0)
-                nch = 2 if show else 1
-            z = x.shape[1] // 2
-            c = x[0, z].numpy()
-            c = (c - c.min()) / (c.max() - c.min() + 1e-6) * 255 * 0.9
-            gray = np.repeat(c[..., None], 3, -1)
 
-            def overlay(chans, gray=gray):   # channel 0 red, channel 1 blue, mixed on one tile
-                a = [np.clip(v, 0, 1)[..., None] for v in chans]
-                cols = [np.array([255, 40, 40]), np.array([40, 90, 255])]
-                wsum = sum(a)
-                al = np.maximum.reduce(a) * 0.85
-                col = sum(ai * ci for ai, ci in zip(a, cols)) / np.maximum(wsum, 1e-6)
-                return gray * (1 - al) + col * al
-            tt = t[:nch, z].numpy()
-            pp = p[:nch, z].numpy()
-            rows.append(np.concatenate([gray, overlay(list(tt)), overlay(list(pp))], 1))
-    net.train(was)
-    Image.fromarray(np.concatenate(rows, 0).astype(np.uint8)).save(path)
+    This is the SYNCHRONOUS path (it reads and runs the items itself). The trainer draws the same bytes
+    from `evaluate`'s own forwards (`PanelCapture`), rendered on a background thread (`_PngWorker`).
+    """
+    _render_png(path, _panel_rows(path, net, grid, dev, layout, cascade=cascade, verso=verso))
+
+
+class PanelCapture:
+    """Everything the validation PNGs draw, taken from `evaluate`'s OWN forwards: `val_png`'s first four
+    grid items and every region panel's items (`region_panels`), as the small middle-slice numpy
+    arrays of `_panel_row`. Before this, `val_png` + `write_region_panels` re-read and re-ran 36 grid
+    items (~310 MB compressed each) after the evaluation, and the first evaluation of each `train()`
+    call re-read the WHOLE grid to pick the panels -- `eval_s.val_png` 290 s beside `evaluate` 404 s on
+    the A100 run, all of it with the trainer not stepping.
+
+    `panels` None: the choice is made here, in the same pass, from exactly `region_panels`' numbers
+    (only the current top `n` of each region hold their slices). `on`: the verso switch `val_png` would
+    have read (`_verso_on`), read once at the evaluation."""
+
+    def __init__(self, layout, on, panels=None, region=1024, n=4, first=4):
+        self.nprob, self.on = int(layout.nprob), on
+        self.panels, self.region, self.n, self.first = panels, int(region), int(n), int(first)
+        self.need = set(range(self.first)) | {int(i) for _, _, idx in (panels or ()) for i in idx}
+        self.rows, self.per, self.order = {}, {}, []
+        self.broken = None           # set by `evaluate` when a capture failed: nothing is drawn
+
+    def add(self, i, item, x, t, ww, p):
+        i = int(i)
+        if self.panels is None:
+            r, fg, fr = _panel_stat(item, self.region)
+            if r not in self.per:
+                self.per[r] = []
+                self.order.append(r)
+            self.per[r].append((fg, i, fr))
+            top = {q[1] for q in sorted(self.per[r], key=lambda q: -q[0])[:self.n]}
+            for q in self.per[r]:                 # a window that has fallen out of its region's top n
+                if q[1] not in top and q[1] >= self.first:
+                    self.rows.pop(q[1], None)
+            keep = i < self.first or i in top
+        else:
+            keep = i in self.need
+        if keep:
+            self.rows[i] = _panel_row(x, t, ww, p, self.nprob, self.on)
+
+    def finish(self):
+        """The panels (chosen here when none were given)."""
+        if self.panels is None:
+            self.panels = _pick_panels(self.order, self.per, self.n)
+        return self.panels
+
+    def render(self, out, step):
+        """val_<step>.png, the region panels and val_<step>_regions.txt, exactly the bytes `val_png` +
+        `write_region_panels` write."""
+        import os
+        _render_png(os.path.join(str(out), "eval", f"val_{int(step):06d}.png"),
+                    [self.rows[i] for i in sorted(self.rows) if i < self.first])
+        _write_region_pngs(out, step, self.finish(), lambda k, idx: [self.rows[int(i)] for i in idx])
+
+
+PNG_WAIT_S = 300.0   # the longest the trainer waits for a background PNG render (next eval, exit)
+
+
+class _PngWorker:
+    """One evaluation's PNGs, rendered on a background thread while training resumes. ONE render at a
+    time: `submit` first waits for the previous one (two never race on the files or the log), and
+    `close` waits for the last one at exit, at most `PNG_WAIT_S`, and logs the wait. A render is numpy
+    + PIL over a few MB of slices, so a thread is enough (no pickling, no process start)."""
+
+    def __init__(self, log_path):
+        self.log_path, self.fut, self.step, self.last_s = log_path, None, None, None
+
+    def wait(self, timeout=PNG_WAIT_S, why="next"):
+        """Wait for the render in flight; False when it is still running after `timeout`."""
+        if self.fut is None:
+            return True
+        import concurrent.futures as cf
+        tw = time.time()
+        ok = True
+        try:
+            self.last_s = self.fut.result(timeout=timeout)
+        except cf.TimeoutError:
+            ok = False
+        except Exception as e:  # noqa: BLE001  -- a render failure (a missing PIL) must never stop a run
+            print("[train] val_png:", repr(e), flush=True)
+        if why == "exit" or not ok:
+            _log(self.log_path, {"kind": "val_png_wait", "at": why, "step": self.step, "done": ok,
+                                 "s": round(time.time() - tw, 2)})
+        self.fut = None
+        return ok
+
+    def submit(self, step, cap, out):
+        """Render `cap` (a `PanelCapture`) for `step`, after the previous render has finished."""
+        self.wait()
+
+        def job():
+            t = time.time()
+            cap.render(out, step)
+            return round(time.time() - t, 2)
+        self.step = int(step)
+        self.fut = _spawn(job, name="rvsm-valpng")
+
+    def close(self, timeout=PNG_WAIT_S):
+        return self.wait(timeout, why="exit")
 
 
 # --------------------------------------------------------------------------- the loop
@@ -825,12 +973,12 @@ def _run_into(fut, fn):
         fut.set_exception(e)
 
 
-def _spawn(fn):
+def _spawn(fn, name="rvsm-h2d-once"):
     """`fn()` on a fresh DAEMON thread, as a Future (a one-off: `DevicePrefetch` keeps ONE thread)."""
     import concurrent.futures as cf
     import threading
     fut = cf.Future()
-    threading.Thread(target=_run_into, args=(fut, fn), name="rvsm-h2d-once", daemon=True).start()
+    threading.Thread(target=_run_into, args=(fut, fn), name=name, daemon=True).start()
     return fut
 
 
@@ -1254,6 +1402,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
              {"kind": "ckpt", "step": step, "at": kind, "s": round(time.time() - tc, 2)})
 
     panels = {}                      # one validation panel per held-out region, chosen once per run
+    pngw = _PngWorker(str(out / "logs" / "train.jsonl"))    # the PNGs render while training resumes
 
     def do_eval():
         nonlocal temps
@@ -1263,8 +1412,10 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         te = time.time()
         kept = {} if cfg.calibrate else None
         cost = {}
+        cap = PanelCapture(layout, _verso_on(out / "eval" / "val.png"), panels=panels.get("p"),
+                           region=int(cfg.region))
         rec = {"step": step, **evaluate(evfwd, grid, dev, layout, cascade=casval, calib_keep=kept,
-                                        cost=cost)}
+                                        cost=cost, capture=cap)}
         if casmask is not None:
             # the same fine windows with the MASK cascade source (the pooled target, no noise): the
             # trajectory of what the model does with a good coarse prediction, beside the self-cascade
@@ -1277,14 +1428,15 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                            if f"dice_r{k}" in mk}})
             rec["mask_s"] = round(time.time() - tm, 1)
         t_ev = time.time() - te
-        try:
+        # the PNGs: drawn from the evaluation's own forwards (`PanelCapture`) and rendered on a
+        # background thread (`_PngWorker`). `val_png` is now only the hand-off (plus the wait for the
+        # previous render, were it still running); `val_png_bg` is the PREVIOUS evaluation's render
+        # seconds (this one's is not known yet)
+        if cap.broken is None:
             (out / "eval").mkdir(parents=True, exist_ok=True)
-            val_png(out / "eval" / f"val_{step:06d}.png", evfwd, grid, dev, layout, cascade=casval)
-            if "p" not in panels:
-                panels["p"] = region_panels(grid, int(cfg.region))
-            write_region_panels(out, step, evfwd, panels["p"], dev, layout, cascade=casval, grid=grid)
-        except Exception as e:   # noqa: BLE001  -- a missing PIL must never stop a run
-            print("[train] val_png:", repr(e), flush=True)
+            panels["p"] = cap.finish()
+            pngw.submit(step, cap, out)
+        del cap
         t_png = time.time() - te - t_ev
         if cfg.calibrate:        # on the evaluation's own logits: the grid is not run a second time
             from rvsm import calib
@@ -1293,7 +1445,8 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             rec["temps"] = dict(temps)
         rec["eval_s"] = {"evaluate": round(t_ev, 1), "val_png": round(t_png, 1),
                          "calibrate": round(time.time() - te - t_ev - t_png, 1),
-                         "band": cost.get("band", 0.0)}   # inside `evaluate`: the recto band metrics
+                         "band": cost.get("band", 0.0),   # inside `evaluate`: the recto band metrics
+                         "val_png_bg": pngw.last_s}
         _log(str(out / "logs" / "eval.jsonl"), rec)
 
     _log(str(out / "logs" / "train.jsonl"),
@@ -1568,6 +1721,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
               "last_checkpoint": int(last), "discarded_microbatches": int(micro),
               "discarded_steps": 0 if do_save else int(step - int(last))})
         src.close(timeout=5.0)
+        pngw.close(timeout=10.0)        # a render in flight is a few MB of numpy: it is not held for long
         if do_save:
             checkpoint("stop")
             # the driver records the resume state of THIS checkpoint (its step and walk): without it
@@ -1577,5 +1731,6 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
                       "out": str(out), "ckpt": str(ck), "quiesce": src.close, "kind": "stop"})
         return str(ck)
     src.close()
+    pngw.close()                        # the last evaluation's PNGs (STOP, a round's end, the last step)
     save()
     return str(ck)

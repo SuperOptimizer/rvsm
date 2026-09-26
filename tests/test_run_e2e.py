@@ -57,12 +57,17 @@ def write_toml(cfg, path):
 
 @pytest.fixture
 def run_cfg(region_cfg, fake_teacher, tmp_path, has_volcomp):
-    """The end-to-end config: the `fake` teacher, both gates on their step fallbacks, two rounds."""
+    """The end-to-end config: the `fake` teacher, both gates on their step fallbacks, two rounds.
+
+    `steps` 30, not 20: the round gate needs the round-0 verso stores the producer writes after the
+    verso gate (step 10), and passes only while `round_steps` of the budget are left. At 20 steps it
+    had ONE try (step 15) and relied on the evaluations' synchronous PNG re-reads for the producer's
+    slack; with the PNGs drawn from the evaluation's own pass that slack is gone, so it gets three."""
     if not has_volcomp:
         pytest.skip("a region store is a volcomp array; no libvolcomp on this host")
     return replace(region_cfg,
                    out=str(tmp_path / "e2e"), teacher_ckpts={"fake": fake_teacher.ckpt},
-                   mode="cpu", gpus=(), rounds=2, steps=20, eval_every=5, ckpt_every=3,
+                   mode="cpu", gpus=(), rounds=2, steps=30, eval_every=5, ckpt_every=3,
                    verso_after_steps=5, verso_min_dice=0.0, round_min_steps_after_verso=0, verso_min_regions=1,
                    verso_regen_gain=10.0, round_steps=5, heldout=1, workers=0,
                    min_regions_before_train=2, lookahead_extra=2, reserve_gb=0.001,

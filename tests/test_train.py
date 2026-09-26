@@ -245,6 +245,14 @@ def test_twenty_steps_of_the_full_recipe(full_cfg):
     if cfg.calibrate:
         assert "2" in last["temps"], last.get("temps")         # rung 2 is always calibrated now
     assert sorted(p.name for p in (out / "eval").glob("val_*.png"))
+    # every evaluation's PNGs are on disk when train() returns (the last one's rendered in the
+    # background and waited for at exit), and an evaluation logs the one before it's render seconds
+    for e in ev:
+        assert (out / "eval" / f"val_{e['step']:06d}.png").exists()
+        assert (out / "eval" / f"val_{e['step']:06d}_regions.txt").exists()
+    assert ev[0]["eval_s"]["val_png_bg"] is None and ev[-1]["eval_s"]["val_png_bg"] >= 0
+    tr = [json.loads(q) for q in (out / "logs" / "train.jsonl").read_text().splitlines()]
+    assert [r for r in tr if r.get("kind") == "val_png_wait"][-1]["done"] is True
     assert sorted((out / "eval").glob("val_*_r0.png")) and sorted((out / "eval").glob("val_*_regions.txt"))
     from PIL import Image
     im = Image.open(sorted((out / "eval").glob("val_*.png"))[-1])
@@ -882,6 +890,111 @@ def test_one_panel_per_held_out_region_with_the_most_sheet(full_cfg, tmp_path):
     assert idx[0].startswith("k") and idx[2].split("\t")[1] == "2048,0,0"
 
 
+def _panel_grid(cfg, tmp_path):
+    """Three held-out regions of five windows each, with different sheet fractions, in memory and as
+    a DiskGrid (the trainer's)."""
+    items = []
+    for reg in range(3):
+        for j, frac in enumerate((0.1, 0.9, 0.5, 0.0, 0.7)):
+            it = _item(cfg, k=2, seed=10 * reg + j)
+            it["lo"] = torch.tensor([2048 * reg + 8 * j, 0, 0])
+            t = it["tgt"].clone()
+            t[0].view(-1)[: int(frac * t[0].numel())] = 255
+            it["tgt"] = t
+            items.append(it)
+    d = tmp_path / "grid"
+    d.mkdir()
+    names = []
+    for i, it in enumerate(items):
+        names.append(f"item_r2_{i:04d}.pt")
+        sample._save_item(str(d / names[-1]), it)
+    return items, sample.DiskGrid(str(d), names)
+
+
+@pytest.mark.parametrize("verso", ["off", "on", "none"])
+def test_the_trainer_pngs_are_the_bytes_of_the_synchronous_path(full_cfg, tmp_path, verso):
+    """The trainer's PNGs come from `evaluate`'s own forwards (`PanelCapture`), not from re-reading and
+    re-running the grid: val_<step>.png, every val_<step>_r<k>.png and the regions.txt are byte for
+    byte what `val_png` + `region_panels` + `write_region_panels` write, at the first evaluation
+    (panels chosen in the pass) and a later one (panels given)."""
+    items, grid = _panel_grid(full_cfg, tmp_path)
+    lay = full_cfg.layout()
+    torch.manual_seed(0)
+    net = M.build("1m", cin=lay.cin, cout=lay.cout, verbose=False).eval()
+    dev = torch.device("cpu")
+    sync, bg = tmp_path / "sync", tmp_path / "bg"
+    for r in (sync, bg):
+        (r / "eval").mkdir(parents=True)
+        if verso != "none":
+            (r / "state.json").write_text(json.dumps({"verso_on": verso == "on"}))
+    TR.val_png(sync / "eval" / "val_000010.png", net, grid, dev, lay)
+    pan = TR.region_panels(grid, region=1024)
+    TR.write_region_panels(sync, 10, net, pan, dev, lay, grid=grid)
+    TR.write_region_panels(sync, 20, net, pan, dev, lay, grid=grid)
+    TR.val_png(sync / "eval" / "val_000020.png", net, grid, dev, lay)
+
+    on = TR._verso_on(bg / "eval" / "val.png")
+    cap = TR.PanelCapture(lay, on, region=1024)
+    ref = TR.evaluate(net, grid, dev, lay)
+    assert TR.evaluate(net, grid, dev, lay, capture=cap) == ref       # the metrics are untouched
+    assert cap.finish() == pan
+    assert len(cap.rows) <= 4 + 3 * 4                                  # only the drawn windows' slices
+    cap.render(bg, 10)
+    cap2 = TR.PanelCapture(lay, on, panels=pan, region=1024)
+    TR.evaluate(net, items, dev, lay, capture=cap2)                     # a later evaluation: panels given
+    assert sorted(cap2.rows) == sorted(set(range(4)) | {i for p in pan for i in p[2]})
+    cap2.render(bg, 20)
+    got = sorted(p.name for p in (bg / "eval").iterdir())
+    assert got == sorted(p.name for p in (sync / "eval").iterdir()) and len(got) == 2 * (1 + 3 + 1)
+    for n in got:
+        assert (bg / "eval" / n).read_bytes() == (sync / "eval" / n).read_bytes(), n
+
+
+class _SlowCap:
+    """A `PanelCapture` stand-in whose render takes `s` seconds and records when it ran."""
+
+    def __init__(self, s, seen):
+        self.s, self.seen = s, seen
+
+    def render(self, out, step):
+        import time as _t
+        t0 = _t.time()
+        _t.sleep(self.s)
+        self.seen.append((step, t0, _t.time()))
+
+
+def test_background_pngs_never_overlap_and_the_exit_waits_for_the_last(tmp_path):
+    """Two evaluations in a row: the second render starts only after the first has ended; the
+    hand-off itself does not wait for a render; `close` waits for the last one and logs it."""
+    import time as _t
+    log = tmp_path / "logs" / "train.jsonl"
+    w = TR._PngWorker(str(log))
+    seen = []
+    t0 = _t.time()
+    w.submit(10, _SlowCap(0.4, seen), tmp_path)
+    assert _t.time() - t0 < 0.2 and not seen          # training resumes while it renders
+    w.submit(20, _SlowCap(0.1, seen), tmp_path)       # waits for step 10's render first
+    assert [s[0] for s in seen] == [10] and w.last_s >= 0.4
+    assert w.close() is True
+    assert [s[0] for s in seen] == [10, 20] and seen[1][1] >= seen[0][2]
+    rec = [json.loads(q) for q in log.read_text().splitlines()]
+    assert rec[-1]["kind"] == "val_png_wait" and rec[-1]["step"] == 20 and rec[-1]["done"] is True
+    w.submit(30, _SlowCap(1.0, seen), tmp_path)
+    assert w.close(timeout=0.1) is False               # a stuck render is logged, never waited forever
+    rec = json.loads(log.read_text().splitlines()[-1])
+    assert rec["kind"] == "val_png_wait" and rec["step"] == 30 and rec["done"] is False
+
+
+def test_a_failed_render_never_stops_the_run(tmp_path):
+    class Bad:
+        def render(self, out, step):
+            raise RuntimeError("no PIL")
+    w = TR._PngWorker(str(tmp_path / "train.jsonl"))
+    w.submit(10, Bad(), tmp_path)
+    w.submit(20, Bad(), tmp_path)
+    assert w.close() is True
+
+
 def _slow_items(n, sleep):
     import time as _t
     for _ in range(n):
@@ -1082,6 +1195,29 @@ def test_a_disk_grid_evaluates_exactly_like_the_list(full_cfg, tmp_path):
     ref2 = TR.evaluate(net, items, torch.device("cpu"), lay, rungs=(2,))
     os.remove(d / names[1])                      # a rung-3 file: the rung-2 pass must not open it
     assert TR.evaluate(net, g, torch.device("cpu"), lay, rungs=(2,)) == ref2
+
+
+def test_grid_items_are_pickled_with_protocol_4_and_old_ones_still_load(full_cfg, tmp_path):
+    """Protocol 2 pickled each compressed buffer as a latin-1 str (~1.2 s of GIL per 240 MB item on
+    load); protocol 4 stores raw bytes. A protocol-2 file written before still loads to the same item."""
+    import zipfile
+    it = _item(full_cfg, k=2, seed=3)
+    it["ct"] = torch.randint(0, 255, (2, 128, 64, 64), dtype=torch.uint8)   # >= _PACK_MIN: packed
+    it["cm"] = np.zeros((256, 64, 64), np.uint8)                          # a packed numpy array too
+    p = str(tmp_path / "item_r2_0.pt")
+    sample._save_item(p, it)
+    with zipfile.ZipFile(p) as z:
+        pkl = z.read([n for n in z.namelist() if n.endswith("data.pkl")][0])
+    assert pkl[:2] == b"\x80\x04"
+    rec = torch.load(p, weights_only=False)
+    assert rec["ct"][0] == "blosc" and isinstance(rec["ct"][1], bytes) and rec["cm"][0] == "blosc"
+    torch.save(rec, str(tmp_path / "old.pt"))                       # torch's default: protocol 2
+    for q in (p, str(tmp_path / "old.pt")):
+        got = sample._load_item(q)
+        assert set(got) == set(it)
+        for k, v in it.items():
+            assert type(got[k]) is type(v) and torch.equal(torch.as_tensor(got[k]),
+                                                           torch.as_tensor(v)), k
 
 
 def _band_case(off, n=40, half=6):
