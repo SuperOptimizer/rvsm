@@ -321,7 +321,7 @@ def test_end_to_end_slab_in_the_legacy_frame(tmp_path, has_volcomp):
     rc = R.main(["--recto", rp, "--verso", vp, "--paths", str(tmp_path / "paths"), "--umbilicus", str(umb),
                  "--out", str(out), "--z0", str(o[0] + 32), "--dz", "64", "--legacy-scale", "2.0",
                  "--legacy-offset", "10", "20", "30", "--far", "8", "--sigma-vox", "8", "--thr", "0.3",
-                 "--eval-store", ep, "--slices", "3", "--taper", "4"])
+                 "--eval-store", ep, "--slices", "3", "--taper", "4", "--crops", "3", "--crop-montage"])
     assert rc == 0
     import tifffile
     got = np.stack([tifffile.imread(str(out / "segA-on-20230205180739-7.91um" / f"{c}.tif")) for c in "zyx"], -1)
@@ -337,6 +337,10 @@ def test_end_to_end_slab_in_the_legacy_frame(tmp_path, has_volcomp):
     assert "displacement_hist.png" in pngs and sum(p.startswith("slab_z") for p in pngs) == 3
     rep = json.load(open(out / "refine_report.json"))
     assert rep["circular"] is False
+    crops = [p for p in pngs if p.startswith("segA-on-20230205180739-7.91um_crop") and p[-5].isdigit()]
+    assert len(crops) == 3 and "segA-on-20230205180739-7.91um_crops.png" in pngs
+    mv = rep["moves"]["segA-on-20230205180739-7.91um"]
+    assert mv["frac_moved_gt2"] > 0.3 and 1.0 < mv["mean_abs_move"] < 5.0
     assert rep["pooled"]["after"]["offset_le3"] >= rep["pooled"]["before"]["offset_le3"]
     assert abs(rep["pooled"]["after"]["offset_mean"]) < abs(rep["pooled"]["before"]["offset_mean"])
 
@@ -417,3 +421,46 @@ def test_tiled_slab_matches_one_tile(tmp_path, has_volcomp):
     assert moved.sum() > 20
     np.testing.assert_allclose(a, b, atol=0.05)
     assert (tmp_path / "out48" / "png" / "displacement_hist.png").exists()
+
+
+# ------------------------------------------------------------------------------------ local following
+
+def bump_band(shape=(16, 48, 96), amp=3.0, width=4.0):
+    """A band at y = 24 + amp * a narrow bump in x (a local feature a wide smoothing flattens)."""
+    return lambda x: 24 + amp * np.exp(-0.5 * ((x - shape[2] / 2) / width) ** 2)
+
+
+def test_sigma_final_follows_a_local_bump_the_wide_smoothing_flattens():
+    yc = bump_band()
+    V = band_volume((16, 48, 96), yc, width=1.2)
+    g = flat_sheet(24.0, z=(2, 14), x=(2, 94))
+    peak = np.abs(g[..., 2] - 48) <= 1
+    errs = {}
+    for fin in (6.0, 0.7):
+        (g1,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, far=6, sigma=6.0, sigma_final=fin, iters=3, thr=0.3)
+        errs[fin] = np.abs(g1[..., 1] - yc(g1[..., 2]))[peak].mean()
+    assert errs[0.7] < 0.5 * errs[6.0], errs
+
+
+def test_local_normal_off_keeps_the_published_normals():
+    V = band_volume((16, 48, 32), lambda x: 26 + 0 * x)
+    g = flat_sheet(24.0)
+    (a,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, far=6, sigma=1.0, iters=2, thr=0.3, local_normal=False)
+    (b,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, far=6, sigma=1.0, iters=2, thr=0.3)
+    inner = (slice(2, -2), slice(2, -2))
+    assert np.abs(a[inner][..., 1] - 26).mean() < 0.3 and np.abs(b[inner][..., 1] - 26).mean() < 0.3
+    assert np.allclose(a[..., [0, 2]], g[..., [0, 2]])        # moved along the fixed +y normal only
+
+
+def test_pick_crops_spreads_over_z_and_finds_the_big_moves():
+    rng = np.random.default_rng(0)
+    cd = {}
+    for z in (10.5, 20.5, 30.5, 40.5):
+        P = np.stack([np.full(400, 100.0), np.linspace(0, 1000, 400)], -1).astype(np.float32)
+        M = np.where(P[:, 1] > 800, 6.0, 0.5).astype(np.float32) + rng.random(400).astype(np.float32) * 0.1
+        cd[z] = ([], [], [P], [M])
+    picks = R.pick_crops(cd, 4, win=128)
+    assert [p[0] for p in picks] == [10.5, 20.5, 30.5, 40.5]
+    assert picks[1][4] == "largest moves" and picks[1][2] > 800 and picks[1][3] > 5
+    xs = [p[2] for p in picks]
+    assert min(abs(a - b) for i, a in enumerate(xs) for b in xs[i + 1:]) >= 128

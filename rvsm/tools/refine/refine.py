@@ -350,7 +350,7 @@ def box_taper(g, origin, size, taper):
 
 def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=None, chunk=400_000,
                 W=None, thick=None, T=None, verso_thr=None, verso_beta=0.5, verso_block=np.inf, verso_margin=0.5,
-                holds=None, taper=0.0, box=None, log=None):
+                holds=None, taper=0.0, box=None, sigma_final=None, local_normal=True, log=None):
     """Joint refinement of several (H,W,3) zyx grids (NaN = hole) against V, a (Z,Y,X) probability (float in
     [0,1] or uint8) at `origin`. Each iteration: normals; per point the peaks along the normal ray and the
     neighbouring sheets on it are matched in order (assign()); the matched peak's offset is smoothed over the
@@ -360,6 +360,10 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     over the box (0 = no data); T: a fixed thickness (else estimated from the peaks at iteration 0).
     holds: per grid (H,W) weights in 0..1, 1 = anchored (never moved by the snap). taper: see `box_taper`.
     sigma: grid cells, one value or one per grid.
+    sigma_final: the smoothing (grid cells, one value or one per grid) of the LAST iteration only, so the
+    final pass follows the band locally while the earlier ones stay robust (default: sigma).
+    local_normal: recompute the normals from the current (refined) grid every iteration, so the search
+    direction follows the refined shape; False keeps the published grid's normals throughout.
     box: (origin, size) of the region being refined when V covers only part of it (a tile of a slab): points
     must be inside both, and the taper fades at `box`'s faces, not V's.
     Returns (refined grids, per-iteration stats)."""
@@ -374,6 +378,8 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
              for g, h in zip(grids, holds or [None] * len(grids))]
     vthr = thr if verso_thr is None else verso_thr
     sigmas = list(np.broadcast_to(np.asarray(sigma, np.float64), (len(grids),)))
+    sigmas_f = sigmas if sigma_final is None else list(np.broadcast_to(np.asarray(sigma_final, np.float64), (len(grids),)))
+    n_fixed = None
     tunit = THICK_UNIT if thick is not None and thick.dtype == np.uint8 else 1.0
     Tg = None if T is None else float(T)
     stats = []
@@ -383,7 +389,13 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
               "capped": 0.0}
         if W is not None:
             st["verso_blocked"] = 0.0
-        ns = [normals(g, ax) for g in grids]
+        if local_normal or n_fixed is None:
+            ns = [normals(g, ax) for g in grids]
+            if not local_normal:
+                n_fixed = ns
+        else:   # the published normals, masked to the cells that are still points
+            ns = [np.where(np.isfinite(g).all(-1)[..., None], n, np.nan) for g, n in zip(grids, n_fixed)]
+        sig_it = sigmas_f if it == iters - 1 else sigmas
         oks = [ins & np.isfinite(n).all(-1) for ins, n in zip(insides, ns)]
         pts = [g[ok] for g, ok in zip(grids, oks)]
         if W is not None and Tg is None:   # one thickness for the box, from the recto-verso spacing
@@ -439,7 +451,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             lo = np.where(np.isfinite(below), below + 1.0, -r).astype(np.float32)
             field, w = np.zeros(g.shape[:2], np.float32), np.zeros(g.shape[:2], np.float32)
             field[ok], w[ok] = np.clip(off, lo, hi), conf
-            dd = smooth(field, w, sigmas[j])
+            dd = smooth(field, w, sig_it[j])
             lof, hif = np.full(g.shape[:2], -float(r), np.float32), np.full(g.shape[:2], float(r), np.float32)
             lof[ok], hif[ok] = lo, hi
             dd = np.clip(dd, lof, hif) * ok * fades[j]
@@ -1007,6 +1019,70 @@ def slab_pngs(out_dir, zs, plane_fn, ct_fn, extent, segs_before, segs_after, max
     return outs
 
 
+def pick_crops(cd, n, win=128, cell=64):
+    """Up to n crop sites for one surface from its per-level data cd = {z: (segs_b, segs_a, [yx], [|move|])}:
+    one per z level (spread over the slab), alternately at the densest `cell`-voxel cell and at the cell
+    with the largest mean |move| (among cells with >= 25% of the densest's points), each at least `win`
+    voxels in yx from the sites already picked. Returns [(z, cy, cx, local mean |move|, why)]."""
+    out = []
+    levels = [z for z in sorted(cd) if cd[z][2]]
+    for k, z in enumerate(levels[:n]):
+        P, M = np.concatenate(cd[z][2]), np.concatenate(cd[z][3])
+        key = np.floor(P / cell).astype(np.int64)
+        _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+        inv = inv.ravel()
+        mm = np.bincount(inv, weights=M) / cnt
+        cyx = np.stack([np.bincount(inv, weights=P[:, i]) / cnt for i in (0, 1)], -1)
+        by_move = k % 2 == 1
+        score = np.where(cnt >= 0.25 * cnt.max(), mm, -1.0) if by_move else cnt.astype(np.float64)
+        order = np.argsort(-score, kind="stable")
+        sep = np.array([min([max(abs(cyx[i, 0] - q[1]), abs(cyx[i, 1] - q[2])) for q in out] or [np.inf])
+                        for i in order])
+        ok = np.nonzero(sep >= win)[0]
+        i = order[ok[0]] if len(ok) else order[int(np.argmax(sep))]   # a small surface: the farthest site
+        near = (np.abs(P - cyx[i]) <= win / 2).all(-1)
+        out.append((z, float(cyx[i, 0]), float(cyx[i, 1]), float(M[near].mean()),
+                    "largest moves" if by_move else "densest"))
+    return out
+
+
+def crop_png(vz, wz, ctz, sb, sa, others, y0, x0, scale, label):
+    """One before | after crop (a PIL image): CT gray, recto red, verso blue, this surface's polylines
+    (magenta before; green after over a dim magenta trace), the other surfaces' dim, and a label."""
+    from PIL import Image, ImageDraw
+    n = vz.shape[0]
+    base = np.zeros((n, n, 3), np.float32)
+    if ctz is not None:
+        c = np.asarray(ctz, np.float32)[:n, :n]
+        base[:c.shape[0], :c.shape[1]] += c[..., None] * 0.8
+    base[..., 0] += 150 * vz
+    if wz is not None:
+        base[..., 2] += 150 * wz
+    base = np.repeat(np.repeat(np.clip(base, 0, 255).astype(np.uint8), scale, 0), scale, 1)
+    left, right = Image.fromarray(base), Image.fromarray(base.copy())
+    lo, hi = np.array([y0, x0]) - 2, np.array([y0, x0]) + n + 2
+
+    def inwin(ss):
+        ss = [q for q in ss if len(q)]
+        if not ss:
+            return np.zeros((0, 2, 2), np.float32)
+        q = np.concatenate(ss)
+        m = q.mean(1)
+        return q[((m >= lo) & (m < hi)).all(-1)]
+    for ob, oa in others:
+        _draw_segments(left, inwin(ob), y0, x0, scale, (120, 120, 120), 1)
+        _draw_segments(right, inwin(oa), y0, x0, scale, (0, 110, 0), 1)
+    b, a = inwin(sb), inwin(sa)
+    _draw_segments(left, b, y0, x0, scale, (255, 0, 255), 2)
+    _draw_segments(right, b, y0, x0, scale, (110, 0, 110), 1)
+    _draw_segments(right, a, y0, x0, scale, (0, 255, 0), 2)
+    W = base.shape[1]
+    img = Image.new("RGB", (2 * W + 6, base.shape[0] + 16), (255, 255, 255))
+    img.paste(left, (0, 16))
+    img.paste(right, (W + 6, 16))
+    ImageDraw.Draw(img).text((3, 2), label + "   before | after", fill=(0, 0, 0))
+    return img
+
 def hist_png(path, moves, far, bins=None, cell=(260, 120)):
     """Small multiples of the signed normal displacement (voxels) per surface: {name: (N,) array}."""
     from PIL import Image, ImageDraw
@@ -1145,7 +1221,11 @@ def run(args):
     # ---- tiles: every published node is refined in the tile whose core holds it, with a halo around the core
     # wide enough for everything that couples nodes (neighbour sheets, the smoothing and anchor kernels, the
     # snap's reach). Only one tile's stores and dense grids are in memory at a time.
-    halo = max(int(args.halo), 3 * int(args.far) + 8, 44)
+    sigma_vox = float(args.sigma_vox) if args.sigma_vox is not None else 2.0 * float(args.pitch)
+    sigma_fin = float(args.sigma_final) if args.sigma_final is not None else sigma_vox / 2.0
+    log(json.dumps({"sigma_vox": sigma_vox, "sigma_final_vox": sigma_fin, "pitch": args.pitch, "far": args.far,
+                    "iters": args.iters, "local_normal": bool(args.local_normal)}))
+    halo = max(int(args.halo), 3 * int(args.far) + 8, 44, int(np.ceil(3 * max(sigma_vox, sigma_fin))))
     tile = int(args.tile) if args.tile and args.tile > 0 else int(max(shape[1], shape[2]))
     rpad = int(args.far) + 4                     # the snap samples +-far around a halo point
     circ = not args.eval_store or os.path.abspath(args.eval_store) == os.path.abspath(args.recto)
@@ -1156,14 +1236,19 @@ def run(args):
     zs = np.linspace(lo[0] + 0.5 + shape[0] / (2 * args.slices), lo[0] + shape[0] - 0.5 - shape[0] / (2 * args.slices),
                      args.slices) if args.slices > 1 else [lo[0] + shape[0] / 2]
     zs = [float(int(z)) + 0.5 for z in zs]
-    zmid = int(lo[0] + shape[0] // 2)
     ext_lo, ext_hi = lo[1:].copy(), lo[1:] + shape[1:]
     pstride, _ = slab_view(int((ext_hi - ext_lo).max()))
     cshape = tuple(int(v) for v in -(-(ext_hi - ext_lo) // pstride))
     canv = {z: [np.zeros(cshape, np.uint8), np.zeros(cshape, np.uint8)] for z in zs}
     segs_b, segs_a = {z: [] for z in zs}, {z: [] for z in zs}
     moves = {x["name"]: [] for x in surf}
-    near_mid = {x["name"]: ([], []) for x in surf}
+    ncrop = 0 if args.no_surface_png else max(int(args.crops), 0)
+    cz_lo, cz_hi = lo[0] + args.taper + 4, lo[0] + shape[0] - args.taper - 4
+    czs = [float(int(z)) + 0.5 for z in (np.linspace(cz_lo, cz_hi, ncrop) if ncrop > 1 and cz_hi > cz_lo
+                                         else [lo[0] + shape[0] / 2] * min(ncrop, 1))]
+    czs = sorted(set(czs))
+    # per surface and crop level: (before segments, after segments, band points yx, band |move|)
+    cdat = {x["name"]: {z: ([], [], [], []) for z in czs} for x in surf}
     met = {x["name"]: {"before": [], "after": []} for x in surf}
     stats = []
     cores = [(y0, min(y0 + tile, int(lo[1] + shape[1])), x0, min(x0 + tile, int(lo[2] + shape[2])))
@@ -1208,13 +1293,15 @@ def run(args):
                     g, h = g + fld, top
             g0.append(g)
             holds.append(h)
-        sig = [args.sigma_vox / max(pitch(g), 1e-3) if np.isfinite(pitch(g)) else 2.0 for g in g0]
+        pit = [pitch(g) for g in g0]
+        sig = [sigma_vox / max(p, 1e-3) if np.isfinite(p) else 2.0 for p in pit]
+        sig_f = [sigma_fin / max(p, 1e-3) if np.isfinite(p) else 1.0 for p in pit]
         g1, st = refine_many(g0, V, rlo.astype(np.float32), ax, far=args.far, sigma=sig,
                              iters=args.iters, thr=args.thr, ct=ct_mask, W=W, thick=thick, T=args.thickness,
                              verso_thr=args.verso_thr, verso_beta=args.verso_beta,
                              verso_block=np.inf if args.verso_block is None else args.verso_block,
                              verso_margin=args.verso_margin, holds=holds, taper=args.taper,
-                             box=(o, s), log=None)
+                             box=(o, s), sigma_final=sig_f, local_normal=bool(args.local_normal), log=None)
         stats.append({"tile": [cy0, cy1, cx0, cx1], "pieces": len(pieces), "iters": st})
         log(json.dumps({"tile": ti + 1, "of": len(cores), "core_yx": [cy0, cy1, cx0, cx1], "pieces": len(pieces),
                         **{k: v for k, v in st[-1].items() if k != "iter"}}))
@@ -1232,7 +1319,21 @@ def run(args):
             x["own_c"].append((cc + pz["c0"]).astype(np.int32))
             x["own_v"].append(b[::up, ::up][cn].astype(np.float32))
             n0 = normals(a, ax)
-            moves[x["name"]].append(((b - a) * np.nan_to_num(n0)).sum(-1)[core].astype(np.float32))
+            dvg = ((b - a) * np.nan_to_num(n0)).sum(-1)
+            moves[x["name"]].append(dvg[core].astype(np.float32))
+            for z in czs:
+                cd = cdat[x["name"]][z]
+                for g, dst in ((a, cd[0]), (b, cd[1])):
+                    sg = plane_segments(g, z)
+                    if len(sg):
+                        mid = sg.mean(1)
+                        keep = (mid[:, 0] >= cy0) & (mid[:, 0] < cy1) & (mid[:, 1] >= cx0) & (mid[:, 1] < cx1)
+                        if keep.any():
+                            dst.append(sg[keep])
+                bk = core & (np.abs(a[..., 0] - z) <= 2.5)
+                if bk.any():
+                    cd[2].append(a[bk][:, 1:].astype(np.float32))
+                    cd[3].append(np.abs(dvg[bk]).astype(np.float32))
             for z in zs:
                 for g, dst in ((a, segs_b), (b, segs_a)):
                     sg = plane_segments(g, z)
@@ -1241,10 +1342,6 @@ def run(args):
                         keep = (mid[:, 0] >= cy0) & (mid[:, 0] < cy1) & (mid[:, 1] >= cx0) & (mid[:, 1] < cx1)
                         if keep.any():
                             dst[z].append(sg[keep])
-            for g, lst in ((a, near_mid[x["name"]][0]), (b, near_mid[x["name"]][1])):
-                pk = core & (np.abs(g[..., 0] - zmid) <= 3.0)
-                if pk.any():
-                    lst.append(g[pk])
             for nm, g in (("before", a), ("after", b)):
                 mm = surface_metrics(Ve, rlo, g, ax, thr=args.thr, mask=core)
                 if mm.get("n_points", 0):
@@ -1271,7 +1368,7 @@ def run(args):
             new[np.concatenate(x["own_r"]), np.concatenate(x["own_c"])] = np.concatenate(x["own_v"])
         x["own_r"] = x["own_c"] = x["own_v"] = None
         note = {"recto": str(args.recto), "verso": str(args.verso or ""), "box": [*lo.tolist(), *shape.tolist()],
-                "far": args.far, "sigma_vox": args.sigma_vox, "iters": args.iters, "thr": args.thr, "up": x["up"],
+                "far": args.far, "sigma_vox": sigma_vox, "sigma_final_vox": sigma_fin, "iters": args.iters, "thr": args.thr, "up": x["up"],
                 "joint_with": len(surf), "frame": x["frame"].name, "anchors": bool(anchors.get(surf.index(x))),
                 "tile": tile, "halo": halo}
         src = E.read_surface(x["dir"])
@@ -1307,27 +1404,53 @@ def run(args):
     for p in slab_pngs(png, zs, plane_fn, ct_fn, (ext_lo, ext_hi), segs_b, segs_a):
         log(p)
     del canv, segs_b, segs_a
-    if not args.no_surface_png:
-        zi = int(zmid - lo[0])
-
-        def vcrop(zi, y0, y1, x0, x1):
-            return read_box(args.recto, (int(lo[0]) + zi, int(lo[1]) + y0, int(lo[2]) + x0), (1, y1 - y0, x1 - x0))[0] / 255.0
-        cz = (lambda zi, y0, y1, x0, x1: ct_fn(int(lo[0]) + zi, int(lo[1]) + y0, int(lo[1]) + y1,
-                                               int(lo[2]) + x0, int(lo[2]) + x1)) if ct else None
+    if ncrop:
+        def read_plane(path, z, y0, x0, n):
+            return read_box(path, (int(z), int(y0), int(x0)), (1, n, n))[0].astype(np.float32) / 255.0 if path else None
+        n = args.crop_px // args.crop_scale
         for x in surf:
-            bp, ap = near_mid[x["name"]]
-            if not bp:
-                continue
-            p = compare_png(os.path.join(png, x["name"] + ".png"), cz, vcrop, o, np.concatenate(bp),
-                            np.concatenate(ap), zi=zi, shape=tuple(int(v) for v in shape))
-            if p:
-                log(p)
+            picks = pick_crops(cdat[x["name"]], ncrop, win=n)
+            imgs = []
+            for k, (z, cy, cx, mv, why) in enumerate(picks):
+                y0, x0 = int(cy) - n // 2, int(cx) - n // 2
+                others = [(cdat[nm][z][0], cdat[nm][z][1]) for nm in cdat if nm != x["name"]]
+                im = crop_png(read_plane(args.recto, z, y0, x0, n), read_plane(args.verso, z, y0, x0, n),
+                              ct_fn(int(z), y0, y0 + n, x0, x0 + n) if ct else None,
+                              cdat[x["name"]][z][0], cdat[x["name"]][z][1], others, y0, x0, args.crop_scale,
+                              f"{x['name'][:28]}  zyx {int(z)} {int(cy)} {int(cx)}  mean|move| {mv:.1f} vox ({why})")
+                im.save(os.path.join(png, f"{x['name']}_crop{k}.png"))
+                imgs.append(im)
+            if imgs and args.crop_montage:
+                from PIL import Image
+                wd, ht = max(i.size[0] for i in imgs), sum(i.size[1] for i in imgs) + 4 * (len(imgs) - 1)
+                mt = Image.new("RGB", (wd, ht), (255, 255, 255))
+                yy = 0
+                for i in imgs:
+                    mt.paste(i, (0, yy))
+                    yy += i.size[1] + 4
+                mt.save(os.path.join(png, f"{x['name']}_crops.png"))
+            if imgs:
+                log(json.dumps({"crops": x["name"], "n": len(imgs)}))
+    del cdat
 
     # ---- metrics: per surface, the tiles' numbers pooled by their point counts
     tot = {"before": {}, "after": {}}
+    move_rep = {}
     for x in surf:
+        dv = np.abs(moves[x["name"]])
+        mr = {"points": int(len(dv)),
+              "frac_moved_gt2": round(float((dv > 2).mean()), 4) if len(dv) else 0.0,
+              "mean_abs_move": round(float(dv.mean()), 3) if len(dv) else 0.0,
+              "median_abs_move": round(float(np.median(dv)), 3) if len(dv) else 0.0}
+        if len(dv) and mr["median_abs_move"] < 0.5:
+            mr["warning"] = "over-smoothed? median |move| < 0.5 voxel"
+        elif len(dv) and mr["median_abs_move"] > args.far / 2:
+            mr["warning"] = f"runaway? median |move| > far/2 = {args.far / 2:g} voxels"
+        if "warning" in mr:
+            log(f"WARNING: {x['name']}: {mr['warning']} (median {mr['median_abs_move']}, mean {mr['mean_abs_move']})")
+        move_rep[x["name"]] = mr
         rec = {"surface": x["name"], "eval_store": str(args.eval_store or args.recto), "circular": bool(circ),
-               "tiles": len(met[x["name"]]["before"])}
+               "tiles": len(met[x["name"]]["before"]), "moves": mr}
         for nm in ("before", "after"):
             ms = met[x["name"]][nm]
             npt = sum(m["n_points"] for m in ms)
@@ -1344,7 +1467,8 @@ def run(args):
               for nm, t in tot.items()}
     log(json.dumps({"pooled": pooled, "circular": bool(circ)}))
     with open(os.path.join(args.out, "refine_report.json"), "w") as f:
-        json.dump({"box": [*lo.tolist(), *shape.tolist()], "tile": tile, "halo": halo, "stats": stats,
+        json.dump({"box": [*lo.tolist(), *shape.tolist()], "tile": tile, "halo": halo, "moves": move_rep,
+                   "sigma_vox": sigma_vox, "sigma_final_vox": sigma_fin, "stats": stats,
                    "pooled": pooled, "circular": bool(circ), "surfaces": [x["name"] for x in surf]}, f, indent=1)
     return 0
 
@@ -1369,8 +1493,13 @@ def parser():
     ap.add_argument("--dz", type=int, default=128)
     ap.add_argument("--box", type=int, nargs=6, help="Z Y X DZ DY DX instead of the store / slab box")
     ap.add_argument("--far", type=int, default=12)
-    ap.add_argument("--sigma-vox", type=float, default=40.0,
-                    help="displacement smoothing, voxels along the sheet (usrm2: 2 cells of a 20-voxel grid)")
+    ap.add_argument("--sigma-vox", type=float, default=None,
+                    help="displacement smoothing, voxels along the sheet (default 2 x --pitch: follows locally; "
+                         "usrm2 used 40 = 2 cells of its 20-voxel grid)")
+    ap.add_argument("--sigma-final", type=float, default=None,
+                    help="smoothing of the LAST iteration only, voxels (default sigma-vox / 2)")
+    ap.add_argument("--local-normal", action=argparse.BooleanOptionalAction, default=True,
+                    help="recompute the normals from the refined grid every iteration (default on)")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--thr", type=float, default=0.5)
     ap.add_argument("--verso-thr", type=float)
@@ -1396,7 +1525,13 @@ def parser():
     ap.add_argument("--eval-store", help="a DIFFERENT store to measure before/after on")
     ap.add_argument("--slices", type=int, default=4)
     ap.add_argument("--png-dir")
-    ap.add_argument("--no-surface-png", action="store_true")
+    ap.add_argument("--no-surface-png", action="store_true", help="no per-surface crops")
+    ap.add_argument("--crops", type=int, default=6,
+                    help="per surface, comparison crops at different z / along-surface positions (densest and "
+                         "largest-move places, alternately): png/<surface>_crop<k>.png")
+    ap.add_argument("--crop-px", type=int, default=384, help="crop panel size, pixels")
+    ap.add_argument("--crop-scale", type=int, default=3, help="pixels per voxel in a crop")
+    ap.add_argument("--crop-montage", action="store_true", help="also png/<surface>_crops.png: all crops stacked")
     return ap
 
 

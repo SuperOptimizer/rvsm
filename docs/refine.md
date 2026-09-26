@@ -12,7 +12,9 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
    (r, c) becomes node (r·up, c·up), so the published nodes are kept exactly).
 2. **Normals.** Normals are hole-tolerant: they are computed on the hole-filled grid (`filled`) and then
    masked back. They are oriented **outward from the umbilicus**, which is also VERSO → RECTO
-   (`export.SIGN_CONVENTION`).
+   (`export.SIGN_CONVENTION`). With `--local-normal` (the default) they are recomputed from the refined
+   grid every iteration, so the search direction follows the refined shape. `--no-local-normal` keeps
+   the published grid's normals throughout.
 3. **Peaks.** The recto probability is sampled along the normal over ±r. The strongest 6 local maxima are
    kept (`local_maxima`), each placed to sub-voxel precision with a parabolic fit. A two-sample plateau
    now counts as ONE peak. usrm2 counted it twice, which let two sheets share one band.
@@ -34,7 +36,10 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
    order to the peaks. The cost is `0.08·|offset − peak| − strength`. Neighbouring sheets can therefore
    neither merge onto one band nor cross, and a move is also capped 1 voxel short of a neighbour.
 6. **Smoothing.** The per-point offsets are smoothed over the (H, W) grid with a Gaussian weighted by
-   peak height (`smooth`, σ = `--sigma-vox` voxels along the sheet). The moves are faded to 0 over
+   peak height (`smooth`). σ = `--sigma-vox` voxels along the sheet, default 2 × `--pitch`, so ~10
+   at pitch 5 and it follows locally; usrm2's 40 flattened everything under ~100 voxels. The LAST
+   iteration uses `--sigma-final` (default σ/2), so the early, wide passes stay robust and the final
+   pass follows the band locally. The moves are faded to 0 over
    `--taper` voxels at the box faces, so a slab-refined surface joins its untouched remainder without a
    step. They are also faded around anchors (below). All sheets move only after all of them have been
    measured.
@@ -87,7 +92,7 @@ None of that is ever held. Instead:
   0.43 GB.
 - **Tiles.** The slab is refined in yx tiles (`--tile`, default 1024 voxels) with a halo (`--halo`,
   default 160, at least 3·far + 8 and 44). The halo covers everything that couples nodes: the
-  neighbour-sheet search (far + 3), the smoothing kernel (3 × `--sigma-vox` 40) and the anchor kernel
+  neighbour-sheet search (far + 3), the smoothing kernel (3 × `--sigma-vox`) and the anchor kernel
   (3 × `--anchor-sigma` 48). The stores are read densely only over one tile (core + halo + far + 4;
   ~240 MB per store at the defaults). The taper still fades at the SLAB's faces, never at a tile's.
 - **Pieces.** Within a tile, each surface is cut into column runs of its grid that reach into the tile,
@@ -99,8 +104,10 @@ None of that is ever held. Instead:
   re-read whole, one at a time, and written back.
 - **Metrics and pictures** are gathered per tile, from core points only. Metrics are pooled per
   surface by point count, so continuity and ERL are per-tile numbers pooled, not whole-surface runs.
-  The slab pictures show the whole box at stride ⌈extent/2000⌉. The per-surface zoom is at the slab's
-  middle z.
+  The slab pictures show the whole box at stride ⌈extent/2000⌉. The crops keep, per tile, only each
+  surface's cross-section segments at the crop levels plus a 5-voxel z band of its points with their
+  |move| (a few MB for the whole slab). The sites are picked after the last tile, and the stores and
+  CT are then read over just the 128² crop.
 
 `--tile 48` against `--tile 0` (one tile) on the test fixture agrees to 0.05 voxel
 (`test_tiled_slab_matches_one_tile`). A synthetic slab at the real tile density (45 sheets over
@@ -115,11 +122,19 @@ Outputs under `--out`:
   grayscale (the store's `volume`, read at a coarser rung when the picture is strided), recto tinted
   red, and verso tinted blue. Unrefined polylines (marching squares on the grid) are magenta, and
   refined ones are green over a dim magenta trace.
-- `png/<name>.png`: a 320-voxel zoom per surface (usrm2's `compare_png`).
+- `png/<name>_crop<k>.png`: `--crops` (default 6) before | after crops per surface, `--crop-px` 384 at
+  `--crop-scale` 3 (a 128-voxel window). Each crop is at its own z level, spread over the slab inside
+  the taper. The site alternates between the densest 64-voxel cell and the cell with the largest mean
+  |move|, at least one window apart along the surface (the farthest site when the surface is too
+  small). The same CT/recto/verso coloring is used; this surface is magenta → green, other sheets
+  are dim. A label gives zyx and the local mean |move|. `--crop-montage` also writes
+  `png/<name>_crops.png` with all of them stacked.
 - `png/displacement_hist.png`: the signed normal displacement per surface.
 - `refine_report.json` plus JSON lines on stdout: per-iteration stats (with_peak, capped by a
   neighbour, verso_blocked, thickness), and evalsurf metrics before and after per surface and pooled:
-  recall@2/4, offset mean/std/≤3, merge_frac, continuity and ERL.
+  recall@2/4, offset mean/std/≤3, merge_frac, continuity and ERL. It also has, per surface (`moves`),
+  the fraction of points that moved more than 2 voxels and the mean and median |move|, with a WARNING
+  when the median is < 0.5 voxel (over-smoothed) or > far/2 (runaway).
 
 ## Warnings
 
@@ -146,8 +161,13 @@ systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=0 \
   --paths /home/forrest/refine/paths --transform /home/forrest/refine/transform.json \
   --umbilicus /home/forrest/refine/umbilicus/20260411134726-umbilicus-20260524235033.json \
   --z0 55552 --dz 128 --tile 1024 --halo 160 --no-ct \
+  --pitch 5 --far 16 --iters 4 --slices 6 --crops 6 --crop-montage \
   --out /home/forrest/refine/refined_z55552 [--anchors anchors.jsonl] [--eval-store S]
 ```
+
+These are the local-following settings: sigma defaults to 2 × pitch = 10 voxels, and to 5 on the last
+pass. On the synthetic 45-sheet 128 × 2048² slab they took 2:27 at a 1.48 GB peak RSS. Expect ~45 min
+and ~2–2.5 GB for the full slab.
 
 Drop `--no-ct` for CT under the pictures. CT is read strided, one plane per picture, from the store's
 `volume` attribute or `--ct`. `--ct-mask` reads full-resolution CT over each tile.
