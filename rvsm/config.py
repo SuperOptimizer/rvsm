@@ -185,6 +185,10 @@ FINGERPRINT_EXCLUDE = ("infer_margin", "steps", "eval_every", "workers", "gpus",
                        # as a deliberate mid-run switch, like the cascade change; the resume logs a
                        # `precision_switch` sched line (`run.log_switches`)
                        "gn_bf16",
+                       # the same switch for the PRODUCER's student only (verso / self passes, the gate's
+                       # held-out pass): an inference numerics choice, recorded in every store it writes
+                       # (`gn_bf16` attr), flipped on a resume with a `precision_switch` sched line
+                       "gn_bf16_producer",
                        # the overlap-crop consistency term (docs/recipe.md): off by default, and switched
                        # on / retuned on a resume as a deliberate mid-run change (`loss_switch` line)
                        "overlap_p", "overlap_sub", "loss_overlap",
@@ -229,6 +233,14 @@ class RouteSpec:
     base: str
     fine_rungs: tuple
     sig: str
+
+
+def producer_gn_bf16(cfg):
+    """The `gn_bf16` the PRODUCER's student passes to `infer.Student`: True (forced, whatever the
+    checkpoint's cfg says, and kept across `Student.reload`) when `gn_bf16` or `gn_bf16_producer` is
+    set; None otherwise -- the checkpoint's own cfg, which is what the trainer ran."""
+    return True if (bool(getattr(cfg, "gn_bf16", False)) or bool(getattr(cfg, "gn_bf16_producer", False))) \
+        else None
 
 
 def route_spec(cfg):
@@ -426,6 +438,10 @@ class Config:
                                        # (float32 statistics; `model.NormAct`): about half the activation
                                        # memory. The trainer, its eval/cascade nets and the producer's
                                        # student (from the checkpoint's cfg) all follow it
+    gn_bf16_producer: bool = False     # the producer's student inference (verso / self passes, the gate's
+                                       # held-out pass, `produce --student`) runs gn_bf16 even when the
+                                       # trainer does not: its nets and calibrate keep `gn_bf16`
+                                       # (`producer_gn_bf16`)
 
     # ------------------------------------------------------------------ derived
     def layout(self):

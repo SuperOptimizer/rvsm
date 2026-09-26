@@ -25,6 +25,7 @@ def test_fingerprint_ignores_only_the_resume_fields():
                                      rounds=9, ct_seed="/m", ckpt_act=0, compile=False,
                                      verso_min_dice=0.9).fingerprint()
     assert a.fingerprint() == Config(ct="x", gn_bf16=True).fingerprint()   # a logged precision switch
+    assert a.fingerprint() == Config(ct="x", gn_bf16_producer=True).fingerprint()   # producer-only
     assert a.fingerprint() != Config(ct="x", patch=128).fingerprint()
     assert a.fingerprint() != Config(ct="y").fingerprint()
 

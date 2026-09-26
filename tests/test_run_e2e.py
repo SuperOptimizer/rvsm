@@ -129,6 +129,7 @@ def test_rvsm_run_two_rounds_end_to_end(run_cfg, tmp_path, capsys):
                 if r.get("kind") in ("reteach", "recto_regen")]
     v = stores.open_store(stores.store_path(out, "verso", _first_done(out, "verso", 0), 0))
     assert v.attrs["radial_sign"] == -1, "the verso store is the FLIPPED-sign pass"
+    assert v.attrs["gn_bf16"] is False, "the producer records the NormAct precision it ran"
 
     # ---- round 1: every produced region carries the whole multi-head contract
     assert 1 in cnt, f"round 1 produced nothing: {cnt}"
@@ -710,7 +711,7 @@ def test_round_r_student_passes_use_the_frozen_round_teacher(tmp_path, monkeypat
     loads = []
     got_bytes = []
 
-    def fake(p, device=None, compile=True, data=None):
+    def fake(p, device=None, compile=True, data=None, gn_bf16=None):
         loads.append(p)
         got_bytes.append(data)
         return p
@@ -1726,5 +1727,6 @@ def test_the_regeneration_student_is_the_live_slot():
     """No second compiled student: the frozen regeneration checkpoint is loaded into the live slot."""
     import inspect
     src = inspect.getsource(RUN.produce_loop)
-    assert "rslot = slot" in src and "StudentSlot(out, device=device, compile=cfg.compile)" in src
+    assert "rslot = slot" in src and "StudentSlot(out, device=device, compile=cfg.compile," in src
+    assert "gn_bf16=CFG.producer_gn_bf16(cfg))" in src          # the producer-only precision
     assert src.count("StudentSlot(") == 1

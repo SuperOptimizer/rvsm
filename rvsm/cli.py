@@ -192,7 +192,7 @@ def produce(argv):
 STUDENT_USAGE = """rvsm produce --out DIR --ct URL|PATH [--umbilicus PATH] --student CKPT
                   --region Z Y X [--size 1024] [--sign -1] [--heads verso|all] [--round R]
                   [--device cuda] [--window 256] [--halo 32] [--cascade-depth 3] [--batch 1]
-                  [--tta 1] [--margin M] [--no-compile] [--fields [--jobs N]]
+                  [--tta 1] [--margin M] [--no-compile] [--gn-bf16] [--fields [--jobs N]]
 
 Runs ONE student checkpoint over ONE region, in one multi-head pass, and writes its stores.
 
@@ -205,6 +205,10 @@ Runs ONE student checkpoint over ONE region, in one multi-head pass, and writes 
                             codec that rounds a 1 to a 0 there invents a hole). Refused at a negative
                             sign: the field stores' sign convention is defined at +1 only.
 
+  --gn-bf16                 run the student's GroupNorm+SiLU outputs in bf16 (`model.NormAct`,
+                            the run's `gn_bf16_producer`) whatever the checkpoint's cfg says;
+                            without it the checkpoint's own `gn_bf16`. Recorded as `gn_bf16` in
+                            the stores' attrs.
   --fields                  after the stores are written, also build the geometric distance fields
                             (`targets.region_fields`: midline / thickness at rungs 2-4 from this
                             region's own recto + verso stores). It is OFF by default because the
@@ -242,7 +246,8 @@ def _produce_student(f, one, out, ct, umb, lo, size3, round_, device):
     do_compile = "no-compile" not in f
 
     ax = AX.load(umb or "auto", ct=ct)
-    st = infer.student_fn(ckpt, device=device, compile=do_compile)
+    st = infer.student_fn(ckpt, device=device, compile=do_compile,
+                          gn_bf16=(True if "gn-bf16" in f else None))
     want = [str(st.layout.channels[0])] if heads == "verso" else "all"
     eff_w = int(w if w is not None else st.cfg.infer_window)
     eff_h = int(h if h is not None else st.cfg.infer_halo)
@@ -257,6 +262,7 @@ def _produce_student(f, one, out, ct, umb, lo, size3, round_, device):
              "radial_sign": int(sign), "window": eff_w, "halo": eff_h, "cascade_depth": eff_d,
              "margin": eff_m,
              "tta": int(tta), "temps": {str(k): float(v) for k, v in st.temps.items()},
+             "gn_bf16": bool(st.gn_bf16),
              "sign_convention": EX.SIGN_CONVENTION}
 
     # (channel, uint8 block, q, encoding). The probabilities are q8 (lossy is harmless: a probability

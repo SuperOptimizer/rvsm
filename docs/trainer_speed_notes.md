@@ -258,6 +258,18 @@ config.json and in every checkpoint's cfg. A resume may flip it as a deliberate 
 the cascade change, and `run.log_switches` logs a `precision_switch` sched line
 (`{"gn_bf16": {"old", "new"}}`). A config.json from before this field counts as False.
 
+**Producer only: `gn_bf16_producer`** (default False, also in `FINGERPRINT_EXCLUDE`). It turns the
+switch on for the producer's student inference and nowhere else: the verso and self passes
+(`run.StudentSlot`, including the frozen regeneration checkpoint it reloads), the gate's held-out
+pass (`run.heldout_rows`) and `rvsm produce --student --gn-bf16`. The trainer's net, its eval and
+cascade nets and `rvsm calibrate` keep `gn_bf16`. The producer passes
+`config.producer_gn_bf16(cfg)` (True when either flag is set, else None: the checkpoint's own cfg) to
+`infer.Student` as an explicit override, so a reload of a checkpoint whose cfg says False keeps the
+module in bf16. Every store the producer writes records `gn_bf16` (the precision the pass actually ran)
+in its attrs. A resume that flips it logs the same `precision_switch` sched line with a
+`gn_bf16_producer` key. For paris4 (trainer stays float32, producer gets the ~25 % forward speed-up at
+window 256), the TOML line is `gn_bf16_producer = true`.
+
 Same laptop, torch and bench as above: the real `train.train` loop, 30m6, batch 1 x accum 2, bf16,
 13.7 GB allocator cap, synthetic full-recipe items (`tests/test_train.py::_item` construction), step =
 median of the second half. Bench scripts are in `/home/forrest/rvsm_bench/gn/`, not in the repo.

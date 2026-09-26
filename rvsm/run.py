@@ -679,10 +679,13 @@ class StudentSlot:
     (`ckpt/teacher_round_<r>.pt`, the EMA snapshotted when round r opened): a round's targets must come
     from one fixed network, not from the student that is being trained on them."""
 
-    def __init__(self, out, device=None, compile=True, mode=None):
+    def __init__(self, out, device=None, compile=True, mode=None, gn_bf16=None):
         self.out = str(out)
         self.path = os.path.join(self.out, "ckpt", "student.pt")
         self.device, self.compile = device, bool(compile)
+        # the producer's NormAct precision (`config.producer_gn_bf16`): True forces bf16 whatever the
+        # checkpoint's cfg says, and `Student.reload` keeps it; None follows each checkpoint's cfg
+        self.gn_bf16 = gn_bf16
         # the producer's compile mode: "default" (no autotuning) unless RVSM_STUDENT_COMPILE_MODE says
         # otherwise. max-autotune benchmarks every candidate kernel on the card, and behind Thunder's
         # GPU proxy (an RPC per benchmark) the first student pass sat in that for 25+ minutes
@@ -716,6 +719,7 @@ class StudentSlot:
                     st = self.st
                 else:
                     st = infer.student_fn(p, device=self.device, compile=self.compile, data=buf,
+                                          gn_bf16=self.gn_bf16,
                                           **({"mode": self.mode} if self.compile else {}))
                 self.st, self.mtime, self.loaded = st, m, p
                 self.sha = hashlib.sha256(buf).hexdigest()
@@ -952,7 +956,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                           "fields_batch": fbatch, "mallopt": malloc_set, "rss_gb": round(own_rss_gb(), 2),
                           "vram_cap_gb": None if vram_cap is None else round(vram_cap / (1 << 30), 2)})
 
-    bank, slot = None, StudentSlot(out, device=device, compile=cfg.compile)
+    bank, slot = None, StudentSlot(out, device=device, compile=cfg.compile,
+                                   gn_bf16=CFG.producer_gn_bf16(cfg))
     peaks = {}                                  # job kind -> the last pass's peak allocated bytes
     vram_report(out, bank, slot, peaks, vram_cap, "start")
     t_vrep = time.time()
@@ -1414,7 +1419,9 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                  "radial_sign": int(sign), "window": int(stu.cfg.infer_window),
                                  "halo": int(stu.cfg.infer_halo), "margin": int(cfg.infer_margin),
                                  "cascade_depth": int(stu.cfg.cascade_depth),
-                                 "temps": {str(k): float(v) for k, v in stu.temps.items()}}
+                                 "temps": {str(k): float(v) for k, v in stu.temps.items()},
+                                 # the NormAct precision the pass ran (`gn_bf16_producer`)
+                                 "gn_bf16": bool(stu.gn_bf16)}
                         rows = student_rows_t(planes, stu.layout, heads)
                         del planes
                         pooled = None
@@ -2451,7 +2458,7 @@ def heldout_rows(cfg, out, ckpt, held, ax, meta5=None, round_=0, device=None, n=
         ref = stores.open_store(p)               # lazy: read block by block by `compare_stores`
         shape = tuple(int(v) for v in ref.shape[-3:])
         if stu is None:
-            stu = infer.student_fn(ckpt, device=device, compile=False)
+            stu = infer.student_fn(ckpt, device=device, compile=False, gn_bf16=CFG.producer_gn_bf16(cfg))
         head = str(stu.layout.channels[0])
         planes = infer.student_region(stu, ct or cfg.ct, ax, lo, shape, sign=1.0, heads=[head],
                                       meta=meta5, as_tensor=True, margin=int(cfg.infer_margin))
@@ -3015,8 +3022,8 @@ def log_switches(out, old, cfg):
     """The deliberate mid-run changes a resume makes, as `sched` lines against the previous
     config.json (`old`): `teacher_switch` when the round-0 teacher set (the keys of `teacher_ckpts`)
     or a teacher's weights moved, `loss_switch` naming every loss weight of `config.LOSS_SWITCH_FIELDS`
-    that moved (the trainer uses the live config's weights), `precision_switch` when `gn_bf16` moved (a
-    config.json that predates the field counts as False). Returns the lines logged."""
+    that moved (the trainer uses the live config's weights), `precision_switch` when `gn_bf16` and/or
+    `gn_bf16_producer` moved (a config.json that predates a field counts as False). Returns the lines logged."""
     d = (old or {}).get("config") or {}
     step = int(read_state(out).get("step", 0) or 0)
     got = []
@@ -3048,9 +3055,13 @@ def log_switches(out, old, cfg):
         rec = {"kind": "loss_switch", "step": step, "weights": moved}
         jlog(out, "sched", rec)
         got.append(rec)
-    og = bool(CFG._coerce("gn_bf16", d.get("gn_bf16", False)))
-    if og != bool(cfg.gn_bf16):
-        rec = {"kind": "precision_switch", "step": step, "gn_bf16": {"old": og, "new": bool(cfg.gn_bf16)}}
+    prec = {}
+    for k in ("gn_bf16", "gn_bf16_producer"):
+        ov = bool(CFG._coerce(k, d.get(k, False)))
+        if ov != bool(getattr(cfg, k)):
+            prec[k] = {"old": ov, "new": bool(getattr(cfg, k))}
+    if prec:
+        rec = {"kind": "precision_switch", "step": step, **prec}
         jlog(out, "sched", rec)
         got.append(rec)
     return got

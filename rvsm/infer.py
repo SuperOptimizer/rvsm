@@ -827,7 +827,9 @@ class Student:
         self.temps = tmps if temps else {}
         self.use_temps = bool(temps)
         # gn_bf16 (`model.NormAct`): the checkpoint's own cfg unless the caller overrides it, so the
-        # producer serves a checkpoint with the precision it was trained with
+        # producer serves a checkpoint with the precision it was trained with. An explicit value (the
+        # run's `config.producer_gn_bf16`) is a producer-only override that `reload` keeps: a reloaded
+        # checkpoint's own cfg never switches it back
         self.gn_bf16_override = gn_bf16
         self.gn_bf16 = bool(cfg.gn_bf16 if gn_bf16 is None else gn_bf16)
         net = M.build(cfg.size, cin=layout.cin, cout=layout.cout, ckpt_act=0,

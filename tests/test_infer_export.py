@@ -673,9 +673,20 @@ def test_produce_student_verso_writes_only_the_verso_store(tmp_path, student_env
     assert a.attrs["ckpt"] == student_ckpt and a.attrs["step"] == 123
     assert a.attrs["encoding"] == "prob_u8" and a.attrs["volume"] == e.cfg.ct
     assert a.attrs["temps"] == {"2": 2.0, "3": 1.5} and a.attrs["cascade_depth"] == 0
+    assert a.attrs["gn_bf16"] is False                     # the checkpoint's own precision
     # round 0's verso pass writes ONE store: the recto is the teachers', and is not touched
     for ch in ("recto", "midline", "thickness", "conf"):
         assert not os.path.exists(stores.store_path(out, ch, (0, 0, 0), 0)), ch
+
+
+def test_produce_student_gn_bf16_records_the_precision_in_the_attrs(tmp_path, student_env, student_ckpt):
+    """`--gn-bf16` (the run's `gn_bf16_producer`): the pass runs bf16 NormAct outputs whatever the
+    checkpoint says, and every store it writes says so."""
+    e = student_env
+    out = str(tmp_path / "brun")
+    assert _produce(out, e.cfg, student_ckpt, "--sign", "-1", "--heads", "verso", "--gn-bf16") == 0
+    a = stores.open_store(stores.store_path(out, "verso", (0, 0, 0), 0))
+    assert a.attrs["gn_bf16"] is True and a.attrs["producer"] == "student"
 
 
 def test_produce_student_all_heads_writes_the_five_stores(tmp_path, student_env, student_ckpt):
@@ -921,6 +932,57 @@ def test_the_student_takes_gn_bf16_from_its_checkpoint_and_follows_a_switch(stud
     assert s.reload(on) is True and s.raw is raw and s.gn_bf16 and all(m.bf16 for m in acts)
     assert infer.student_fn(on, device="cpu", compile=False).gn_bf16
     assert not infer.student_fn(on, device="cpu", compile=False, gn_bf16=False).gn_bf16   # override
+
+
+def _normact_dtypes(net, cin=None):
+    """The dtypes every `NormAct` of `net` hands on for a float32 GroupNorm output under bf16 autocast
+    (CPU autocast keeps `group_norm` in bf16, so a whole-net CPU forward would not show the switch;
+    on the card GroupNorm is float32 and this is exactly what each NormAct sees)."""
+    from rvsm import model as M
+    acts = [m for m in net.modules() if isinstance(m, M.NormAct)]
+    assert acts
+    x = torch.randn(1, 4, 4, 4, 4)
+    with torch.no_grad(), torch.autocast("cpu", torch.bfloat16):
+        return {m(x).dtype for m in acts}
+
+
+def test_gn_bf16_producer_runs_the_producer_student_bf16_and_leaves_the_trainer_alone(
+        student_env, tmp_path):
+    """`gn_bf16_producer`: the producer's student (`StudentSlot`, from `config.producer_gn_bf16`) runs
+    bf16 NormAct outputs although the checkpoint's cfg says gn_bf16 = False, a trainer net built from
+    the same cfg the way `train.train` builds it does not, and a newly published checkpoint reloaded
+    into the slot (its own cfg still False) keeps the producer's bf16."""
+    import dataclasses
+    import shutil
+    from rvsm import config as CFG, model as M, run as RUN
+    e = student_env
+    cfg = dataclasses.replace(e.cfg, gn_bf16_producer=True)
+    assert not cfg.gn_bf16 and CFG.producer_gn_bf16(cfg) is True
+    assert CFG.producer_gn_bf16(e.cfg) is None                      # off: the checkpoint's own cfg
+    L = cfg.layout()
+    out = tmp_path / "run"
+    (out / "ckpt").mkdir(parents=True)
+    live = out / "ckpt" / "student.pt"
+    shutil.copy(_other_ckpt(tmp_path, e.cfg, "a.pt", 1, 10), live)
+    slot = RUN.StudentSlot(str(out), device="cpu", compile=False, gn_bf16=CFG.producer_gn_bf16(cfg))
+    s = slot.get(0)
+    assert s.gn_bf16 and not s.cfg.gn_bf16 and s.raw.gn_bf16
+    assert _normact_dtypes(s.raw, L.cin) == {torch.bfloat16}
+    trainer = M.build(cfg.size, cin=L.cin, cout=L.cout, gn_bf16=bool(getattr(cfg, "gn_bf16", False)),
+                      verbose=False)
+    assert _normact_dtypes(trainer, L.cin) == {torch.float32}
+    # a reload: the new checkpoint's cfg (gn_bf16 False) never switches the producer back
+    shutil.copy(_other_ckpt(tmp_path, e.cfg, "b.pt", 2, 20), str(live) + ".tmp")
+    os.replace(str(live) + ".tmp", live)
+    os.utime(live, (1e9, 1e9))
+    raw = s.raw
+    s2 = slot.get(0)
+    assert s2 is s and s2.raw is raw and s2.step == 20 and s2.gn_bf16
+    assert _normact_dtypes(s2.raw, L.cin) == {torch.bfloat16}
+    # the override also holds against a checkpoint that turned gn_bf16 on and then off again
+    st = infer.student_fn(live, device="cpu", compile=False, gn_bf16=True)
+    on = _other_ckpt(tmp_path, dataclasses.replace(e.cfg, gn_bf16=True), "on.pt", 3, 30)
+    assert st.reload(on) and st.gn_bf16 and st.reload(str(live)) and st.gn_bf16
 
 
 def test_the_producer_slot_follows_the_live_checkpoint_in_place(student_ckpt, tmp_path, region_cfg):

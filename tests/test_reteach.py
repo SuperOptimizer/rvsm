@@ -330,6 +330,13 @@ def test_enabling_the_skeleton_precision_on_a_resume_logs_a_loss_switch(tmp_path
     got = RUN.log_switches(out, o3, replace(small_cfg, gn_bf16=True))
     assert [(r["kind"], r["gn_bf16"]) for r in got] == [("precision_switch", {"old": False, "new": True})]
     assert RUN.log_switches(out, o3, small_cfg) == []
+    # the producer-only override: its own `precision_switch` key, also against a config.json from before it
+    o4 = small_cfg.to_json()
+    o4["config"].pop("gn_bf16_producer")
+    got = RUN.log_switches(out, o4, replace(small_cfg, gn_bf16_producer=True))
+    assert [r["kind"] for r in got] == ["precision_switch"] and "gn_bf16" not in got[0]
+    assert got[0]["gn_bf16_producer"] == {"old": False, "new": True}
+    assert RUN.log_switches(out, o4, small_cfg) == []
 
 
 # ------------------------------------------------------------------------------ the producer, for real
