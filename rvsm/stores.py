@@ -39,6 +39,25 @@ def region_name(lo):
     return "region_%d_%d_%d.zarr" % tuple(int(v) for v in lo)
 
 
+def parse_region_name(name):
+    """`region_<z>_<y>_<x>.zarr` -> ((z, y, x), 0), `region_<z>_<y>_<x>.g<N>.zarr` -> ((z, y, x), N),
+    anything else (a `.tmp`, a `.gc-<ts>` being removed, a bundle file) -> None."""
+    n = str(name)
+    if not (n.startswith("region_") and n.endswith(".zarr")):
+        return None
+    stem, g = n[len("region_"):-len(".zarr")], 0
+    if "." in stem:
+        stem, _, tail = stem.partition(".")
+        if not (tail.startswith("g") and tail[1:].isdigit() and int(tail[1:]) > 0):
+            return None
+        g = int(tail[1:])
+    try:
+        z, y, x = (int(v) for v in stem.split("_"))
+    except ValueError:
+        return None
+    return (z, y, x), g
+
+
 def store_path(root, channel, lo, round_=0):
     """<root>/stores/round_<r>/<channel>/region_<z>_<y>_<x>.zarr"""
     return os.path.join(root, "stores", f"round_{int(round_)}", str(channel), region_name(lo))

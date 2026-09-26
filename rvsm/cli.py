@@ -18,10 +18,12 @@ USAGE = """rvsm <command> [options]
   status | stop | ledger --rebuild | umbilicus --ct URL --out umbilicus.json
   teachers   fetch [recto,m7] [--cache DIR] [--extras]
   grid-repack DIR [DIR ...] [--jobs N] [--dry-run] [--force] [--wait S]   (rvsm/grid_repack.py)
+  store-gc   --out DIR [--round R] [--delete] [--gen0] [--min-age-min 30]   (rvsm/store_gc.py)
 """
 
 COMMANDS = ("run", "produce", "train", "eval", "export", "calibrate", "pretrain", "ladder",
-            "status", "stop", "ledger", "umbilicus", "teachers", "verso", "grid-repack")
+            "status", "stop", "ledger", "umbilicus", "teachers", "verso", "grid-repack",
+            "store-gc")
 
 
 def _stack_dumps():
@@ -1164,6 +1166,12 @@ def grid_repack(argv):
     """`rvsm grid-repack`: the grid items' pickle protocol 2 -> 4, in place (`rvsm.grid_repack`)."""
     from rvsm import grid_repack as GR
     return GR.main(argv)
+
+
+def store_gc(argv):
+    """`rvsm store-gc`: list (default) or delete the superseded store generations (`rvsm.store_gc`)."""
+    from rvsm import store_gc as SG
+    return SG.main(argv)
 
 
 if __name__ == "__main__":       # kept LAST: `main` dispatches on the functions defined above it

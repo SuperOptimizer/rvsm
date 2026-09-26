@@ -283,21 +283,25 @@ class Catalog:
         return a
 
     def list_done(self, channel):
-        """[(z, y, x), ...] of every finished region of a channel, in name order."""
+        """[(z, y, x), ...] of every region of a channel whose generation-0 store or COMMITTED store
+        (`path`) is finished, sorted. Every generation's directory names its region
+        (`region_<z>_<y>_<x>[.g<N>].zarr`), so a region whose superseded generation 0 was removed
+        (`rvsm store-gc --gen0`) is still listed;
+        before, only the generation-0 name was parsed and such a region vanished from the recto
+        regeneration's work list, the verso count and the round rollover's cleanup."""
         d = os.path.join(self.root, "stores", f"round_{self.round}", str(channel))
         if not os.path.isdir(d):
             return []
-        out = []
-        for n in sorted(os.listdir(d)):
-            if not (n.startswith("region_") and n.endswith(".zarr")):
-                continue
-            try:
-                z, y, x = (int(v) for v in n[len("region_"):-len(".zarr")].split("_"))
-            except ValueError:
-                continue
-            if stores.is_done(os.path.join(d, n)):
-                out.append((z, y, x))
-        return sorted(out)
+        los = {}
+        for n in os.listdir(d):
+            got = stores.parse_region_name(n)
+            if got is not None:
+                los[got[0]] = los.get(got[0], False) or got[1] == 0
+        # generation 0 finished (the old test, kept: a superset never drops a region a caller saw
+        # before -- a `band` whose committed generation has none still lists) OR the committed one
+        return sorted(lo for lo, g0 in los.items()
+                      if (g0 and stores.is_done(os.path.join(d, stores.region_name(lo))))
+                      or stores.is_done(self.path(channel, lo)))
 
 
 # --------------------------------------------------------------------------- pooling a region
