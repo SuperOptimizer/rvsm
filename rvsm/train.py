@@ -1371,7 +1371,17 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
             w_pre = wt[thin_sel, :1] > 0
             tg, wt = L.thin_apply(tg, wt, thin_sel, width=float(cfg.thin_band_width),
                                   soft=float(cfg.thin_band_soft), orig=orig0, tb=tb, m=route_m)
-            thin_zero = float((w_pre & (wt[thin_sel, :1] <= 0)).sum() / w_pre.sum().clamp_min(1))
+            w_post = wt[thin_sel, :1] > 0
+            # thin_zero: share of the recto weight the transform ZEROED (the band's flanks where the
+            # weight was > 0: the standalone / unrouted path; a routed gap was 0 already, so under full
+            # routing it is 0.0). thin_gain: share of the recto weight after the transform that it
+            # ADDED (the routed gap's direct target). thin_gap_w: share of the gap voxels that now
+            # carry a direct term (the rest are the m7 band's flanks, left at weight 0)
+            thin_log = {"thin_zero": float((w_pre & ~w_post).sum() / w_pre.sum().clamp_min(1)),
+                        "thin_gain": float((~w_pre & w_post).sum() / w_post.sum().clamp_min(1))}
+            if route_m is not None:
+                g_ = route_m["gap"][thin_sel] > 0
+                thin_log["thin_gap_w"] = float((g_ & w_post).sum() / g_.sum().clamp_min(1))
         del orig0
         ct = ct.to(memory_format=M.memfmt())
         ph.mark("aug")
@@ -1411,7 +1421,7 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         paired = (wd > 0).to(wt.dtype)
         reg_extra = {"pair_support": float(paired.mean())}
         if thin_sel:
-            reg_extra["thin_zero"] = thin_zero      # share of the rung-2 recto weight the thinning zeroed
+            reg_extra.update(thin_log)          # thin_zero / thin_gain (/ thin_gap_w): see above
         if layout.nprob >= 2:
             lr_, lv_ = L.pair_logits(d, th, half=cfg.pair_band, tau=cfg.pair_tau)
             pb_, pd_ = pair_terms(lr_, lv_, tg[:, :2], wt[:, :2], paired)

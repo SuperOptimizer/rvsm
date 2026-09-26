@@ -194,7 +194,12 @@ routing is what fixes the placement where the 2.4 µm teacher is confident, and 
 m7 sheets in the gaps, the fine teacher's faces where it is sure).
 
 **Logging and switching.** Every train row at a rung-2 sample logs `thin_zero`, the share of the recto
-weight the thinning zeroed (the flanks). The three fields are fingerprint-excluded and in
+weight the thinning zeroed (the flanks where the weight was > 0: the standalone / unrouted path), and
+`thin_gain`, the share of the recto weight after the transform that it ADDED (the routed gap's direct
+target); a routed config also logs `thin_gap_w`, the share of gap voxels that now carry a direct term
+(the rest are m7's flanks, left at 0). **Under full routing `thin_zero` is 0.0 by construction**: a gap
+voxel's weight is already 0 before the transform (`route_apply`), so zeroing a flank there changes
+nothing it counts; the gap's activity shows in `thin_gain` / `thin_gap_w`. The three fields are fingerprint-excluded and in
 `LOSS_SWITCH_FIELDS`, so a resume may switch it on (a `loss_switch` sched line). The evaluation is
 unchanged: the reference stays the raw band, and `dice_recto_r2_thin` / `recall_recto_r2_band` /
 `precision_recto_r2_band` already score a thin student against it.

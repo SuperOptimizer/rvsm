@@ -128,12 +128,13 @@ def test_twenty_steps_with_the_thinned_band(small_cfg, monkeypatch):
     rows = [json.loads(q) for q in (Path(cfg.out) / "logs" / "train.jsonl").read_text().splitlines()]
     tz = [r["thin_zero"] for r in rows if "thin_zero" in r]
     assert tz and all(np.isfinite(v) and 0 < v < 1 for v in tz)
+    assert all(r["thin_gain"] == 0.0 and "thin_gap_w" not in r for r in rows if "thin_zero" in r)
     assert all(np.isfinite(r["loss"]) for r in rows if "loss" in r)
 
 
 def test_the_routed_trainer_takes_the_thinned_gap(small_cfg, monkeypatch):
     cfg = replace(small_cfg, rungs=(2,), teacher_route={"2": "recto"}, loss_band=1.0, thin_band=1,
-                  steps=2, eval_every=1000, aug="none")
+                  steps=20, eval_every=1000, aug="none")
     seen = {}
     real = L.thin_apply
 
@@ -150,6 +151,12 @@ def test_the_routed_trainer_takes_the_thinned_gap(small_cfg, monkeypatch):
             yield _routed_item(cfg, seed=i)
     TR.train(cfg, patches_factory=gen, device="cpu")
     assert seen["gap_w0"] == 0 and seen["gap_w"] > 0   # the gap now carries a direct term
+    # ... and the log says so: every voxel is routed here, so nothing with weight was zeroed
+    # (thin_zero 0.0, as on paris4), while the gap's direct target shows as thin_gain / thin_gap_w
+    rows = [json.loads(q) for q in (Path(cfg.out) / "logs" / "train.jsonl").read_text().splitlines()]
+    tr = [r for r in rows if "thin_gain" in r]
+    assert tr and all(r["thin_zero"] == 0.0 and r["thin_gain"] > 0 and 0 < r["thin_gap_w"] <= 1
+                      for r in tr)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA")
