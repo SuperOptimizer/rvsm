@@ -125,11 +125,13 @@ def assign(pos, stren, below, above, alpha=0.08):
     return out
 
 
-def ray_neighbours(q, n, others, R, lateral=3.0, k=48, return_index=False):
+def ray_neighbours(q, n, others, R, lateral=3.0, k=48, return_index=False, min_sep=0.5):
     """Offsets along the normal of the nearest other-sheet points below (<0) and above (>0) each point, NaN if
     none (with return_index: also their indices into `others`, -1 if none). Vectorised over the k nearest
     other-sheet points (usrm2 looped a ball query per point, which is minutes per iteration at the millions of
-    points a whole slab has)."""
+    points a whole slab has). Other-sheet points closer than `min_sep` along the normal are not neighbours:
+    with min_sep = the duplicate gap, a second published trace of the SAME wrap (different segmentations of one
+    sheet lie a few voxels apart) is ignored rather than treated as a wall."""
     from scipy.spatial import cKDTree
     below, above = np.full(len(q), np.nan, np.float32), np.full(len(q), np.nan, np.float32)
     ib_all, ia_all = np.full(len(q), -1, np.int64), np.full(len(q), -1, np.int64)
@@ -147,8 +149,8 @@ def ray_neighbours(q, n, others, R, lateral=3.0, k=48, return_index=False):
         t = (d * n[sl][:, None]).sum(-1)
         lat = np.linalg.norm(d - t[..., None] * n[sl][:, None], axis=-1)
         ok &= (lat <= lateral) & (np.abs(t) <= R)
-        tb = np.where(ok & (t < -0.5), t, -np.inf)
-        ta = np.where(ok & (t > 0.5), t, np.inf)
+        tb = np.where(ok & (t < -min_sep), t, -np.inf)
+        ta = np.where(ok & (t > min_sep), t, np.inf)
         jb, ja = tb.argmax(1), ta.argmin(1)
         rows = np.arange(len(tb))
         lo, hi = tb[rows, jb], ta[rows, ja]
@@ -159,10 +161,11 @@ def ray_neighbours(q, n, others, R, lateral=3.0, k=48, return_index=False):
     return (below, above, ib_all, ia_all) if return_index else (below, above)
 
 
-def sheet_pairs(P, n, gid, R, lateral, qmask=None):
+def sheet_pairs(P, n, gid, R, lateral, qmask=None, min_sep=0.5, dup=None):
     """For every node of a set of sheets (P (N,3), unit normals n (N,3), sheet id gid (N,)) -- or only the
     `qmask` ones: the nearest node of ANOTHER sheet (any node) above and below along its normal (within R,
-    `lateral`). Returns (i, j) index arrays."""
+    `lateral`, and at least `min_sep` away). dup: (K,K) bool, sheets that are traces of the same wrap
+    (`duplicate_sheets`) are not each other's neighbours. Returns (i, j) index arrays."""
     I, J = [], []
     for g in np.unique(gid):
         sel = np.nonzero((gid == g) & (True if qmask is None else qmask))[0]
@@ -171,10 +174,13 @@ def sheet_pairs(P, n, gid, R, lateral, qmask=None):
         q = P[sel]
         pad = R + lateral + 1.0
         bl, bh = q.min(0) - pad, q.max(0) + pad
-        oth = np.nonzero((gid != g) & ((P >= bl) & (P <= bh)).all(-1))[0]
+        other = gid != g
+        if dup is not None:
+            other &= ~dup[int(g)][gid]
+        oth = np.nonzero(other & ((P >= bl) & (P <= bh)).all(-1))[0]
         if not len(oth):
             continue
-        _, _, ib, ia = ray_neighbours(q, n[sel], P[oth], R, lateral=lateral, return_index=True)
+        _, _, ib, ia = ray_neighbours(q, n[sel], P[oth], R, lateral=lateral, return_index=True, min_sep=min_sep)
         for ix in (ib, ia):
             k = ix >= 0
             I.append(sel[k])
@@ -191,11 +197,86 @@ def grid_stride_mask(shape, stride):
     return m
 
 
-def pair_stats(grids_ref, grids_now, ns, min_gap, R=24.0, lateral=None, stride=3):
-    """Adjacent-wrap spacing of a tile's sheets: node pairs (from every `stride`-th node to the nearest other
-    sheet along its normal, found on `grids_now`) closer than `min_gap` along the normal, and pairs whose
-    side has flipped against the same pair in `grids_ref` (a crossing). Returns {"pairs", "under_min",
-    "crossings", "stride"} (counts are of the sampled nodes' pairs)."""
+def duplicate_sheets(grids, dgap, stride=3, reach=2.5):
+    """(K,K) bool: pairs of grids that are traces of the SAME wrap. Published segmentations overlap: two
+    segments of one wrap run a few voxels apart, and treated as neighbours they wall each other off (and every
+    tile reports them as under-spaced). For every pair with overlapping boxes: the distance from every
+    `stride`-th node of one to the nearest node of the other (only those within reach x dgap -- where they
+    overlap at all), both ways; duplicates when the median is under `dgap`. Decided once, on the published
+    grids, so a pair never switches between wall and duplicate as the sheets move."""
+    from scipy.spatial import cKDTree
+    K = len(grids)
+    dup = np.zeros((K, K), bool)
+    pts = []
+    for g in grids:
+        ok = np.isfinite(g).all(-1)
+        pts.append((g[ok], g[ok & grid_stride_mask(ok.shape, stride)]))
+    bbs = [(a.min(0), a.max(0)) if len(a) else None for a, _ in pts]
+    trees = [cKDTree(a) if len(a) else None for a, _ in pts]
+    R = reach * float(dgap)
+    for j in range(K):
+        for k in range(j + 1, K):
+            if bbs[j] is None or bbs[k] is None or (bbs[j][0] > bbs[k][1] + R).any() or (bbs[k][0] > bbs[j][1] + R).any():
+                continue
+            ds = []
+            for a, b in ((j, k), (k, j)):
+                d, _ = trees[b].query(pts[a][1], distance_upper_bound=R)
+                ds.append(d[np.isfinite(d)])
+            d = np.concatenate(ds)
+            if len(d) >= 10 and float(np.median(d)) < dgap:
+                dup[j, k] = dup[k, j] = True
+    return dup
+
+
+def no_cross(grids_ref, grids_now, ns, dup=None, R=48.0, lateral=None, steps=6):
+    """Hard no-crossing: every node's nearest non-duplicate neighbour node above and below along its normal is
+    found once on `grids_ref` (the published grids, which do not cross); a node pair whose side has flipped in
+    `grids_now` has BOTH nodes' moves (grids_now - grids_ref) halved, up to `steps` times, then undone.
+    Returns (grids, number of nodes pulled back)."""
+    Rs, Ds, N, G, idx = [], [], [], [], []
+    for k, (a, b, n) in enumerate(zip(grids_ref, grids_now, ns)):
+        ok = np.isfinite(a).all(-1) & np.isfinite(b).all(-1) & np.isfinite(n).all(-1)
+        Rs.append(a[ok])
+        Ds.append((b - a)[ok])
+        N.append(n[ok])
+        G.append(np.full(int(ok.sum()), k))
+        idx.append(ok)
+    if not Rs or not sum(len(x) for x in Rs):
+        return [g.copy() for g in grids_now], 0
+    Rr, D, N, G = (np.concatenate(x) for x in (Rs, Ds, N, G))
+    lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_ref])))
+    i, j = sheet_pairs(Rr, N, G, R, lat, dup=dup)
+    gr = np.sign(((Rr[j] - Rr[i]) * N[i]).sum(-1))
+    t = np.ones(len(Rr), np.float32)
+    ev = np.zeros(len(Rr), bool)
+    for s_ in range(steps + 64):   # a pulled-back node can cross another neighbour: until clean (all-undone is)
+        P = Rr + t[:, None] * D
+        bad = (np.sign(((P[j] - P[i]) * N[i]).sum(-1)) * gr) <= 0
+        bad &= gr != 0
+        if not bad.any():
+            break
+        nodes = np.unique(np.concatenate([i[bad], j[bad]]))
+        ev[nodes] = True
+        t[nodes] = 0.0 if s_ >= steps - 1 else t[nodes] * 0.5
+    out, base = [], 0
+    for b, ok in zip(grids_now, idx):
+        h = b.copy()
+        m = int(ok.sum())
+        h[ok] = Rr[base:base + m] + t[base:base + m, None] * D[base:base + m]
+        base += m
+        out.append(h.astype(np.float32))
+    return out, int(ev.sum())
+
+
+def pair_stats(grids_ref, grids_now, ns, min_gap, R=None, lateral=None, stride=3, dup_gap=0.5, dup=None):
+    """Adjacent-wrap spacing of a tile's sheets. The pairs are found on `grids_ref` (the published grids): from
+    every `stride`-th node, the nearest node of another sheet along its normal that is at least `dup_gap` away
+    (nearer ones are other traces of the same wrap: "coincident", counted separately). Each pair is then
+    measured on `grids_now`: closer than `min_gap` along the normal ("under_min"), or on the other side than in
+    `grids_ref` (a crossing). R: search reach (default 2 x max(min_gap, dup_gap) + 8). dup: `duplicate_sheets`
+    (then the pairs are all nodes of non-duplicate sheets, at any gap, and "coincident" counts the duplicate sheet
+    pairs). Returns {"pairs", "under_min", "crossings", "coincident", "stride"} (node counts are of the sampled
+    nodes' pairs)."""
     Ps, Rs, Ns, G, Qm = [], [], [], [], []
     for k, (a, b, n) in enumerate(zip(grids_ref, grids_now, ns)):
         ok = np.isfinite(a).all(-1) & np.isfinite(b).all(-1) & np.isfinite(n).all(-1)
@@ -208,11 +289,18 @@ def pair_stats(grids_ref, grids_now, ns, min_gap, R=24.0, lateral=None, stride=3
         return {"pairs": 0, "under_min": 0, "crossings": 0}
     P, Rr, N, G, Qm = (np.concatenate(x) for x in (Ps, Rs, Ns, G, Qm))
     lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_now])))
-    i, j = sheet_pairs(P, N, G, R, lat, qmask=Qm)
+    R = float(R) if R is not None else 2.0 * max(float(min_gap), float(dup_gap)) + 8.0
+    if dup is not None:
+        i, j = sheet_pairs(Rr, N, G, R, lat, qmask=Qm, dup=dup)
+        ncoin = int(np.triu(dup, 1).sum())
+    else:
+        i, j = sheet_pairs(Rr, N, G, R, lat, qmask=Qm, min_sep=dup_gap)
+        ncoin = int(len(np.unique(sheet_pairs(Rr, N, G, max(float(dup_gap), 1.0), lat, qmask=Qm)[0])))
     gn = ((P[j] - P[i]) * N[i]).sum(-1)
     gr = ((Rr[j] - Rr[i]) * N[i]).sum(-1)
     return {"pairs": int(len(i)), "under_min": int((np.abs(gn) < min_gap).sum()),
-            "crossings": int((np.sign(gn) * np.sign(gr) < 0).sum()), "stride": int(stride)}
+            "crossings": int((np.sign(gn) * np.sign(gr) < 0).sum()), "coincident": ncoin,
+            "stride": int(stride)}
 
 
 # ===================================================================================== the verso term
@@ -242,6 +330,15 @@ def verso_adjust(pos, stren, vpos, vstren, T, margin=0.5, beta=0.5, block=np.inf
     else:
         st = np.where(blocked, np.maximum(st - block, 1e-3), st)
     return st.astype(np.float32), blocked
+
+
+def wrap_spacing(pos, stren, dmin=8.0):
+    """The median gap between consecutive recto peaks on the same ray (gaps under `dmin` voxels are one band
+    split in two, not two wraps): the adjacent-wrap spacing. NaN when no ray has two peaks."""
+    p = np.sort(np.where(stren > 0, pos, np.nan), axis=0)
+    d = np.diff(p, axis=0)
+    d = d[np.isfinite(d) & (d >= dmin)]
+    return float(np.median(d)) if len(d) >= 20 else float("nan")
 
 
 def thickness_from_peaks(pos, stren, vpos, vstren, tmin=TMIN, tmax=TMAX):
@@ -558,7 +655,8 @@ def spacing(g):
 def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=None, chunk=400_000,
                 W=None, thick=None, T=None, verso_thr=None, verso_beta=0.5, verso_block=np.inf, verso_margin=0.5,
                 holds=None, taper=0.0, box=None, sigma_final=None, local_normal=False, relax=0.5, relax_iters=2,
-                guard=True, min_spacing=None, peak_tol=0.15, reparam_on=True, diag=None, log=None):
+                guard=True, min_spacing=None, peak_tol=0.15, reparam_on=False, dup_gap=None, dup_frac=0.4,
+                diag=None, log=None):
     """Joint refinement of several (H,W,3) zyx grids (NaN = hole) against V, a (Z,Y,X) probability (float in
     [0,1] or uint8) at `origin`. Each iteration, for every node: the peaks along its normal ray within
     far[it] and the other sheets on that ray are matched in order (assign()); the matched peak's offset is
@@ -572,6 +670,13 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
       or whose spacing drops below `min_spacing` (default 0.4 x the grid pitch).
     Candidates are bounded by half the distance to the nearest other sheet on the ray (else by far), and
     among peaks within `peak_tol` of the strongest the one nearest the current position wins.
+    Sheets that are traces of the same wrap (`duplicate_sheets`: median distance under `dup_gap` on the
+    published grids) are NOT neighbours: published segmentations overlap, and two traces of one wrap a few
+    voxels apart must both snap to that wrap's band, not wall each other off (on a real 2.4 um strip 90% of
+    the published inter-sheet pairs within 24 voxels are such duplicates while the wraps are ~44 voxels
+    apart). dup_gap default: `dup_frac` x the wrap spacing measured from the recto peaks (`wrap_spacing`), at
+    least min_spacing. A move is bounded by half the gap to every non-duplicate sheet within 2r + 2 on its
+    ray, so two neighbours (each moving at most r) cannot cross.
 
     far: one radius (every iteration) or a per-iteration schedule (see far_schedule).
     W: the verso probability over the same box (enables `verso_adjust`); thick: a thickness volume in voxels
@@ -604,9 +709,26 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     n_rest = [normals(g, ax) for g in grids]
     tunit = THICK_UNIT if thick is not None and thick.dtype == np.uint8 else 1.0
     Tg = None if T is None else float(T)
+    dgap = None if dup_gap is None else float(dup_gap)
     if diag is not None:
         diag["first_move"] = [np.zeros(g.shape[:2], np.float32) for g in grids]
         diag["folds"] = [0] * len(grids)
+    if dgap is None:   # the duplicate gap, from the adjacent-wrap spacing on the recto
+        oks0 = [ins & np.isfinite(n).all(-1) for ins, n in zip(insides, n_rest)]
+        q = np.concatenate([g[k] for g, k in zip(grids, oks0) if k.any()] or [np.zeros((0, 3), np.float32)])
+        nq = np.concatenate([n[k] for n, k in zip(n_rest, oks0) if k.any()] or [np.zeros((0, 3), np.float32)])
+        sub = np.linspace(0, len(q) - 1, min(len(q), 50_000)).astype(np.int64) if len(q) else np.zeros(0, np.int64)
+        rw = 40
+        wp, wsn = local_maxima(profile(V, q[sub] - o, nq[sub], rw), rw, thr, P=8)
+        msp = float(np.min(min_sps)) if min_sps else 1.0
+        wsp = wrap_spacing(wp, wsn, dmin=2.0 * msp)
+        dgap = max(msp, dup_frac * wsp) if np.isfinite(wsp) else msp   # no estimate: no duplicates
+        if diag is not None:
+            diag["wrap_spacing"] = None if not np.isfinite(wsp) else round(wsp, 3)
+    dup = duplicate_sheets(rest, dgap) if dgap > 0.5 else np.zeros((len(grids), len(grids)), bool)
+    if diag is not None:
+        diag["dup_gap"] = float(dgap)
+        diag["dup"] = dup
     stats = []
     for it in range(iters):
         r = radii[it]
@@ -634,6 +756,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 Tg = 8.0
         if W is not None:
             st["thickness"] = round(float(Tg), 3)
+        st["dup_gap"] = round(float(dgap), 3)
         moves, tot = [], 0
         bbs = [(p.min(0), p.max(0)) if len(p) else None for p in pts]
         for j, (g, n, ok, q) in enumerate(zip(grids, ns, oks, pts)):
@@ -643,16 +766,18 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             qi = q - o
             # other sheets' points that can be within reach: a tree over the whole box per sheet is the slab's
             # cost otherwise
-            pad = r + lateral + 1.0
+            pad = 2 * r + 2 + lateral + 1.0
             bl, bh = bbs[j][0] - pad, bbs[j][1] + pad
             others = [p[((p >= bl) & (p <= bh)).all(-1)] for k, p in enumerate(pts)
-                      if k != j and bbs[k] is not None and (bbs[k][0] <= bh).all() and (bbs[k][1] >= bl).all()]
+                      if k != j and not dup[j, k] and bbs[k] is not None and (bbs[k][0] <= bh).all() and (bbs[k][1] >= bl).all()]
             others = np.concatenate([p for p in others if len(p)] or [np.zeros((0, 3), np.float32)])
             nn = n[ok]
             below, above = ray_neighbours(q, nn, others, r, lateral=lateral)
-            # a candidate may not go past half-way to the nearest other sheet on the ray (else far)
-            lo = np.where(np.isfinite(below), below / 2.0, -float(r)).astype(np.float32)
-            hi = np.where(np.isfinite(above), above / 2.0, float(r)).astype(np.float32)
+            # a move may not go past half-way to the nearest other sheet on the ray (else far). That sheet moves
+            # too, by at most r, so every sheet within 2r + 2 bounds: two neighbours can then never cross
+            b2, a2 = ray_neighbours(q, nn, others, 2 * r + 2, lateral=lateral)
+            lo = np.where(np.isfinite(b2), np.maximum(b2 / 2.0, -float(r)), -float(r)).astype(np.float32)
+            hi = np.where(np.isfinite(a2), np.minimum(a2 / 2.0, float(r)), float(r)).astype(np.float32)
             off, conf = np.zeros(len(q), np.float32), np.zeros(len(q), np.float32)
             for i in range(0, len(q), ch):
                 sl = slice(i, i + ch)
@@ -718,7 +843,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
 
 def mesh_opt(grids, V, origin, n0s, movable, W=None, steps=100, lr=0.1, trust=3.0, verso_t=(1.0, 2.0),
              w_data=1.0, w_verso=0.3, w_edge=1.0, w_bend=1.0, w_fold=10.0, rest=None, min_gap=8.0,
-             pair_every=25, pair_R=24.0, lateral=None, w_gap=1.0, w_cross=10.0, pair_stride=2, normal_only=True,
+             pair_every=25, pair_R=None, dup_gap=0.5, dup=None, lateral=None, w_gap=1.0, w_cross=10.0, pair_stride=2, normal_only=True,
              device=None, log=None):
     """A JOINT mesh solve over every sheet of a tile (vertices = valid nodes of all grids; edges = grid u,
     v and one diagonal), initialised from the snap, with Adam on the GPU when there is one:
@@ -783,10 +908,16 @@ def mesh_opt(grids, V, origin, n0s, movable, W=None, steps=100, lr=0.1, trust=3.
     lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids])))
     pairs = {}
 
-    def find_pairs(pnp):
-        i, j = sheet_pairs(pnp, n0np, gid, pair_R, lat, qmask=qm)
-        s0 = np.sign(((r0np[j] - r0np[i]) * n0np[i]).sum(-1))
-        k = s0 != 0
+    pR = float(pair_R) if pair_R is not None else max(24.0, 1.5 * float(min_gap), float(dup_gap) + 8.0)
+
+    def find_pairs(pnp):   # true neighbours only: a pair nearer than dup_gap in the published grids is one wrap
+        if dup is not None:
+            i, j = sheet_pairs(pnp, n0np, gid, pR, lat, qmask=qm, dup=dup)
+        else:
+            i, j = sheet_pairs(pnp, n0np, gid, pR, lat, qmask=qm, min_sep=dup_gap)
+        g0_ = ((r0np[j] - r0np[i]) * n0np[i]).sum(-1)
+        s0 = np.sign(g0_)
+        k = (s0 != 0) & ((np.abs(g0_) >= dup_gap) | (dup is not None))
         pairs["i"], pairs["j"], pairs["s0"] = t(i[k], torch.long), t(j[k], torch.long), t(s0[k])
     mv = t(np.concatenate(M).astype(np.float32))[:, None]
     E_, Q_, L_ = t(E, torch.long), t(Q, torch.long), t(Lp, torch.long)
@@ -1740,13 +1871,17 @@ def run(args):
                              verso_margin=args.verso_margin, holds=holds, taper=args.taper,
                              box=(o, s), sigma_final=sig_f, local_normal=bool(args.local_normal),
                              relax=args.relax, relax_iters=args.relax_iters, guard=args.fold_guard,
-                             min_spacing=min_sp, peak_tol=args.peak_tol, reparam_on=args.reparam, diag=dg, log=None)
+                             min_spacing=min_sp, peak_tol=args.peak_tol, reparam_on=args.reparam,
+                             dup_gap=args.dup_gap, dup_frac=args.dup_frac, diag=dg, log=None)
         folds = list(dg.get("folds", [0] * len(g1)))
         Tt = st[-1].get("thickness", args.thickness or 8.0) if st else (args.thickness or 8.0)
         min_gap = max(float(Tt), min_sp)
         n_rest = [normals(g, ax) for g in g0]
-        tp = {"tile": ti + 1, "min_gap": round(min_gap, 3),
-              "published": pair_stats(g0, g0, n_rest, min_gap), "snap": pair_stats(g0, g1, n_rest, min_gap)}
+        dgap = float(dg.get("dup_gap", min_sp))
+        tp = {"tile": ti + 1, "min_gap": round(min_gap, 3), "dup_gap": round(dgap, 3),
+              "wrap_spacing": dg.get("wrap_spacing"),
+              "published": pair_stats(g0, g0, n_rest, min_gap, dup=dg.get("dup")),
+              "snap": pair_stats(g0, g1, n_rest, min_gap, dup=dg.get("dup"))}
         if args.mesh_opt:
             mov = []
             for g, h in zip(g1, holds):
@@ -1756,12 +1891,15 @@ def run(args):
                 mov.append(inner & inb & (fd > 0.5) & ((h if h is not None else 0.0) < 0.5))
             snap = g1
             g1, mh = mesh_opt(snap, V, rlo.astype(np.float32), n_rest, mov, W=W, steps=args.mesh_steps,
-                              lr=args.mesh_lr, rest=g0, min_gap=min_gap, log=None)
+                              lr=args.mesh_lr, rest=g0, min_gap=min_gap, dup_gap=dgap, dup=dg.get("dup"),
+                              log=None)
             for j in range(len(g1)):   # the guard has the last word
                 g1[j], nev = fold_guard(snap[j], g1[j], g0[j], n_rest[j], min_sp)
                 folds[j] += nev
             tp["mesh_opt"] = mh
-            tp["final"] = pair_stats(g0, g1, n_rest, min_gap)
+        g1, ncx = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0)
+        tp["no_cross_pulled"] = ncx
+        tp["final"] = pair_stats(g0, g1, n_rest, min_gap, dup=dg.get("dup"))
         tile_pairs.append(tp)
         stats.append({"tile": [cy0, cy1, cx0, cx1], "pieces": len(pieces), "iters": st, "pairs": tp})
         log(json.dumps({"tile": ti + 1, "of": len(cores), "core_yx": [cy0, cy1, cx0, cx1], "pieces": len(pieces),
@@ -1975,12 +2113,14 @@ def run(args):
         tot_mv[nm] = {"mean": round(mu, 3), "cv": round(float(np.sqrt(max(sq / max(c, 1) - mu * mu, 0))) / max(mu, 1e-9), 4)}
     pr = {}
     for tp in tile_pairs:
-        for stage in ("published", "snap", "final"):
+        for stage in ("published", "snap", "final"):   # snap = before the no-cross guard
             if stage in tp:
-                for k in ("pairs", "under_min", "crossings"):
+                for k in ("pairs", "under_min", "crossings", "coincident"):
                     pr.setdefault(stage, {}).setdefault(k, 0)
-                    pr[stage][k] += tp[stage][k]
+                    pr[stage][k] += tp[stage].get(k, 0)
     tot_mv["pairs"] = pr
+    tot_mv["no_cross_pulled"] = int(sum(tp.get("no_cross_pulled", 0) for tp in tile_pairs))
+    tot_mv["duplicate_sheet_pairs"] = int(sum(tp.get("published", {}).get("coincident", 0) for tp in tile_pairs))
     log(json.dumps({"pooled": pooled, "circular": bool(circ), "geometry": tot_mv, "far_off": far_off}))
     with open(os.path.join(args.out, "refine_report.json"), "w") as f:
         json.dump({"box": [*lo.tolist(), *shape.tolist()], "tile": tile, "halo": halo, "moves": move_rep,
@@ -2023,15 +2163,21 @@ def parser():
     ap.add_argument("--iters", type=int, default=None, help="default: the --far schedule's length (3 for one radius)")
     ap.add_argument("--peak-tol", type=float, default=0.15,
                     help="peaks within this strength of the strongest tie; the one nearest the current position wins")
-    ap.add_argument("--reparam", action=argparse.BooleanOptionalAction, default=True,
+    ap.add_argument("--reparam", action=argparse.BooleanOptionalAction, default=False,
                     help="after each move, slide nodes along the surface back to the published arc-length "
-                         "fractions per grid row/column (undoes bunching exactly)")
+                         "fractions per grid row/column. Default off: with normal-only moves nodes cannot slide, and on a jagged "
+                         "snap the arc-length redistribution itself drifts nodes by tens of voxels (37 on a real tile)")
     ap.add_argument("--relax", type=float, default=0.5, help="tangential Laplacian relaxation weight (0 = off)")
     ap.add_argument("--relax-iters", type=int, default=2)
     ap.add_argument("--fold-guard", action=argparse.BooleanOptionalAction, default=True,
                     help="pull back nodes whose quads flip or whose spacing drops below --min-spacing")
     ap.add_argument("--min-spacing", type=float, default=None,
                     help="voxels (default 0.4 x --pitch); also the floor of the mesh stage's inter-sheet gap")
+    ap.add_argument("--dup-gap", type=float, default=None,
+                    help="voxels: other published sheets nearer than this along the normal are traces of the SAME "
+                         "wrap (they snap to one band, they do not bound each other); default --dup-frac x the "
+                         "wrap spacing measured on the recto per tile")
+    ap.add_argument("--dup-frac", type=float, default=0.4)
     ap.add_argument("--mesh-opt", action="store_true",
                     help="after the snap, a joint torch mesh solve over all sheets of a tile (data, verso, "
                          "edge, bend, fold, inter-sheet gap and no-crossing terms)")

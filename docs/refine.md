@@ -37,7 +37,18 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
    order to the peaks. The cost is `0.08·|offset − peak| − strength`. Neighbouring sheets can therefore
    neither merge onto one band nor cross. Before the match, a candidate is also bounded by half the
    distance to the nearest other sheet on the ray (else by far), so a wide first pass cannot jump a
-   wrap. Among peaks within `--peak-tol` (0.15) of the strongest, the one nearest the current position
+   wrap; after the smoothing the move is clipped to the same bound, taken over every neighbour within
+   2r + 2 (that neighbour moves too, by at most r), so two neighbours cannot cross.
+
+   **Duplicate traces are not neighbours** (`duplicate_sheets`, `--dup-gap`, `--dup-frac` 0.4).
+   Published segmentations overlap: several segments trace the same wrap a few voxels apart. On the
+   2.4 µm strip, 90% of the inter-sheet node pairs within 24 voxels were such duplicates while the wraps
+   are ~44 voxels apart; treated as neighbours, they walled each other off (the first version of this
+   pass: 'capped' 0.6–0.96, 'with_peak' 0.14–0.27, every published pair "under min gap"). Per tile, the
+   wrap spacing is measured on the recto (median gap between consecutive peaks on a ray, `wrap_spacing`)
+   and dup gap = 0.4 × it (at least `--min-spacing`). Two sheets whose published nodes are, in median,
+   nearer than that are one wrap: they ignore each other and both snap to its band. Decided once, on
+   the published grids, so a pair never switches between wall and duplicate as it moves. Among peaks within `--peak-tol` (0.15) of the strongest, the one nearest the current position
    wins, not simply the strongest. The neighbour search's lateral tolerance is 0.75 × pitch (at least
    3).
 6. **Smoothing.** The per-point offsets are smoothed over the (H, W) grid with a Gaussian weighted by
@@ -49,11 +60,14 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
    step. They are also faded around anchors (below). All sheets move only after all of them have been
    measured.
 7. **Keeping the grid a grid.** After each move:
-   - **Reparametrisation** (`--reparam`, on). For every run of nodes along a grid row, then a column, if
+   - **Reparametrisation** (`--reparam`, OFF by default). For every run of nodes along a grid row, then a column, if
      some edge's length ratio to the published grid departs from the run's median by more than 15%, the
      run's nodes slide ALONG their own polyline back to the published arc-length fractions (end nodes
      fixed). This undoes bunching exactly and keeps the shape. An evenly stretched run, or the slight
-     kink where moves fade out, is left alone.
+     kink where moves fade out, is left alone. Off by default: with normal-only moves nodes cannot slide
+     in the first place, and on a real (jagged) snap the redistribution along the jagged polyline itself
+     drifted nodes 11–37 voxels sideways and cut the on-band fraction from 0.70 to 0.41 (tile 1 of the
+     strip). It still evens out a smooth out-of-phase sheet (the wavy test pins it on).
    - **Tangential relaxation** (`--relax` 0.5, `--relax-iters` 2). A rest-relative Laplacian
      (L(P) − L(P_published)), projected onto the refined surface's tangent plane. It keeps the
      published parametrisation, and it is zero for a pure normal offset of a smooth sheet.
@@ -64,7 +78,7 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
      when published. The pull-backs are counted as fold events.
 
    On a published wavy sheet half a wavelength out of phase with its band, the old scheme gives spacing
-   CV 0.87 and 200 folded nodes. The new defaults give CV 0.06, no fold, and a fit within 0.07 voxel
+   CV 0.87 and 200 folded nodes. With `--reparam` it gives CV 0.06, no fold, and a fit within 0.07 voxel
    (`test_wavy_band_keeps_even_spacing_and_never_folds`). On the synthetic slab, the mean tangential
    drift is 0.03 voxel.
 8. **Joint mesh solve** (`--mesh-opt`, off). After the snap, torch (on the GPU when there is one)
@@ -80,7 +94,12 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
      node along the normal, re-found every 25 steps;
    - no-crossing: relu of the gap's flip against the published side.
 
-   Tile and grid boundaries, anchors and the taper are fixed, and the fold guard has the last word.
+   Duplicate traces (above) are excluded from the gap and no-crossing pairs. Tile and grid boundaries,
+   anchors and the taper are fixed, and the fold guard has the last word.
+9. **No-crossing guard** (`no_cross`, always). Each node's nearest non-duplicate neighbour node above
+   and below along its normal is found on the published grids; any pair whose side has flipped after
+   the snap (and the mesh solve) has both nodes' moves halved up to 6 times, then undone. Crossings in
+   the final grids are 0 by construction (`tile_pairs.*.no_cross_pulled` counts the nodes it touched).
    Free tangential moves were tried first and random-walked nodes 0.4 voxel sideways.
 
 **Anchors** (`--anchors anchors.jsonl`, render3d's append-only log). The log is replayed (`add` / `del`,
@@ -181,8 +200,9 @@ Outputs under `--out`:
   - grid spacing mean and CV, before and after.
 
   `geometry` pools these numbers. Per tile, `tile_pairs` gives the adjacent-wrap statistics for the
-  published, snapped and (with `--mesh-opt`) final positions: node pairs sampled every 3rd node, pairs
-  closer than max(thickness, min spacing), and crossings.
+  published, snapped (before the no-cross guard) and final positions: node pairs sampled every 3rd node
+  to the nearest NON-duplicate sheet, pairs closer than max(thickness, min spacing), crossings, and
+  `coincident` = the number of duplicate sheet pairs in the tile.
 - `png/spacing_hist.png`: grid-edge length histograms, published (gray) and refined (green).
 
 ## Warnings

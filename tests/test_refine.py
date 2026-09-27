@@ -493,7 +493,9 @@ def test_wavy_band_keeps_even_spacing_and_never_folds():
     kw = dict(far=12, sigma=1.0, iters=6, thr=0.3)
     (old,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, local_normal=True, relax=0, guard=False, reparam_on=False, **kw)
     dg = {}
-    (new,), st = R.refine_many([g], V, (0, 0, 0), AX_Y, diag=dg, **kw)
+    # --reparam is off by default (on a real, jagged snap it drifted nodes by tens of voxels) but is what evens
+    # out a smooth out-of-phase sheet like this one
+    (new,), st = R.refine_many([g], V, (0, 0, 0), AX_Y, diag=dg, reparam_on=True, **kw)
     n0 = R.normals(g, AX_Y)
     min_sp = 0.4 * R.pitch(g)
     assert u_spacing_cv(old) > 0.5 and R.bad_nodes(old, g, n0, min_sp).sum() > 0      # the bug, reproduced
@@ -582,3 +584,32 @@ def test_mesh_opt_is_joint_and_keeps_two_sheets_apart():
     assert gap.min() > 2.0 and gap.mean() > 3.0                   # jointly: never merged, never crossed
     st = R.pair_stats([lo_, hi_], [a, b], n0, 4.0)
     assert st["crossings"] == 0 and st["pairs"] > 0
+
+
+def test_duplicate_traces_of_one_wrap_both_snap_to_it_instead_of_walling_each_other_off():
+    """Published segmentations overlap: two traces of ONE wrap 3 voxels apart (the band at 30, the next wrap
+    at 50). They are duplicates, not neighbours: both land on 30. As neighbours, the half-gap bound would hold
+    them 3 voxels apart and one would stay off the band."""
+    shape = (16, 72, 32)
+    V = np.maximum(band_volume(shape, lambda x: 30 + 0 * x, 1.2), band_volume(shape, lambda x: 50 + 0 * x, 1.2))
+    a, b = flat_sheet(34.0), flat_sheet(37.0)
+    far_ = flat_sheet(52.0)
+    dup = R.duplicate_sheets([a, b, far_], 8.0)
+    assert dup[0, 1] and dup[1, 0] and not dup[0, 2] and not dup[1, 2]
+    dg = {}
+    (a1, b1, f1), _ = R.refine_many([a, b, far_], V, (0, 0, 0), AX_Y, far=[12, 8], iters=2, sigma=1.0,
+                                    thr=0.3, dup_gap=8.0, diag=dg)
+    assert abs(a1[..., 1].mean() - 30) < 1.0 and abs(b1[..., 1].mean() - 30) < 1.0, (a1[..., 1].mean(), b1[..., 1].mean())
+    assert abs(f1[..., 1].mean() - 50) < 1.0
+    assert dg["dup"][0, 1] and not dg["dup"][0, 2]
+
+
+def test_no_cross_pulls_back_a_crossing_pair():
+    lo_, hi_ = flat_sheet(30.0), flat_sheet(40.0)
+    a, b = lo_.copy(), hi_.copy()
+    a[3:6, 5:9, 1] = 44.0          # a patch of the lower sheet jumped through the upper one
+    n = [R.normals(g, AX_Y) for g in (lo_, hi_)]
+    assert R.pair_stats([lo_, hi_], [a, b], n, 4.0, stride=1)["crossings"] > 0
+    (a2, b2), k = R.no_cross([lo_, hi_], [a, b], n, R=20.0)
+    assert k > 0 and R.pair_stats([lo_, hi_], [a2, b2], n, 4.0, stride=1)["crossings"] == 0
+    assert np.allclose(a2[0, 0], a[0, 0])     # untouched away from the crossing
