@@ -358,7 +358,7 @@ class StudentInputs(Inputs):
 # --------------------------------------------------------------------------- #
 def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torch.float16,
                prep_dtype=torch.float32, offs=None, out_dtype=torch.float32, bounded=None, stats=None,
-               rolling=True):
+               rolling=True, out_device=None):
     """The blended output of one region: (planes, Z, Y, X) with `size` = (Z, Y, X).
 
     `fn(x)` takes a (B, C, w, w, w) tensor and returns (B, planes, w, w, w). Windows whose CT is all air
@@ -385,6 +385,13 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     The accumulators therefore only span min(w, Z) z-rows, not Z: at a 1024^3 box and w = 256 the
     five-plane round-1 self pass (3 bounded fp16 + 2 unbounded fp32 + fp32 wsum) holds 4.5 GiB of
     accumulators instead of 18 GiB. `rolling=False` is the old whole-box path (kept for the tests).
+
+    THE OUTPUT. `out_device` (None: the inputs' device) is where the (P, Z, Y, X) result lives. A
+    multi-head student pass puts it on the host (`"cpu"`): five fp16 planes of a 1024^3 box are
+    10 GiB the card cannot spare beside the compiled model's activations. Each flushed z-slab is
+    normalised on the device and copied across plane by plane, so the values are exactly the ones a
+    device-resident `out` holds. Pageable, not pinned: torch's pinned allocator rounds 10 GiB up to a
+    16 GiB cached block, and the ~10 GiB of D2H copies cost a few seconds per region either way.
 
     THE MARGIN. `inputs.core` is where the output box starts inside the inputs' (padded) grid: the
     windows tile the whole padded grid, but the accumulators are the (Z, Y, X) BOX and nothing more --
@@ -423,7 +430,8 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     if stats is not None:
         stats.update(acc_shape=box, windows=len(todo), acc_depth=D,
                      acc_bytes=int(sum(t.numel() * t.element_size() for t in bufs + [wsum])))
-    out = torch.empty((P, Z, Y, X), dtype=out_dtype, device=dev)
+    odev = torch.device(out_device) if out_device is not None else dev
+    out = torch.empty((P, Z, Y, X), dtype=out_dtype, device=odev)
     ys, xs = slice(c[1], c[1] + Y), slice(c[2], c[2] + X)
     zero = torch.zeros((), device=dev)
     base = 0        # the box z of buffer row 0
@@ -439,10 +447,14 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
             keep = (wsum[j0:j1] > 0) & (inputs.roi[c[0] + z:c[0] + e, ys, xs] > 0)
             if ib:
                 q = acc_b[:, j0:j1].float() / (ws * GAUSS_SCALE)[None]
-                out[ib, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
+                q = torch.where(keep[None], q, zero).to(out_dtype)
+                for r, k in enumerate(ib):
+                    out[k, z:e].copy_(q[r])
             if iu:
                 q = acc_u[:, j0:j1] / ws[None]
-                out[iu, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
+                q = torch.where(keep[None], q, zero).to(out_dtype)
+                for r, k in enumerate(iu):
+                    out[k, z:e].copy_(q[r])
 
     def advance(nb):
         """Move the buffer's start to box z `nb`: rows before it are final (flushed); rows the buffer
@@ -1008,7 +1020,8 @@ def student_fn(ckpt_path, device=None, compile=True, mode="max-autotune-no-cudag
 
 def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, device=None,
                    window=None, halo=None, cascade_depth=None, batch=1, rung=RUNG, tta=1, pyr=None,
-                   acc_dtype=torch.float16, umbilicus=None, as_tensor=False, margin=None, stats=None):
+                   acc_dtype=torch.float16, umbilicus=None, as_tensor=False, margin=None, stats=None,
+                   out_device=None):
     """One student pass over one region: `{plane name: (Z, Y, X) float32}` in rung-`rung` voxels
     (`as_tensor`: float16 tensors left on the device, for a producer that encodes there).
 
@@ -1022,6 +1035,9 @@ def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, 
     `margin` (rung-2 voxels; None: the checkpoint's `infer_margin`) is the fine-CT context read around
     the box (`StudentInputs`), scaled to `rung` by `margin_at`; the planes are still exactly the box.
     `stats`, a dict, gets `run_region`'s accounting of the pass (windows, accumulator bytes).
+    `out_device` ("cpu" for the producer's multi-head pass) is where the planes are assembled
+    (`run_region`); with `as_tensor` the float16 planes are then host tensors (`student_rows_t`
+    encodes them on the card in z-chunks).
     """
     st = student if isinstance(student, Student) else student_fn(student, device=device)
     names = st.plane_names(heads)
@@ -1039,6 +1055,7 @@ def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, 
     out = run_region(fn, inp, tuple(int(v) for v in ladder.shape3(size)), w, h, batch=batch,
                      bounded=bounded,
                      planes=len(names), offs=inp.offs, acc_dtype=acc_dtype, stats=stats,
+                     out_device=out_device,
                      out_dtype=(torch.float16 if as_tensor else torch.float32))
     if as_tensor:
         return {n: out[i] for i, n in enumerate(names)}

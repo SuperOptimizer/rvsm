@@ -750,23 +750,40 @@ def student_rows(planes, layout, heads):
             ("conf", stores.u8(planes["conf"]), 0, "conf_u8")]
 
 
-def student_rows_t(planes, layout, heads):
-    """`student_rows` for DEVICE float planes (`student_region(..., as_tensor=True)`): the same codes,
-    computed on the card, returned as host uint8 arrays -- one byte per voxel crosses the bus."""
+def _enc_chunks(f, planes, device=None, chunk=64):
+    """`f(*z-slabs)` -> uint8 slab, over (Z, Y, X) tensors in z-chunks of `chunk`, computed on `device`
+    (None: the planes' own) and gathered into one host uint8 array. The encoders are elementwise, so
+    the codes are exactly the whole-plane ones -- without whole-region float32 temporaries on the
+    card, and with planes that live on the host (`student_region(..., out_device="cpu")`)."""
+    import numpy as np
+    dev = planes[0].device if device is None else device
+    Z = int(planes[0].shape[0])
+    res = np.empty(tuple(int(v) for v in planes[0].shape), np.uint8)
+    for z in range(0, Z, int(chunk)):
+        e = min(z + int(chunk), Z)
+        res[z:e] = f(*(p[z:e].to(dev, non_blocking=True) for p in planes)).cpu().numpy()
+    return res
+
+
+def student_rows_t(planes, layout, heads, device=None, chunk=64):
+    """`student_rows` for float TENSOR planes (`student_region(..., as_tensor=True)`): the same codes,
+    computed on `device` (None: where the planes are) in z-chunks, returned as host uint8 arrays --
+    for device planes one byte per voxel crosses the bus; host planes (the multi-head pass's
+    `out_device="cpu"`) go up a chunk at a time."""
     from rvsm import export as EX, infer, targets as TG
     first = str(layout.channels[0])
+    E = lambda f, *ps: _enc_chunks(f, ps, device, chunk)   # noqa: E731
     if heads == "verso":
-        return [("verso", infer.u8_t(planes[first]).cpu().numpy(), 8, "prob_u8")]
+        return [("verso", E(infer.u8_t, planes[first]), 8, "prob_u8")]
     rec = planes["recto"]
-    valid = rec > 0
-    return [("recto", infer.u8_t(rec).cpu().numpy(), 8, "prob_u8"),
-            ("verso", infer.u8_t(planes["verso"]).cpu().numpy(), 8, "prob_u8"),
-            ("midline", EX.enc_t(planes["midline"], valid, -EX.TRACER_CAP, EX.TRACER_CAP,
-                                 EX.TRACER_UNIT, EX.TRACER_OFF).cpu().numpy(), 0,
-             "signed_u8_off128_q0.25"),
-            ("thickness", EX.enc_t(planes["thickness"], valid, TG.UNIT, 255 * TG.UNIT,
-                                   TG.UNIT).cpu().numpy(), 0, "unsigned_u8_q0.25"),
-            ("conf", infer.u8_t(planes["conf"]).cpu().numpy(), 0, "conf_u8")]
+    return [("recto", E(infer.u8_t, rec), 8, "prob_u8"),
+            ("verso", E(infer.u8_t, planes["verso"]), 8, "prob_u8"),
+            ("midline", E(lambda m, r: EX.enc_t(m, r > 0, -EX.TRACER_CAP, EX.TRACER_CAP,
+                                                EX.TRACER_UNIT, EX.TRACER_OFF),
+                          planes["midline"], rec), 0, "signed_u8_off128_q0.25"),
+            ("thickness", E(lambda t, r: EX.enc_t(t, r > 0, TG.UNIT, 255 * TG.UNIT, TG.UNIT),
+                            planes["thickness"], rec), 0, "unsigned_u8_q0.25"),
+            ("conf", E(infer.u8_t, planes["conf"]), 0, "conf_u8")]
 
 
 def write_rows(out, lo, rows, cfg, round_, attrs, gen=0):
@@ -1423,7 +1440,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                  "temps": {str(k): float(v) for k, v in stu.temps.items()},
                                  # the NormAct precision the pass ran (`gn_bf16_producer`)
                                  "gn_bf16": bool(stu.gn_bf16)}
-                        rows = student_rows_t(planes, stu.layout, heads)
+                        rows = student_rows_t(planes, stu.layout, heads, device=getattr(stu, "dev", None))
                         del planes
                         pooled = None
                     t_gpu = time.time() - t1
@@ -1654,8 +1671,12 @@ def _compiled_graphs():
 
 def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr, margin=None, stats=None):
     from rvsm import infer
+    # the planes are assembled on the HOST for a CUDA pass: a region-sized fp16 `out` (10 GiB for the
+    # five-head self pass) beside the compiled model's activations overran vram_produce_gb
+    host = getattr(getattr(stu, "dev", None), "type", "cpu") == "cuda"
     return infer.student_region(stu, ct, ax, lo, size, sign=sign, heads=want, meta=meta5, pyr=pyr,
-                                as_tensor=True, margin=margin, stats=stats)
+                                as_tensor=True, margin=margin, stats=stats,
+                                out_device="cpu" if host else None)
 
 
 def _gpu_order(units, leased=None, held=None):

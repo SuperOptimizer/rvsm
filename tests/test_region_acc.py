@@ -91,3 +91,57 @@ def test_rolling_box_thinner_than_a_window_and_single_plane():
     b = infer.run_region(one, inp, box, W, H, stats=st)
     assert st["acc_depth"] == box[0]
     assert torch.equal(a, b)
+
+
+def _student_like_planes(Z=40, Y=12, X=10, dev="cpu"):
+    g = torch.Generator().manual_seed(0)
+    rec = torch.rand((Z, Y, X), generator=g)
+    rec[rec < 0.3] = 0
+    return {"recto": rec.half(), "verso": torch.rand((Z, Y, X), generator=g).half(),
+            "midline": ((torch.rand((Z, Y, X), generator=g) - 0.5) * 80).half(),
+            "thickness": (torch.rand((Z, Y, X), generator=g) * 300).half(),
+            "conf": torch.rand((Z, Y, X), generator=g).half()}
+
+
+def test_host_out_is_the_device_out():
+    """`out_device`: the multi-head pass assembles its planes on the host, slab by slab -- the very
+    values a device-resident `out` holds (on CUDA when there is one: the real D2H path)."""
+    box, core = (80, 24, 20), (4, 3, 0)
+    inp = Synth(box, core, gap=(30, 70))
+    kw = dict(planes=3, bounded=[True, False, False], acc_dtype=torch.float16, batch=3,
+              out_dtype=torch.float16)
+    ref = infer.run_region(synth_fn, inp, box, W, H, **kw)
+    host = infer.run_region(synth_fn, inp, box, W, H, out_device="cpu", **kw)
+    assert host.device.type == "cpu" and torch.equal(host, ref)
+    if torch.cuda.is_available():
+        inp.dev, inp.roi = torch.device("cuda"), inp.roi.cuda()
+        prep0 = inp.prep
+        inp.prep = lambda o, out_dtype=torch.float32: prep0(o, out_dtype).cuda()
+        dref = infer.run_region(synth_fn, inp, box, W, H, **kw)
+        dhost = infer.run_region(synth_fn, inp, box, W, H, out_device="cpu", **kw)
+        assert dref.device.type == "cuda" and dhost.device.type == "cpu"
+        assert torch.equal(dhost, dref.cpu())
+
+
+def test_student_rows_t_chunked_and_host_planes_match_whole_plane_codes():
+    """The producer's encoder in z-chunks, from host planes, is the whole-plane device encoder."""
+    from types import SimpleNamespace
+
+    from rvsm import export as EX, run, targets as TG
+    pl = _student_like_planes()
+    lay = SimpleNamespace(channels=("recto", "verso"))
+    valid = pl["recto"] > 0
+    want = {"recto": infer.u8_t(pl["recto"]), "verso": infer.u8_t(pl["verso"]),
+            "midline": EX.enc_t(pl["midline"], valid, -EX.TRACER_CAP, EX.TRACER_CAP,
+                                EX.TRACER_UNIT, EX.TRACER_OFF),
+            "thickness": EX.enc_t(pl["thickness"], valid, TG.UNIT, 255 * TG.UNIT, TG.UNIT),
+            "conf": infer.u8_t(pl["conf"])}
+    devs = [None] + (["cuda"] if torch.cuda.is_available() else [])
+    for dev in devs:
+        for chunk in (7, 64):
+            rows = run.student_rows_t(pl, lay, "all", device=dev, chunk=chunk)
+            assert [r[0] for r in rows] == ["recto", "verso", "midline", "thickness", "conf"]
+            for ch, block, _, _ in rows:
+                assert (block == want[ch].numpy()).all(), (dev, chunk, ch)
+    v = run.student_rows_t({"recto": pl["verso"]}, lay, "verso", chunk=5)
+    assert v[0][0] == "verso" and (v[0][1] == want["verso"].numpy()).all()
