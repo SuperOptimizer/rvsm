@@ -357,7 +357,8 @@ class StudentInputs(Inputs):
 # The region pass
 # --------------------------------------------------------------------------- #
 def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torch.float16,
-               prep_dtype=torch.float32, offs=None, out_dtype=torch.float32, bounded=None, stats=None):
+               prep_dtype=torch.float32, offs=None, out_dtype=torch.float32, bounded=None, stats=None,
+               rolling=True):
     """The blended output of one region: (planes, Z, Y, X) with `size` = (Z, Y, X).
 
     `fn(x)` takes a (B, C, w, w, w) tensor and returns (B, planes, w, w, w). Windows whose CT is all air
@@ -371,13 +372,28 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
     other plane -- a distance, a thickness, a log-variance -- accumulates in fp32 unscaled: scaled in
     fp16, a 31.75-voxel midline overflowed to inf (pass-3 review P3-11). The division is fp32.
 
+    Why the unbounded planes stay fp32 (and wsum too): fp16's spacing at 128..256 is 0.125, so a
+    thickness near 200 cannot even be HELD in fp16 closer than 0.0625 voxel, let alone summed over up
+    to 8 windows (up to ~0.1-0.2 voxel of drift); unit-scale fp16 also flushes a corner term
+    v * 1.5e-6 of a v ~ 1e-3 plane to zero. The VRAM is cut by the rolling z-window below instead,
+    which changes no arithmetic at all.
+
+    ROLLING Z-WINDOW (`rolling`, default). The windows are taken in order of their in-box z start
+    (a stable sort; every tiling here is already z-major, so the order of the terms each voxel sums
+    is unchanged and the result is bit-identical). Once the pass reaches a window starting at box z0,
+    no later window touches a voxel at z < z0, so those rows are normalised into `out` and dropped.
+    The accumulators therefore only span min(w, Z) z-rows, not Z: at a 1024^3 box and w = 256 the
+    five-plane round-1 self pass (3 bounded fp16 + 2 unbounded fp32 + fp32 wsum) holds 4.5 GiB of
+    accumulators instead of 18 GiB. `rolling=False` is the old whole-box path (kept for the tests).
+
     THE MARGIN. `inputs.core` is where the output box starts inside the inputs' (padded) grid: the
     windows tile the whole padded grid, but the accumulators are the (Z, Y, X) BOX and nothing more --
     a window reaching past it adds only its in-box part (its output and its Gaussian clipped alike), so
     the accumulator VRAM of a region is the same at every margin; only the inputs grow. With `offs`
     None the windows are `spread_offsets` when `inputs.spread` (a margin: as many windows as the box
     alone, spread over the padded extent), and windows whose kept core misses the box are dropped here (`core_offsets`; a caller's own
-    `offs` is used as given). `stats`, a dict, gets the accumulator shape and the forwarded windows."""
+    `offs` is used as given). `stats`, a dict, gets the accumulator shape (the box), the forwarded
+    windows, the accumulators' z depth `acc_depth` and their bytes `acc_bytes`."""
     w, dev = int(window), inputs.dev
     Z, Y, X = (int(v) for v in size)
     c = tuple(int(v) for v in getattr(inputs, "core", (0, 0, 0)))
@@ -395,11 +411,64 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
         offs = core_offsets(tile, w, c, (Z, Y, X), halo)
     todo = [o for o in offs if inputs.window_any(o)]
     box = (Z, Y, X)
-    acc_b = torch.zeros((len(ib),) + box, dtype=torch.float16, device=dev) if ib else None
-    acc_u = torch.zeros((len(iu),) + box, dtype=torch.float32, device=dev) if iu else None
-    wsum = torch.zeros(box, dtype=torch.float32, device=dev)
+    # in-box z start of a window (clipped at the box's near face)
+    zb = lambda o: max(int(o[0]), c[0]) - c[0]   # noqa: E731
+    if rolling:
+        todo = sorted(todo, key=zb)
+    D = min(w, Z) if rolling else Z
+    acc_b = torch.zeros((len(ib), D, Y, X), dtype=torch.float16, device=dev) if ib else None
+    acc_u = torch.zeros((len(iu), D, Y, X), dtype=torch.float32, device=dev) if iu else None
+    wsum = torch.zeros((D, Y, X), dtype=torch.float32, device=dev)
+    bufs = [t for t in (acc_b, acc_u) if t is not None]
     if stats is not None:
-        stats.update(acc_shape=box, windows=len(todo))
+        stats.update(acc_shape=box, windows=len(todo), acc_depth=D,
+                     acc_bytes=int(sum(t.numel() * t.element_size() for t in bufs + [wsum])))
+    out = torch.empty((P, Z, Y, X), dtype=out_dtype, device=dev)
+    ys, xs = slice(c[1], c[1] + Y), slice(c[2], c[2] + X)
+    zero = torch.zeros((), device=dev)
+    base = 0        # the box z of buffer row 0
+
+    def flush(z1):
+        """Normalise box rows [base, z1) (buffer rows [0, z1 - base)) into `out`, in z-slabs straight
+        into the output dtype: whole-box float32 temporaries of `where(keep, acc / wsum)` were 4 GB
+        per plane on top of the accumulators (20+ GB for five heads)."""
+        for z in range(base, z1, 64):
+            e = min(z + 64, z1)
+            j0, j1 = z - base, e - base
+            ws = wsum[j0:j1].clamp_min(1e-30)
+            keep = (wsum[j0:j1] > 0) & (inputs.roi[c[0] + z:c[0] + e, ys, xs] > 0)
+            if ib:
+                q = acc_b[:, j0:j1].float() / (ws * GAUSS_SCALE)[None]
+                out[ib, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
+            if iu:
+                q = acc_u[:, j0:j1] / ws[None]
+                out[iu, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
+
+    def advance(nb):
+        """Move the buffer's start to box z `nb`: rows before it are final (flushed); rows the buffer
+        never reached had no window at all and are zero; the kept rows shift down in chunks of the
+        shift, so no copy reads memory it overlaps."""
+        nonlocal base
+        if nb <= base:
+            return
+        s = nb - base
+        flush(base + min(s, D))
+        if s > D:
+            out[:, base + D:min(nb, Z)] = 0
+        if nb >= Z:
+            base = nb
+            return
+        for t in bufs + [wsum]:
+            v = t if t.dim() == 4 else t[None]
+            if s < D:
+                for j in range(0, D - s, s):
+                    n = min(s, D - s - j)
+                    v[:, j:j + n].copy_(v[:, j + s:j + s + n])
+                v[:, D - s:].zero_()
+            else:
+                v.zero_()
+        base = nb
+
     for i in range(0, len(todo), max(1, int(batch))):
         ob = todo[i:i + max(1, int(batch))]
         x = torch.cat([inputs.prep(o, prep_dtype) for o in ob])
@@ -407,12 +476,16 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
             p = fn(x)
         del x
         for o, pj in zip(ob, p):
-            # the window's part inside the box: `sl` in the box, `lw` in the window
+            # the window's part inside the box: `sl` in the buffer, `lw` in the window
             a0 = [max(int(o[k]), c[k]) for k in range(3)]
             a1 = [min(int(o[k]) + w, c[k] + box[k]) for k in range(3)]
             if any(a1[k] <= a0[k] for k in range(3)):
                 continue
-            sl = tuple(slice(a0[k] - c[k], a1[k] - c[k]) for k in range(3))
+            if rolling:
+                advance(a0[0] - c[0])
+            assert base <= a0[0] - c[0] and a1[0] - c[0] - base <= D, (o, base, D)
+            sl = ((slice(a0[0] - c[0] - base, a1[0] - c[0] - base),)
+                  + tuple(slice(a0[k] - c[k], a1[k] - c[k]) for k in (1, 2)))
             lw = tuple(slice(a0[k] - int(o[k]), a1[k] - int(o[k])) for k in range(3))
             if ib:
                 acc_b[(slice(None),) + sl] += pj[ib][(slice(None),) + lw].to(torch.float16) * g16[lw]
@@ -420,22 +493,8 @@ def run_region(fn, inputs, size, window, halo, batch=1, planes=1, acc_dtype=torc
                 acc_u[(slice(None),) + sl] += pj[iu][(slice(None),) + lw].float() * g32[lw]
             wsum[sl] += g32[lw]
         del p
-    # normalised in z-slabs straight into the output dtype: the whole-volume float32 temporaries of
-    # `where(keep, acc / wsum)` were 4 GB per plane on top of the accumulators (20+ GB for five heads)
-    out = torch.empty((P, Z, Y, X), dtype=out_dtype, device=dev)
-    ys, xs = slice(c[1], c[1] + Y), slice(c[2], c[2] + X)
-    for z in range(0, Z, 64):
-        e = min(z + 64, Z)
-        ws = wsum[z:e].clamp_min(1e-30)
-        keep = (wsum[z:e] > 0) & (inputs.roi[c[0] + z:c[0] + e, ys, xs] > 0)
-        zero = torch.zeros((), device=dev)
-        if ib:
-            q = acc_b[:, z:e].float() / (ws * GAUSS_SCALE)[None]
-            out[ib, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
-        if iu:
-            q = acc_u[:, z:e] / ws[None]
-            out[iu, z:e] = torch.where(keep[None], q, zero).to(out_dtype)
-    del acc_b, acc_u, wsum
+    advance(Z)
+    del acc_b, acc_u, wsum, bufs
     return out
 
 
@@ -949,7 +1008,7 @@ def student_fn(ckpt_path, device=None, compile=True, mode="max-autotune-no-cudag
 
 def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, device=None,
                    window=None, halo=None, cascade_depth=None, batch=1, rung=RUNG, tta=1, pyr=None,
-                   acc_dtype=torch.float16, umbilicus=None, as_tensor=False, margin=None):
+                   acc_dtype=torch.float16, umbilicus=None, as_tensor=False, margin=None, stats=None):
     """One student pass over one region: `{plane name: (Z, Y, X) float32}` in rung-`rung` voxels
     (`as_tensor`: float16 tensors left on the device, for a producer that encodes there).
 
@@ -962,6 +1021,7 @@ def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, 
 
     `margin` (rung-2 voxels; None: the checkpoint's `infer_margin`) is the fine-CT context read around
     the box (`StudentInputs`), scaled to `rung` by `margin_at`; the planes are still exactly the box.
+    `stats`, a dict, gets `run_region`'s accounting of the pass (windows, accumulator bytes).
     """
     st = student if isinstance(student, Student) else student_fn(student, device=device)
     names = st.plane_names(heads)
@@ -978,7 +1038,7 @@ def student_region(student, ct, ax, lo, size, sign=1.0, heads="all", meta=None, 
     bounded = [n in set(str(c) for c in st.layout.channels) or n == "conf" for n in names]
     out = run_region(fn, inp, tuple(int(v) for v in ladder.shape3(size)), w, h, batch=batch,
                      bounded=bounded,
-                     planes=len(names), offs=inp.offs, acc_dtype=acc_dtype,
+                     planes=len(names), offs=inp.offs, acc_dtype=acc_dtype, stats=stats,
                      out_dtype=(torch.float16 if as_tensor else torch.float32))
     if as_tensor:
         return {n: out[i] for i, n in enumerate(names)}

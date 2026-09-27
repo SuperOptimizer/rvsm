@@ -1365,6 +1365,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                           "compile_pending": pending,
                                           "step": None if cst is None else int(getattr(cst, "step", 0))},
                          echo=False)
+                    acc_st = {}                 # the student pass's accumulator accounting
                     if job in TEACHER_JOBS:
                         B = None
                         if bank.route is not None:
@@ -1407,7 +1408,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                         sign = -1.0 if job == "verso" else 1.0
                         want = [str(stu.layout.channels[0])] if heads == "verso" else "all"
                         planes = _student_planes(stu, ct_local, ax, lo, size, sign, want, meta5, pyr,
-                                                 margin=int(cfg.infer_margin))
+                                                 margin=int(cfg.infer_margin), stats=acc_st)
                         attrs = {"producer": "student", "ckpt": stu.ckpt, "step": int(stu.step),
                                  "ckpt_sha256": use.sha, "frozen_teacher": bool(round_ >= 1),
                                  "regeneration": bool(regen_unit),
@@ -1441,6 +1442,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                               "pass_s": round(t_gpu, 1)})
                     extra = {"L": L, "cursor": cursor, "read_wait_s": round(t_in, 2),
                              "gpu_s": round(t_gpu, 2), **_vram()}
+                    if "acc_bytes" in acc_st:
+                        extra["acc_gb"] = round(acc_st["acc_bytes"] / (1 << 30), 3)
                     with lock:
                         pend.append(writer.submit(finish, job, lo, round_, t0, rows, attrs,
                                                   pooled, extra))
@@ -1649,10 +1652,10 @@ def _compiled_graphs():
         return 0
 
 
-def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr, margin=None):
+def _student_planes(stu, ct, ax, lo, size, sign, want, meta5, pyr, margin=None, stats=None):
     from rvsm import infer
     return infer.student_region(stu, ct, ax, lo, size, sign=sign, heads=want, meta=meta5, pyr=pyr,
-                                as_tensor=True, margin=margin)
+                                as_tensor=True, margin=margin, stats=stats)
 
 
 def _gpu_order(units, leased=None, held=None):
