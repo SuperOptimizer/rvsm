@@ -981,7 +981,7 @@ def mode_positions(Sr, Sw, Sc=None, far=None):
 
 
 def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, hi, thr, vthr, snap, t_min,
-              t_max, T_est, far_total, movable, st, lo_w=None):
+              t_max, T_est, far_total, movable, st, lo_w=None, hi_r=None):
     """One grid's move for one pass of the exact surface solve (`two_surface_cut`): per node the recto, verso
     (and CT) profiles along its original normal over -D..D, every `step` voxels; the snap mode picks the
     costs and the placement:
@@ -1003,10 +1003,14 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
     Dcur = np.nan_to_num(((g - rest) * nr).sum(-1)).astype(np.float32)
     Sr = profile(V, qi, nn, D)
     Sw = profile(W, qi, nn, D) if W is not None else None
-    # the verso of a recto at depth d lies near d - T: its labels are the recto's shifted inward by `shift`
+    # the verso of a recto at depth d lies near d - T. The two label windows follow the node's current place:
+    # recto window centred on the node for snap recto, T above it for verso (the node sits on the verso),
+    # T/2 above for mid; the verso window is the recto's shifted inward by `shift`
     Tm = float(np.clip(T_est if np.isfinite(T_est) else 0.5 * (t_min + t_max), t_min, t_max))
     shift = int(round(Tm / step)) * step
-    Sws = profile(W, qi, nn, D + shift)[:2 * D + 1] if W is not None else None     # depths -D-shift .. D-shift
+    c_r = {"verso": shift, "mid": int(round(shift / 2 / step)) * step}.get(snap, 0)
+    tr, tw = ts + c_r, ts + c_r - shift
+    R_ = D + shift
     Sc = profile(CTV, qi, nn, D) if (CTV is not None and snap == "ct") else None
     sub = np.round((ts + D)).astype(np.int64)
     coupled = snap in ("recto", "verso", "mid") and Sw is not None
@@ -1015,13 +1019,18 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
     forbid_far = np.abs(Dq[None] + ts[:, None]) > far_total + 1e-3 if far_total is not None else np.zeros((Z, len(Dq)), bool)
     lo_, hi_ = lo[None], hi[None]
     if coupled:
-        cr = -np.log(np.clip(Sr[sub], 1e-3, 1.0))
-        cw = -np.log(np.clip(Sws[sub], 1e-3, 1.0))
-        tw = ts - shift
-        forbid_w = np.abs(Dq[None] + tw[:, None]) > far_total + t_max + 1e-3 if far_total is not None else forbid_far
-        cr = np.where((ts[:, None] > hi_ + 1e-3) | forbid_far, cr + BIGC, cr)     # the whole sheet [w, r]
+        Rf, Wf = profile(V, qi, nn, R_), profile(W, qi, nn, R_)          # depths -R_ .. R_
+        cr = -np.log(np.clip(Rf[np.round(tr + R_).astype(np.int64)], 1e-3, 1.0))
+        cw = -np.log(np.clip(Wf[np.round(tw + R_).astype(np.int64)], 1e-3, 1.0))
+        if far_total is not None:
+            fr_ = np.abs(Dq[None] + tr[:, None]) > far_total + 1e-3
+            fw_ = np.abs(Dq[None] + tw[:, None]) > far_total + t_max + 1e-3
+        else:
+            fr_ = fw_ = np.zeros((Z, len(Dq)), bool)
+        hr = hi_ if hi_r is None else hi_r[None]      # only a real neighbour above bounds the recto
+        cr = np.where((tr[:, None] > hr + 1e-3) | fr_, cr + BIGC, cr)       # the whole sheet [w, r]
         lw = lo_ if lo_w is None else lo_w[None]      # the verso: only a real neighbour below bounds it
-        cw = np.where((tw[:, None] < lw - 1e-3) | forbid_w, cw + BIGC, cw)        # stays inside the bounds
+        cw = np.where((tw[:, None] < lw - 1e-3) | fw_, cw + BIGC, cw)       # stays inside the bounds
     else:
         sc = mode_scores(Sr, Sw, Sc)[snap][sub]
         cr = -sc / max(float(np.abs(sc).max()), 1e-6)
@@ -1041,10 +1050,11 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
     # fixed columns (outside the tile's box, the taper zone): the PLACED surface stays where it is
     fx = ~ok | (fade < 1.0)
     c0 = int(np.argmin(np.abs(ts)))
-    tstep_min, tstep_max = int(np.ceil(t_min / step)), int(np.floor(t_max / step))
-    half = int(np.clip(round(0.5 * (T_est if np.isfinite(T_est) else 0.5 * (t_min + t_max)) / step),
-                       tstep_min / 2, tstep_max / 2))
-    pin = {"recto": ("r", c0), "verso": ("w", c0), "mid": ("r", min(c0 + half, Z - 1))}.get(snap, ("r", c0))
+    if coupled:   # the index at which the placed surface is at depth 0
+        pin = {"recto": ("r", int(np.argmin(np.abs(tr)))), "verso": ("w", int(np.argmin(np.abs(tw)))),
+               "mid": ("r", int(np.argmin(np.abs(tr - 0.5 * shift))))}[snap]
+    else:
+        pin = ("r", c0)
     tgt = Cr if (pin[0] == "r" or Cw is None) else Cw
     tgt[fx] = BIGC
     tgt[fx, pin[1]] = 0.0
@@ -1053,8 +1063,8 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
         m = float(np.nanmedian(c)) if np.isfinite(c).any() else step
         dz.append(max(1, int(np.floor(m / step + 1e-6))))
     r_i, w_i = two_surface_cut(Cr, Cw, dz, int(np.ceil((t_min - shift) / step)), int(np.floor((t_max - shift) / step)))
-    r = ts[r_i]
-    w = ts[w_i] - shift if w_i is not None else None
+    r = tr[r_i] if coupled else ts[r_i]
+    w = tw[w_i] if w_i is not None else None
     if snap == "verso" and coupled:
         place = w
     elif snap == "mid" and coupled:
@@ -1063,12 +1073,16 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
         place = r
     dd = np.where(ok & (fade >= 1.0), place, 0.0).astype(np.float32)
     # validity of the placed feature, and the diagnostics
-    rq = np.clip(np.round(r[ii] + D).astype(np.int64), 0, 2 * D)
-    pr = np.take_along_axis(Sr, rq[None], 0)[0]
+    if coupled:
+        rq = np.clip(np.round(r[ii] + R_).astype(np.int64), 0, 2 * R_)
+        pr = np.take_along_axis(Rf, rq[None], 0)[0]
+    else:
+        rq = np.clip(np.round(r[ii] + D).astype(np.int64), 0, 2 * D)
+        pr = np.take_along_axis(Sr, rq[None], 0)[0]
     valid = np.zeros((H, Wd), bool)
     if coupled:
-        wq = np.clip(np.round(w[ii] + shift + D).astype(np.int64), 0, 2 * D)
-        pw = np.take_along_axis(Sws, wq[None], 0)[0]
+        wq = np.clip(np.round(w[ii] + R_).astype(np.int64), 0, 2 * R_)
+        pw = np.take_along_axis(Wf, wq[None], 0)[0]
         both = (pr >= thr) & (pw >= vthr)
         st.setdefault("_both", [0, 0])
         st["_both"][0] += int(both.sum())
@@ -1338,7 +1352,8 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                     g, qm, qi, nn, rest[j], n_rest[j], caps[j], fades[j], V, W, ctv, int(r),
                     int(cut_steps[min(it, len(cut_steps) - 1)]), lo, hi, thr, vthr, snap, t_min, t_max,
                     float(Tg) if Tg is not None else float("nan"), far_total, movables[j], st,
-                    lo_w=np.where(np.isfinite(b2), b2 / 2.0, -np.inf).astype(np.float32))
+                    lo_w=np.where(np.isfinite(b2), b2 / 2.0, -np.inf).astype(np.float32),
+                    hi_r=np.where(np.isfinite(a2), a2 / 2.0, np.inf).astype(np.float32))
                 last_valid[j] = vmask
                 moves.append(dd)
                 st["points"] += int(qm.sum())

@@ -778,3 +778,22 @@ def test_fine_write_pitch_writes_every_refined_node(tmp_path, has_volcomp):
     fy = tifffile.imread(str(d / "y.tif"))
     by = tifffile.imread(str(out / "segB-on-20260411134726-2.4um.before" / "y.tif"))
     assert (np.abs(fy - by) > 0.5).sum() > 50                 # nodes between the published ones moved too
+
+
+def test_cut_solver_verso_and_mid_placements_are_stable_over_passes():
+    """Recto band at 46, its verso 20 inward at 26, sheet published at 50: snap recto / verso / mid end on
+    46 / 26 / 36, and later passes barely move (the label windows follow the node's place: T above it for
+    verso, T/2 for mid -- with the recto window centred on a verso-placed node, the recto fell outside it and
+    every pass moved the sheet another thickness)."""
+    pytest.importorskip("maxflow")
+    shape = (16, 90, 40)
+    Vr = band_volume(shape, lambda x: 46 + 0 * x, 1.2)
+    Vv = band_volume(shape, lambda x: 26 + 0 * x, 1.2)
+    g = flat_sheet(50.0, x=(2, 38))
+    for snap, want in (("recto", 46.0), ("verso", 26.0), ("mid", 36.0)):
+        (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, T=20.0, cut=True, snap=snap,
+                                   cut_depths=(24, 12, 6), cut_steps=(2, 1, 1), t_min=6, t_max=28, taper=0.0,
+                                   sigma=1.0, thr=0.3)
+        assert abs(np.median(new[2:-2, 2:-2, 1]) - want) <= 1.0, (snap, np.median(new[2:-2, 2:-2, 1]))
+        assert st[-1]["mean_abs_move"] < 1.0
+        assert st[-1]["thickness_fit"]["p50"] == 20.0
