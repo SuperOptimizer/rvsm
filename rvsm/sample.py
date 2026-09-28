@@ -292,7 +292,9 @@ class Patches(torch.utils.data.IterableDataset):
         self.pyr = ladder.rungs(self.ct)
         self.ax = (np.asarray(self._ax_in, np.float64) if self._ax_in is not None
                    else AX.load(self.cfg.umbilicus, ct=self.ct))
-        self.cat = RG.Catalog(self.root, self.round)
+        # each region at the newest round <= this one that has produced it (`regions.RoundCatalog`):
+        # a round-r walk never waits for a region's round-r regeneration while older stores exist
+        self.cat = RG.RoundCatalog(self.root, self.round)
         if self._records is None:
             self._records = RG.region_list(self.pyr, rungs=self.cfg.rungs, patch=self.cfg.patch,
                                            region=self.cfg.region, boost=self.cfg.rung_boost,
@@ -335,7 +337,7 @@ class Patches(torch.utils.data.IterableDataset):
         shape = ladder.shape3(shape)
         k = int(k)
         if k >= RG.COARSE_RUNGS[0]:
-            v, cov = RG.read_coarse(self.root, chan, k, lo, shape, self.round)
+            v, cov = self._coarse(chan, k, lo, shape)
             held = getattr(self, "_held", ())
             if held:
                 # the TRAINING sampler: a coarse voxel any part of which lies over a held-out region's
@@ -358,6 +360,27 @@ class Patches(torch.utils.data.IterableDataset):
             return np.zeros(tuple(shape), np.uint8), np.zeros(tuple(shape), np.float32)
         v, ins = stores.read_store(a, k, lo, shape)
         return v, ins.astype(np.float32)
+
+    def _round_of(self, r):
+        """The round region `r` (rung-2 origin) is read from (`regions.RoundCatalog.region_round`)."""
+        rr = getattr(self.cat, "region_round", None)
+        return self.round if rr is None else int(rr(tuple(int(v) for v in r)))
+
+    def _coarse(self, chan, k, lo, shape):
+        """(cube, coverage) of the whole-scroll coarse array at rung k >= 7, this round's -- and, from
+        round 1 on, where this round's coverage is still 0 (regions not regenerated yet), the newest
+        lower round's, voxel by voxel: the coarse counterpart of `RoundCatalog`."""
+        v, cov = RG.read_coarse(self.root, chan, k, lo, shape, self.round)
+        for r in range(self.round - 1, -1, -1):
+            gap = cov <= 0
+            if not gap.any():
+                break
+            v0, c0 = RG.read_coarse(self.root, chan, k, lo, shape, r)
+            fill = gap & (c0 > 0)
+            if fill.any():
+                v, cov = v.copy(), cov.copy()
+                v[fill], cov[fill] = v0[fill], c0[fill]
+        return v, cov
 
     def _regions_over(self, k, lo, shape):
         """The rung-2 origins of every region whose footprint meets the rung-k window [lo, lo+shape)."""
@@ -402,7 +425,7 @@ class Patches(torch.utils.data.IterableDataset):
                     continue
                 v, i_ = stores.read_store(a, 3, plo, pn)
             else:
-                v, i_ = RG.pooled_window(self.root, ch, r, k, plo, pn, self.round)
+                v, i_ = RG.pooled_window(self.root, ch, r, k, plo, pn, self._round_of(r))
             o = plo - lo
             sl = tuple(slice(int(o[j]), int(o[j] + pn[j])) for j in range(3))
             out[sl] = v
@@ -413,7 +436,7 @@ class Patches(torch.utils.data.IterableDataset):
         """Is region `r` (rung-2 origin) served by a ROUTED generation: a route is configured, this is
         round 0, and the region's COMMITTED teacher generation has its `band` (a region the regeneration
         has not reached yet keeps its old stores' meaning -- the m7 recto with its rw)."""
-        return self.route is not None and self.round == 0 and r is not None and \
+        return self.route is not None and r is not None and self._round_of(r) == 0 and \
             self.cat.done(BAND, tuple(int(v) for v in r))
 
     def _eff(self, chan, r, k):

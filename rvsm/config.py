@@ -207,7 +207,18 @@ FINGERPRINT_EXCLUDE = ("infer_margin", "steps", "eval_every", "workers", "gpus",
                        # exits to be respawned, and the glibc malloc knobs it sets -- process housekeeping,
                        # never what any store holds
                        "producer_recycle_fields", "producer_recycle_rss_gb", "producer_mallopt",
-                       "producer_arena_max")
+                       "producer_arena_max",
+                       # disk housekeeping: the free-disk floor the producer pauses at and the CT shard
+                       # cache's budget. Neither changes what any store holds or what is trained, so a
+                       # resume may lower them (paris4 2026-09-28: the disk filled in round 1)
+                       "reserve_gb", "cache_gb",
+                       # the round >= 1 student planes' field BAND (`run.student_rows`): midline,
+                       # thickness and conf are code 0 (no data, weight 0) further than this from the
+                       # recto / verso bands. A new field on the 2026-09-28 resume of paris4 (its round-1
+                       # stores were dense, ~110 MB/region/field); excluded so that resume and any later
+                       # retuning keep the checkpoint's fingerprint. It changes only where round >= 1
+                       # field targets exist, never their values
+                       "self_band_vox")
 
 # The loss weights a resume may retune (`run.log_switches` logs a `loss_switch` line when one moved).
 LOSS_SWITCH_FIELDS = ("loss_prob_dice", "loss_pair", "loss_skel", "loss_affinity", "loss_ect",
@@ -429,6 +440,11 @@ class Config:
     train_min: float = 20.0            # timeshare: minutes of training per phase
     produce_max_min: float = 10.0      # timeshare: maximum minutes of production per phase
     reserve_gb: float = 50.0           # production pauses below this much free disk
+    self_band_vox: int = 6             # round >= 1: the student's midline / thickness / conf stores are
+                                       # code 0 (no data) further than this many rung-2 voxels (Chebyshev)
+                                       # from its recto or verso band (prob >= 0.5); 0 = dense (the old
+                                       # stores, ~110 MB/region/field). Rungs 3-4 come from `region_fields`,
+                                       # whose REACH / pairing rules already bound them
     round_steps: int = 20000           # the MINIMUM steps a round trains (counted from its own start)
                                        # before the round gate may promote it
     compile: bool = True               # torch.compile the student (and the teachers, when teacher_bf16)

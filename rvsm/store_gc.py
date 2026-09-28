@@ -1,6 +1,7 @@
 """List, and optionally delete, SUPERSEDED generations of a run's region stores.
 
     python -m rvsm.store_gc --out DIR [--round R] [--delete] [--gen0] [--min-age-min 30] [--log F]
+                            [--superseded-by-round R]
     rvsm store-gc --out DIR ...                  (the same)
 
 A regeneration (the verso's, a teacher reteach, the fields rebuilt from either) writes a NEW directory
@@ -24,6 +25,15 @@ GENERATION 0 (`region_<z>_<y>_<x>.zarr`, no suffix) is only a candidate with `--
 `regions.Catalog.list_done` learnt to parse `.g<N>` names, it was the region's only existence marker
 (the recto regeneration's work list, the verso count, the round rollover), so a producer or trainer
 running OLDER code must not see it go. Use `--gen0` only once every process runs this commit or later.
+
+`--superseded-by-round R` lists (and with `--delete` removes) instead the ROUND-(R-1) stores of every
+region whose round-R stores cover them (`superseded_by_round`): once a region's round-R recto is
+finished the trainer reads the whole region from round R (`regions.RoundCatalog`), so its round-(R-1)
+stores of every channel round R has (and round 0's rw / band beside the recto) are dead. Held-out
+regions are never touched (their round-0 stores are every round's reference), nor a region whose
+round-R recto finished within `--min-age-min`. The producer does the same per region as it goes
+(`run.SUPERSEDE_GRACE_S` after the region's round-R fields are in, a `supersede_gc` line); this is for
+what a restart or an older producer left behind.
 
 What does NOT pin an old generation: the evaluation grid's identity (`sample.grid_sources`) digests
 `Catalog.path`, i.e. the committed stores, and its item files are self-contained tensors; the
@@ -164,6 +174,130 @@ def scan(out, round_=None, gen0=False, min_age_s=1800.0, now=None):
     return {"candidates": cands, "skipped": skipped, "leftover": leftover}
 
 
+# ------------------------------------------------------------------ superseded by a newer ROUND
+
+SUPERSEDE_ANCHOR = "recto"   # the channel whose round-r store moves a region's readers to round r
+                             # (`regions.RoundCatalog.ANCHOR`)
+
+
+def pinned_regions(out):
+    """The held-out regions (`<out>/eval/heldout.json`): their ROUND-0 stores are the fixed reference
+    every gate and evaluation of every round is scored against, never collected."""
+    try:
+        with open(os.path.join(str(out), "eval", "heldout.json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    return {tuple(int(v) for v in h["lo"]) for h in (d or {}).get("regions", [])}
+
+
+def _region_dirs(out, channel, lo, round_):
+    """Every directory of a region's store in one channel and round: generation 0 and each `.g<N>`."""
+    base = stores.store_path(out, channel, lo, round_)
+    return [(g, stores.gen_path(base, g)) for g in [0] + stores.gens(base)
+            if os.path.isdir(stores.gen_path(base, g))]
+
+
+def superseded_by_round(out, lo, round_):
+    """The round-(`round_` - 1) store directories of region `lo` that its round-`round_` stores cover:
+    every generation of each lower-round channel whose round-`round_` store (`stores.current_path`) is
+    finished -- and round 0's teacher companions (rw, band: `stores.TEACHER_BUNDLED`), which only mean
+    anything beside round 0's recto, once the round-`round_` recto is. A list of dicts {round, channel,
+    region, gen, path}; nothing when the round-`round_` anchor (recto) is not finished, since readers
+    (`regions.RoundCatalog`) keep reading the lower round until it is. Reads only."""
+    r, old = int(round_), int(round_) - 1
+    lo = tuple(int(v) for v in lo)
+    if old < 0 or not stores.is_done(stores.current_path(out, SUPERSEDE_ANCHOR, lo, r)):
+        return []
+    rd = os.path.join(str(out), "stores", f"round_{old}")
+    if not os.path.isdir(rd):
+        return []
+    got = []
+    for ch in sorted(os.listdir(rd)):
+        if ch == "bundle" or ch.endswith(".zarr") or not os.path.isdir(os.path.join(rd, ch)):
+            continue
+        cover = SUPERSEDE_ANCHOR if ch in stores.TEACHER_BUNDLED else ch
+        if not stores.is_done(stores.current_path(out, cover, lo, r)):
+            continue
+        for g, p in _region_dirs(out, ch, lo, old):
+            got.append({"round": old, "channel": ch, "region": list(lo), "gen": g, "path": p})
+    return got
+
+
+def remove(paths_or_recs):
+    """Rename each store to `<path>.gc-<ts>` (a name no reader resolves), then rmtree it. Returns
+    (removed records with their `bytes` / `alloc`, failed records)."""
+    ts = int(time.time())
+    removed, failed = [], []
+    for c in paths_or_recs:
+        c = c if isinstance(c, dict) else {"path": c}
+        p = c["path"]
+        try:
+            size, alloc, _ = _tree(p)
+        except OSError:
+            continue
+        q = f"{p}{GC_TAG}{ts}"
+        try:
+            os.replace(p, q)
+        except OSError as e:
+            failed.append({**c, "error": repr(e)})
+            continue
+        shutil.rmtree(q, ignore_errors=True)
+        removed.append({**c, "bytes": size, "alloc": alloc})
+    return removed, failed
+
+
+def supersede(out, lo, round_, pinned=None):
+    """Delete region `lo`'s round-(`round_` - 1) stores that its round-`round_` stores cover
+    (`superseded_by_round`), unless it is a held-out region (`pinned`, default `pinned_regions`).
+    Returns (removed records, bytes allocated that were freed)."""
+    pinned = pinned_regions(out) if pinned is None else {tuple(int(v) for v in p) for p in pinned}
+    if tuple(int(v) for v in lo) in pinned:
+        return [], 0
+    removed, _ = remove(superseded_by_round(out, lo, round_))
+    return removed, sum(c["alloc"] for c in removed)
+
+
+def scan_superseded(out, round_, min_age_s=1800.0, now=None):
+    """`scan`'s result shape for the round-(`round_` - 1) stores superseded by round `round_`: every
+    region with a finished round-`round_` anchor store, its covered lower-round stores
+    (`superseded_by_round`) as candidates -- or skipped, `why` "held out" (`pinned_regions`) or
+    "superseded recently" (the round-`round_` anchor finished less than `min_age_s` ago: a reader that
+    resolved the region before may still be reading the old round)."""
+    now = time.time() if now is None else float(now)
+    cands, skipped, leftover = [], [], []
+    r = int(round_)
+    pinned = pinned_regions(out)
+    old_rd = os.path.join(str(out), "stores", f"round_{r - 1}")
+    if r >= 1 and os.path.isdir(old_rd):
+        for ch in os.listdir(old_rd):
+            d = os.path.join(old_rd, ch)
+            if os.path.isdir(d) and not ch.endswith(".zarr"):
+                leftover += [os.path.join(d, n) for n in os.listdir(d) if GC_TAG in n]
+    d = os.path.join(str(out), "stores", f"round_{r}", SUPERSEDE_ANCHOR)
+    los = sorted({got[0] for got in (stores.parse_region_name(n) for n in
+                                     (os.listdir(d) if r >= 1 and os.path.isdir(d) else ()))
+                  if got is not None})
+    for lo in los:
+        recs = superseded_by_round(out, lo, r)
+        if not recs:
+            continue
+        anchor = stores.current_path(out, SUPERSEDE_ANCHOR, lo, r)
+        try:
+            t_new = os.stat(os.path.join(anchor, "zarr.json")).st_mtime
+        except OSError:
+            continue
+        why = "held out" if lo in pinned else ("superseded recently" if now - t_new < min_age_s else None)
+        for c in recs:
+            try:
+                size, alloc, _ = _tree(c["path"])
+            except OSError:
+                continue
+            c.update(bytes=size, alloc=alloc, committed=None)
+            (cands if why is None else skipped).append(c if why is None else {**c, "why": why})
+    return {"candidates": cands, "skipped": skipped, "leftover": leftover}
+
+
 def summary(res):
     """Per (round, channel): count and bytes of the candidates, and of the skipped ones by reason."""
     per = {}
@@ -236,6 +370,7 @@ USAGE = __doc__.split("\n\n")[1]
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     out, round_, do, gen0, age, logp, as_json = None, None, False, False, 30.0, None, False
+    by_round = None
     it = iter(argv)
     for a in it:
         if a in ("-h", "--help"):
@@ -257,13 +392,18 @@ def main(argv=None):
             logp = next(it)
         elif a == "--json":
             as_json = True
+        elif a == "--superseded-by-round":
+            by_round = int(next(it))
         else:
             print(USAGE)
             return 2
     if not out:
         print(USAGE)
         return 2
-    res = scan(out, round_=round_, gen0=gen0, min_age_s=age * 60.0)
+    if by_round is not None:
+        res = scan_superseded(out, by_round, min_age_s=age * 60.0)
+    else:
+        res = scan(out, round_=round_, gen0=gen0, min_age_s=age * 60.0)
     per = report(res)
     if as_json:
         print(json.dumps(per))

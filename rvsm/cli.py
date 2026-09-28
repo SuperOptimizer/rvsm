@@ -18,7 +18,8 @@ USAGE = """rvsm <command> [options]
   status | stop | ledger --rebuild | umbilicus --ct URL --out umbilicus.json
   teachers   fetch [recto,m7] [--cache DIR] [--extras]
   grid-repack DIR [DIR ...] [--jobs N] [--dry-run] [--force] [--wait S]   (rvsm/grid_repack.py)
-  store-gc   --out DIR [--round R] [--delete] [--gen0] [--min-age-min 30]   (rvsm/store_gc.py)
+  store-gc   --out DIR [--round R] [--delete] [--gen0] [--min-age-min 30] [--superseded-by-round R]
+                                                                           (rvsm/store_gc.py)
   refine     --recto S [--verso S] --paths DIR --umbilicus U --out DIR [--z0 Z --dz 128] [--anchors F]
              (rvsm/tools/refine/refine.py; docs/refine.md)
 """

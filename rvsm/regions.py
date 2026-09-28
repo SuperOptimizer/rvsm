@@ -304,6 +304,43 @@ class Catalog:
                       or stores.is_done(self.path(channel, lo)))
 
 
+class RoundCatalog(Catalog):
+    """The TRAINER's catalog: a region is read from the NEWEST round <= `round_` that has produced it.
+
+    Round r >= 1 regenerates every region with a student pass, ~30 regions/h on paris4 against the
+    trainer's ~45 region visits/h, so a round-r walk that waited for round-r stores starved (2026-09-28:
+    `wait` lines for hours while every region had finished round-0 stores). Here a region whose round-r
+    stores are not there yet is read from its round-(r-1) stores (and so on down to round 0), and the
+    moment its round-r ANCHOR store (`ANCHOR`: the recto, the one channel every round writes first) is
+    finished it is read from round r -- the whole region at once, never a mix of rounds per channel
+    (round 0's rw / band only mean anything beside round 0's recto).
+
+    The resolution is per call and cached like a store MISS: a region resolved to its top round stays
+    there (a finished store never un-finishes), one resolved lower is looked at again after `ttl`
+    seconds -- well inside the producer's supersession grace (`run.SUPERSEDE_GRACE_S`) before it deletes
+    the lower round's stores. The producer must NOT use this class: it has to see what round r lacks."""
+
+    ANCHOR = "recto"
+
+    def region_round(self, lo):
+        """The round this region is read from: the highest r' <= `round` whose anchor store is
+        finished (`round` itself when none is: nothing is there, every read misses)."""
+        key = ("round", tuple(int(v) for v in lo))
+        hit = self._c.get(key)
+        if hit is not None and (hit[2] or time.time() - hit[1] < self.ttl):
+            return hit[0]
+        got, top = self.round, False
+        for r in range(self.round, -1, -1):
+            if stores.is_done(stores.current_path(self.root, self.ANCHOR, lo, r)):
+                got, top = r, r == self.round
+                break
+        self._c[key] = (got, time.time(), top)
+        return got
+
+    def path(self, channel, lo):
+        return stores.current_path(self.root, channel, lo, self.region_round(lo))
+
+
 # --------------------------------------------------------------------------- pooling a region
 
 _POOL = {}     # {(path, k): ndarray} -- the pooled views of a region store, built once per loader

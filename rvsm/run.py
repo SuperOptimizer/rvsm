@@ -730,24 +730,59 @@ class StudentSlot:
         return self.st
 
 
-def student_rows(planes, layout, heads):
+BAND_THR_U8 = 128     # a sheet voxel: its stored probability code >= this -- round 0's `thr` = 0.5 as
+                      # `targets.block_fields` applies it (`round(0.5 * 255)`)
+
+
+def field_band(rec, ver, radius):
+    """The support of a round >= 1 student pass's FIELD stores (midline, thickness, conf): the voxels
+    within `radius` voxels (Chebyshev: a (2r+1)^3 cube dilation) of a recto or verso SHEET voxel (its
+    uint8 probability code >= `BAND_THR_U8`, the threshold round 0's fields take their faces from).
+    Everything else is code 0 = no data, which the loader gives weight 0 (`sample.Patches._rung_target`)
+    -- the same meaning round 0's `targets.region_fields` gives its code 0, whose support is the paired
+    faces' neighbourhood. `radius` None or <= 0: everywhere (the old dense planes). `rec` / `ver` are
+    float probabilities or their uint8 codes; numpy in, bool out."""
+    from scipy import ndimage as ndi
+    from rvsm import stores
+    r = 0 if radius is None else int(radius)
+    if r <= 0:
+        return np.ones(np.shape(rec), bool)
+
+    def sheet(p):
+        p = np.asarray(p)
+        return (p if p.dtype == np.uint8 else stores.u8(p)) >= BAND_THR_U8
+    m = sheet(rec)
+    if ver is not None:
+        m |= sheet(ver)
+    if not m.any():
+        return m
+    return ndi.maximum_filter(m, size=2 * r + 1, mode="constant", cval=False)
+
+
+def student_rows(planes, layout, heads, band=None):
     """[(channel, uint8 block, q, encoding)] for a student pass.
 
     q8 for the probabilities (a probability is read as a weight, so a lossy codec is harmless) and q0
     for every FIELD, whose code 0 is the no-data marker and whose other codes are a distance in
     0.25-voxel steps -- neither of which a codec may round. The same contract `rvsm produce --student`
-    writes; the encoders are `export` / `targets`' own, so there is one definition of it."""
+    writes; the encoders are `export` / `targets`' own, so there is one definition of it.
+
+    `band` (voxels, `cfg.self_band_vox`; None = dense): midline, thickness and conf are code 0 outside
+    `field_band` -- a dense q0 plane of a student head is ~110 MB per 1024^3 region and field, a banded
+    one a few MB (paris4 round 1 filled its disk on the dense ones)."""
     from rvsm import export as EX, stores, targets as TG
     first = str(layout.channels[0])
     if heads == "verso":
         return [("verso", stores.u8(planes[first]), 8, "prob_u8")]
     rec = planes["recto"]
-    valid = rec > 0
+    ver = stores.u8(planes["verso"])
+    sup = field_band(rec, ver, band)
+    valid = (rec > 0) & sup
     return [("recto", stores.u8(rec), 8, "prob_u8"),
-            ("verso", stores.u8(planes["verso"]), 8, "prob_u8"),
+            ("verso", ver, 8, "prob_u8"),
             ("midline", EX.enc_signed(planes["midline"], valid), 0, "signed_u8_off128_q0.25"),
             ("thickness", TG.encode_unsigned(planes["thickness"], valid), 0, "unsigned_u8_q0.25"),
-            ("conf", stores.u8(planes["conf"]), 0, "conf_u8")]
+            ("conf", np.where(sup, stores.u8(planes["conf"]), np.uint8(0)).astype(np.uint8), 0, "conf_u8")]
 
 
 def _enc_chunks(f, planes, device=None, chunk=64):
@@ -765,25 +800,72 @@ def _enc_chunks(f, planes, device=None, chunk=64):
     return res
 
 
-def student_rows_t(planes, layout, heads, device=None, chunk=64):
+def field_band_t(rec, ver, radius):
+    """`field_band` on (Z, Y, X) tensors (one device): the same bool mask -- the cube dilation as three
+    separable 1-D max pools, which is exactly the (2r+1)^3 maximum filter with a False border."""
+    import torch
+    import torch.nn.functional as F
+    from rvsm import infer
+    r = 0 if radius is None else int(radius)
+    if r <= 0:
+        return torch.ones(rec.shape, dtype=torch.bool, device=rec.device)
+    m = infer.u8_t(rec) >= BAND_THR_U8
+    if ver is not None:
+        m |= infer.u8_t(ver) >= BAND_THR_U8
+    x = m[None, None].to(torch.float16 if m.is_cuda else torch.float32)
+    k = 2 * r + 1
+    for ks, pad in (((k, 1, 1), (r, 0, 0)), ((1, k, 1), (0, r, 0)), ((1, 1, k), (0, 0, r))):
+        x = F.max_pool3d(x, ks, stride=1, padding=pad)
+    return x[0, 0] > 0
+
+
+def _fields_banded(planes, radius, device=None, chunk=64):
+    """(midline, thickness, conf) uint8 host arrays of a multi-head pass, in z-chunks like
+    `_enc_chunks`, with the field support `field_band_t(recto, verso, radius)` computed per chunk from
+    the chunk plus `radius` planes of halo on each side (so the codes are exactly the whole-plane
+    ones) and shared by the three encoders."""
+    import numpy as np
+    from rvsm import export as EX, infer, targets as TG
+    rec, ver = planes["recto"], planes["verso"]
+    dev = rec.device if device is None else device
+    Z = int(rec.shape[0])
+    h = max(int(radius or 0), 0)
+    shp = tuple(int(v) for v in rec.shape)
+    mid, thk, cf = (np.empty(shp, np.uint8) for _ in range(3))
+    for z in range(0, Z, int(chunk)):
+        e = min(z + int(chunk), Z)
+        a, b = max(z - h, 0), min(e + h, Z)
+        sup = field_band_t(rec[a:b].to(dev, non_blocking=True), ver[a:b].to(dev, non_blocking=True),
+                           radius)[z - a:z - a + (e - z)]
+        r = rec[z:e].to(dev, non_blocking=True)
+        valid = (r > 0) & sup
+        mid[z:e] = EX.enc_t(planes["midline"][z:e].to(dev, non_blocking=True), valid, -EX.TRACER_CAP,
+                            EX.TRACER_CAP, EX.TRACER_UNIT, EX.TRACER_OFF).cpu().numpy()
+        thk[z:e] = EX.enc_t(planes["thickness"][z:e].to(dev, non_blocking=True), valid, TG.UNIT,
+                            255 * TG.UNIT, TG.UNIT).cpu().numpy()
+        c = infer.u8_t(planes["conf"][z:e].to(dev, non_blocking=True))
+        cf[z:e] = (c * sup.to(c.dtype)).cpu().numpy()
+        del sup, r, valid, c
+    return mid, thk, cf
+
+
+def student_rows_t(planes, layout, heads, device=None, chunk=64, band=None):
     """`student_rows` for float TENSOR planes (`student_region(..., as_tensor=True)`): the same codes,
     computed on `device` (None: where the planes are) in z-chunks, returned as host uint8 arrays --
     for device planes one byte per voxel crosses the bus; host planes (the multi-head pass's
-    `out_device="cpu"`) go up a chunk at a time."""
-    from rvsm import export as EX, infer, targets as TG
+    `out_device="cpu"`) go up a chunk at a time. `band`: the field support radius, as `student_rows`."""
+    from rvsm import infer
     first = str(layout.channels[0])
     E = lambda f, *ps: _enc_chunks(f, ps, device, chunk)   # noqa: E731
     if heads == "verso":
         return [("verso", E(infer.u8_t, planes[first]), 8, "prob_u8")]
     rec = planes["recto"]
+    mid, thk, cf = _fields_banded(planes, band, device, chunk)
     return [("recto", E(infer.u8_t, rec), 8, "prob_u8"),
             ("verso", E(infer.u8_t, planes["verso"]), 8, "prob_u8"),
-            ("midline", E(lambda m, r: EX.enc_t(m, r > 0, -EX.TRACER_CAP, EX.TRACER_CAP,
-                                                EX.TRACER_UNIT, EX.TRACER_OFF),
-                          planes["midline"], rec), 0, "signed_u8_off128_q0.25"),
-            ("thickness", E(lambda t, r: EX.enc_t(t, r > 0, TG.UNIT, 255 * TG.UNIT, TG.UNIT),
-                            planes["thickness"], rec), 0, "unsigned_u8_q0.25"),
-            ("conf", E(infer.u8_t, planes["conf"]), 0, "conf_u8")]
+            ("midline", mid, 0, "signed_u8_off128_q0.25"),
+            ("thickness", thk, 0, "unsigned_u8_q0.25"),
+            ("conf", cf, 0, "conf_u8")]
 
 
 def write_rows(out, lo, rows, cfg, round_, attrs, gen=0):
@@ -985,6 +1067,9 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     rslot = slot
     keys = {}
     backlog_keys = set()                        # regions fetched for the regeneration backlog
+    # supersession GC (`supersede_due`): {region: (due time, round)} once a region's round >= 1 stores
+    # are complete; its round-(r-1) stores go SUPERSEDE_GRACE_S later
+    supersede_q = {}
 
     def release_backlog():
         """A backlog region sits outside the walk (no position), so `_release_passed` never gives its
@@ -1150,6 +1235,9 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
             # a new verso or recto AND all of the fields built from it are finished: only now do
             # readers move to them (`commit_sources`)
             commit_sources(out, lo, round_, frungs)
+            if int(round_) >= 1 and TG.fields_current(out, lo, round_, frungs):
+                with lock:          # the round-r bundle is complete: the round-(r-1) one is dead
+                    supersede_q[tuple(lo)] = (time.time() + SUPERSEDE_GRACE_S, int(round_))
             g = TG.field_gen(out, lo, round_)
             # the region's host garbage back to the OS (a no-op without glibc); before / after logged
             rss0 = own_rss_gb()
@@ -1172,6 +1260,7 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
     try:
         while not stopping():
             settle()
+            supersede_due(out, supersede_q, held_los, lock=lock)
             if recycle_gb and recycle["why"] is None and time.time() - t_start > RECYCLE_MIN_S:
                 r_ = own_rss_gb()                           # between units: the RSS cap
                 if r_ > recycle_gb:
@@ -1440,7 +1529,8 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
                                  "temps": {str(k): float(v) for k, v in stu.temps.items()},
                                  # the NormAct precision the pass ran (`gn_bf16_producer`)
                                  "gn_bf16": bool(stu.gn_bf16)}
-                        rows = student_rows_t(planes, stu.layout, heads, device=getattr(stu, "dev", None))
+                        rows = student_rows_t(planes, stu.layout, heads, device=getattr(stu, "dev", None),
+                                              band=int(getattr(cfg, "self_band_vox", 0) or 0))
                         del planes
                         pooled = None
                     t_gpu = time.time() - t1
@@ -1520,6 +1610,44 @@ def produce_loop(cfg, out, role_gpu=None, device=None, mem_frac=None, stop=None,
         jlog(out, "produce", {"kind": "exit", "pid": os.getpid()})
     settle()
     return 0
+
+
+SUPERSEDE_GRACE_S = 600.0   # a region's round-(r-1) stores are deleted this long after its round-r
+                            # stores are complete: a sampler resolves the region to round r within
+                            # `regions.TTL` of the round-r recto landing (`RoundCatalog`), so after
+                            # this no reader still holds the old round
+
+
+def supersede_due(out, queue, held=(), lock=None, now=None):
+    """Delete the round-(r-1) stores of every queued region whose grace has run out
+    (`store_gc.supersede`: the channels its round-r stores cover, never a held-out region's) and log a
+    `supersede_gc` line each to produce.jsonl. `queue` is {region: (due, round)}; the regions handled
+    leave it. Returns the lines logged. A failure is logged and dropped: a leftover is only disk, and
+    `rvsm store-gc --superseded-by-round` finds it."""
+    from rvsm import store_gc as SG
+    now = time.time() if now is None else float(now)
+    import contextlib
+    with (lock or contextlib.nullcontext()):
+        due = [(lo, r) for lo, (t, r) in queue.items() if t <= now]
+        for lo, _ in due:
+            queue.pop(lo, None)
+    got = []
+    for lo, r in due:
+        try:
+            removed, freed = SG.supersede(out, lo, r, pinned=held)
+        except Exception as e:  # noqa: BLE001
+            jlog(out, "produce", {"kind": "supersede_gc_error", "region": [int(v) for v in lo],
+                                  "round": int(r), "error": repr(e)})
+            continue
+        if not removed:
+            continue
+        rec = {"kind": "supersede_gc", "region": [int(v) for v in lo], "round": int(r) - 1,
+               "by_round": int(r), "stores": len(removed),
+               "channels": sorted({c["channel"] for c in removed}),
+               "freed_gb": round(freed / (1 << 30), 3)}
+        jlog(out, "produce", rec, echo=False)
+        got.append(rec)
+    return got
 
 
 def _vram():
