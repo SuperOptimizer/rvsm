@@ -673,8 +673,9 @@ def slope_project(X, caps, fixed, iters=None):
     return out, slope_violations(out, caps)
 
 
-def slope_violations(X, caps, tol=1e-3):
-    """Grid edges whose displacement difference exceeds the cap ('sheet switches')."""
+def slope_violations(X, caps, tol=0.01):
+    """Grid edges whose displacement difference exceeds the cap ('sheet switches'). tol: float32 zyx near
+    16000 voxels resolve ~0.002 voxel, and the projection leaves many edges exactly AT the cap."""
     c0, c1 = caps
     n = 0
     for d, c in ((np.diff(X, axis=0), c0), (np.diff(X, axis=1), c1)):
@@ -900,6 +901,18 @@ def spacing(g):
     return np.concatenate(out) if out else np.zeros(0, np.float32)
 
 
+def upsample_field(f, valid, shape, s):
+    """An (h,w) field on every s-th node (valid mask) bilinearly onto the full (H,W) grid (normalised, so a
+    hole or a missing coarse node does not pull toward 0)."""
+    from scipy.ndimage import map_coordinates
+    H, Wd = shape
+    ii, jj = np.meshgrid(np.arange(H, dtype=np.float32) / s, np.arange(Wd, dtype=np.float32) / s, indexing="ij")
+    w = valid.astype(np.float32)
+    num = map_coordinates(np.nan_to_num(f * w), [ii, jj], order=1, mode="nearest")
+    den = map_coordinates(w, [ii, jj], order=1, mode="nearest")
+    return np.where(den > 1e-3, num / np.maximum(den, 1e-3), 0.0).astype(np.float32)
+
+
 def _label_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, r, lo, hi, thr, vthr, Tg, thick, tunit, ct,
                 verso_margin, verso_beta, verso_block, move_prior, pair_weight, slope_excess, sweeps, st,
                 movable=None, far_total=None, chunk=40_000):
@@ -975,7 +988,10 @@ def _label_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, r, lo, hi, thr, v
     y2 = np.take_along_axis(S_all, np.clip(lab + 1, 0, L - 1)[..., None], -1)[..., 0].astype(np.float32)
     den = np.minimum(y0 - 2 * y1 + y2, -1e-6)
     sub = np.where((lab > 0) & (lab < L - 1) & (y1 >= thr), np.clip(0.5 * (y0 - y2) / den, -0.5, 0.5), 0.0)
-    dd = (lab - r + sub).astype(np.float32)
+    # the sub-voxel parabola is per node: left alone it makes +-0.5 voxel zigzag; it is averaged over the
+    # 3x3 neighbourhood (the integer labels, which carry the shape, are not touched)
+    sub = smooth(sub.astype(np.float32), ((y1 >= thr) & ok).astype(np.float32), 1.0)
+    dd = (lab - r + np.clip(sub, -0.5, 0.5)).astype(np.float32)
     lof, hif = np.full((H, Wd), -float(r), np.float32), np.full((H, Wd), float(r), np.float32)
     lof[ok], hif[ok] = lo, hi
     dd = np.clip(dd, lof, hif) * ok * fade
@@ -987,7 +1003,8 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 holds=None, taper=0.0, box=None, sigma_final=None, local_normal=False, relax=0.5, relax_iters=2,
                 guard=True, min_spacing=None, peak_tol=0.15, reparam_on=False, dup_gap=None, dup_frac=0.4,
                 labelling=False, max_slope=0.5, pair_weight=0.02, slope_excess=2.0, label_sweeps=2,
-                max_strain=0.10, move_prior=0.002, far_total=40.0, ridge_reach=2.0, diag=None, log=None):
+                max_strain=0.10, move_prior=0.002, far_total=40.0, ridge_reach=2.0, label_pitch=None, diag=None,
+                log=None):
     """Joint refinement of several (H,W,3) zyx grids (NaN = hole) against V, a (Z,Y,X) probability (float in
     [0,1] or uint8) at `origin`. Each iteration, for every node: the peaks along its normal ray within
     far[it] and the other sheets on that ray are matched in order (assign()); the matched peak's offset is
@@ -1049,6 +1066,9 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     # sqrt(s^2 + d^2) long, so max_strain allows d <= s sqrt((1 + max_strain)^2 - 1) (0.458 s at 10%)
     eff_slope = max_slope if max_strain is None else min(max_slope, float(np.sqrt((1 + max_strain) ** 2 - 1)))
     caps = [edge_caps(g, eff_slope) for g in grids] if labelling else None
+    strides = [max(1, int(round(float(p_) / max(pm, 1e-3)))) for p_ in
+               (label_pitch if label_pitch is not None else [pm] * iters)]
+    strides = [strides[min(i, len(strides) - 1)] for i in range(iters)]
     movables = [stable_nodes(g, n) for g, n in zip(grids, n_rest)] if labelling else None
     if diag is not None:
         diag["eff_slope"] = eff_slope
@@ -1099,9 +1119,12 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         moves, tot = [], 0
         bbs = [(p.min(0), p.max(0)) if len(p) else None for p in pts]
         for j, (g, n, ok, q) in enumerate(zip(grids, ns, oks, pts)):
-            if not ok.any():
+            sk = strides[it] if labelling else 1
+            qm = ok & grid_stride_mask(ok.shape, sk) if sk > 1 else ok
+            if not qm.any():
                 moves.append(np.zeros(g.shape[:2], np.float32))
                 continue
+            q = g[qm]                    # coarse-to-fine: this pass works on every sk-th node
             qi = q - o
             # other sheets' points that can be within reach: a tree over the whole box per sheet is the slab's
             # cost otherwise
@@ -1110,7 +1133,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             others = [p[((p >= bl) & (p <= bh)).all(-1)] for k, p in enumerate(pts)
                       if k != j and not dup[j, k] and bbs[k] is not None and (bbs[k][0] <= bh).all() and (bbs[k][1] >= bl).all()]
             others = np.concatenate([p for p in others if len(p)] or [np.zeros((0, 3), np.float32)])
-            nn = n[ok]
+            nn = n[qm]
             # a move may not go past half-way to the nearest other sheet on the ray (else far). That sheet moves
             # too, by at most r, so every sheet within 2r + 2 bounds: two neighbours can then never cross
             b2, a2 = ray_neighbours(q, nn, others, 2 * r + 2, lateral=lateral)
@@ -1119,20 +1142,26 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             lo = np.where(np.isfinite(b2), np.maximum(b2 / 2.0, -float(r)), -float(r)).astype(np.float32)
             hi = np.where(np.isfinite(a2), np.minimum(a2 / 2.0, float(r)), float(r)).astype(np.float32)
             if labelling:
+                c_ = caps[j] if sk == 1 else edge_caps(rest[j][::sk, ::sk], eff_slope)
                 dd, conf, nfree = _label_move(
-                    g, ok, qi, nn, rest[j], n_rest[j], caps[j], fades[j], V, W, r, lo, hi, thr, vthr, Tg, thick,
-                    tunit, ct, verso_margin, verso_beta, verso_block, move_prior, pair_weight, slope_excess,
-                    label_sweeps, st, movable=movables[j], far_total=far_total)
+                    g[::sk, ::sk], qm[::sk, ::sk], qi, nn, rest[j][::sk, ::sk], n_rest[j][::sk, ::sk], c_,
+                    fades[j][::sk, ::sk], V, W, r, lo, hi, thr, vthr, Tg, thick, tunit, ct, verso_margin,
+                    verso_beta, verso_block, move_prior, pair_weight / sk ** 3, slope_excess / sk ** 2,
+                    label_sweeps, st, movable=movables[j][::sk, ::sk], far_total=far_total)
+                if sk > 1:   # the coarse displacement, bilinear onto every node (the fixed ones stay)
+                    dd = upsample_field(dd, qm[::sk, ::sk] | (fades[j][::sk, ::sk] < 1.0), g.shape[:2], sk)
+                    dd = np.where(ok & (fades[j] >= 1.0), dd, 0.0).astype(np.float32)
                 st.setdefault("switches_free", 0)
                 st["switches_free"] += nfree
                 if diag is not None and it == 0:
                     diag["switches_free"][j] = nfree
                 moves.append(dd)
-                st["points"] += int(ok.sum())
+                st["points"] += int(qm.sum())
+                st["stride"] = sk
                 tot += len(q)
                 st["with_peak"] += float((conf > 0).sum())
                 st["capped"] += float((np.isfinite(below) | np.isfinite(above)).sum())
-                st["mean_abs_move"] += float(np.abs(dd[ok]).sum())
+                st["mean_abs_move"] += float(np.abs(dd[qm]).sum())
                 st["max_move"] = max(st["max_move"], float(np.abs(dd).max()))
                 if diag is not None and it == 0:
                     diag["first_move"][j] = dd.astype(np.float32)
@@ -1203,10 +1232,18 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 st.setdefault("switches", 0)
                 st["switches"] += slope_violations(((new - rest[j]) * nr).sum(-1), caps[j])
                 st.setdefault("strain_final", []).append(strain(new, rest[j]))
+                ins_ = insides[j] & np.isfinite(new).all(-1)
+                if ins_.any():
+                    st.setdefault("_ridge", [0, 0])
+                    st["_ridge"][0] += int(ridge_at(V, new[ins_] - o, nr[ins_], thr, 2).sum())
+                    st["_ridge"][1] += int(ins_.sum())
             grids[j] = new
         for k in ("with_peak", "mean_abs_move", "capped", "verso_blocked"):
             if k in st:
                 st[k] = st[k] / max(tot, 1)
+        if "_ridge" in st:
+            rr = st.pop("_ridge")
+            st["at_ridge"] = round(rr[0] / max(rr[1], 1), 4)
         for k in ("strain_free", "strain_final"):
             if k in st:
                 st[k] = pct(np.concatenate(st[k]) if st[k] else np.zeros(0))
@@ -2095,6 +2132,7 @@ def run(args):
         args.iters = len(sched) if len(sched) > 1 else 3
     args.far_sched = far_schedule(sched if len(sched) > 1 else sched[0], args.iters)
     args.far = max(args.far_sched)
+    args.label_pitch_list = [float(v) for v in str(getattr(args, "label_pitch", "") or "").split(",") if v.strip()] or None
     o_s, S_s, _ = store_box(args.recto)
     lo, shape = o_s.copy(), S_s.copy()
     if args.z0 is not None:
@@ -2206,7 +2244,7 @@ def run(args):
     first = {x["name"]: [] for x in surf}          # |first-pass move| of core nodes
     diagn = {x["name"]: {"folds": 0, "drift_sum": 0.0, "n": 0, "sp_b": [0.0, 0.0, 0], "sp_a": [0.0, 0.0, 0],
                          "moved_gt30": 0, "no_ridge": 0, "moved": 0, "switches_free": 0, "switches": 0,
-                         "zz": [0, 0], "strain": [], "reverted": 0}
+                         "zz": [0, 0], "zz1": [0, 0], "strain": [], "reverted": 0}
              for x in surf}
     sp_bins = np.linspace(0, 3 * float(args.pitch), 61)
     sp_hist = {"before": np.zeros(60, np.int64), "after": np.zeros(60, np.int64)}
@@ -2277,7 +2315,7 @@ def run(args):
                              dup_gap=args.dup_gap, dup_frac=args.dup_frac, labelling=args.labelling,
                              max_slope=args.max_slope, pair_weight=args.pair_weight, slope_excess=args.slope_excess,
                              label_sweeps=args.label_sweeps, max_strain=args.max_strain, far_total=args.far_total,
-                             ridge_reach=args.ridge_reach, diag=dg, log=None)
+                             ridge_reach=args.ridge_reach, label_pitch=args.label_pitch_list, diag=dg, log=None)
         folds = list(dg.get("folds", [0] * len(g1)))
         Tt = st[-1].get("thickness", args.thickness or 8.0) if st else (args.thickness or 8.0)
         min_gap = max(float(Tt), min_sp)
@@ -2303,19 +2341,19 @@ def run(args):
                 folds[j] += nev
             tp["mesh_opt"] = mh
         ncx = 0
-        for _ in range(3 if args.labelling else 1):
+        for rnd in range(4 if args.labelling else 1):
             g1, nc_, pulled = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0,
                                        return_masks=True)
             ncx += nc_
-            if not args.labelling or not nc_:
-                break
-            for j in range(len(g1)):   # the pulled-back nodes are kept; the slope caps hold around them again
+            if not args.labelling or not nc_ or rnd == 3:
+                break                  # the last word is the no-crossing guard's
+            for j in range(len(g1)):   # the slope caps again around the pulled-back nodes, then re-check
                 if not pulled[j].any():
                     continue
                 nr = np.nan_to_num(n_rest[j])
                 X = ((g1[j] - g0[j]) * nr).sum(-1)
                 inb = np.isfinite(g0[j]).all(-1) & ((g0[j] >= rlo) & (g0[j] < rhi)).all(-1)
-                fx = pulled[j] | ~inb | (box_taper(g0[j], o, s, args.taper) < 1.0) | ~np.isfinite(X)
+                fx = ~inb | (box_taper(g0[j], o, s, args.taper) < 1.0) | ~np.isfinite(X)
                 if holds[j] is not None:
                     fx |= holds[j] > 0
                 Xp, _ = slope_project(X, edge_caps(g0[j], dg.get("eff_slope", args.max_slope)), fx)
@@ -2359,6 +2397,9 @@ def run(args):
             _, zn, zv = zigzag_frac(Xc)
             dn["zz"][0] += zn
             dn["zz"][1] += zv
+            _, zn, zv = zigzag_frac(Xc, tol=1.0)
+            dn["zz1"][0] += zn
+            dn["zz1"][1] += zv
             dn["strain"].append(strain(np.where(core[..., None], b, np.nan), np.where(core[..., None], a, np.nan)))
             tang = (b - a) - dvg[..., None] * np.nan_to_num(n0)
             tk = core & np.isfinite(tang).all(-1)
@@ -2516,6 +2557,7 @@ def run(args):
         mr["sheet_switches_free"] = int(dn["switches_free"])
         mr["sheet_switches"] = int(dn["switches"])
         mr["zigzag"] = round(dn["zz"][0] / max(dn["zz"][1], 1), 4)
+        mr["zigzag_1vox"] = round(dn["zz1"][0] / max(dn["zz1"][1], 1), 4)
         sa = np.concatenate(dn["strain"]) if dn["strain"] else np.zeros(0)
         mr["strain"] = pct(sa)
         for key, nm in (("sp_b", "spacing_before"), ("sp_a", "spacing_after")):
@@ -2566,7 +2608,8 @@ def run(args):
     for k, nm in (("moved_gt30", "moved_gt30"), ("no_ridge", "no_ridge_end"), ("moved", "moved_nodes"),
                   ("switches_free", "sheet_switches_free"), ("switches", "sheet_switches"), ("reverted", "ridge_reverted")):
         tot_mv[nm] = int(sum(diagn[x][k] for x in diagn))
-    tot_mv["zigzag"] = round(sum(diagn[x]["zz"][0] for x in diagn) / max(sum(diagn[x]["zz"][1] for x in diagn), 1), 4)
+    for zk, zn_ in (("zz", "zigzag"), ("zz1", "zigzag_1vox")):
+        tot_mv[zn_] = round(sum(diagn[x][zk][0] for x in diagn) / max(sum(diagn[x][zk][1] for x in diagn), 1), 4)
     sall = [a for x in diagn for a in diagn[x]["strain"]]
     tot_mv["strain"] = pct(np.concatenate(sall) if sall else np.zeros(0))
     tot_mv["no_cross_pulled"] = int(sum(tp.get("no_cross_pulled", 0) for tp in tile_pairs))
@@ -2638,6 +2681,9 @@ def parser():
     ap.add_argument("--pair-weight", type=float, default=0.02, help="quadratic neighbour term inside the cap, per voxel^2")
     ap.add_argument("--slope-excess", type=float, default=2.0, help="labelling cost per voxel beyond the cap")
     ap.add_argument("--label-sweeps", type=int, default=2, help="column/row ICM rounds after the row Viterbi")
+    ap.add_argument("--label-pitch", default="20,20,10,5",
+                    help="coarse-to-fine: the grid pitch (voxels) each pass's labelling works at, one per --far "
+                         "entry (a whole patch shifts to the right wrap on the coarse grid first)")
     ap.add_argument("--far-total", type=float, default=40.0, help="cap on a node's CUMULATIVE move over all passes")
     ap.add_argument("--ridge-reach", type=float, default=2.0,
                     help="a moved node must end within this many voxels of a recto ridge (>= --thr), else it "
