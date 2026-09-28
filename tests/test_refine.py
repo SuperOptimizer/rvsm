@@ -613,3 +613,90 @@ def test_no_cross_pulls_back_a_crossing_pair():
     (a2, b2), k = R.no_cross([lo_, hi_], [a, b], n, R=20.0)
     assert k > 0 and R.pair_stats([lo_, hi_], [a2, b2], n, 4.0, stride=1)["crossings"] == 0
     assert np.allclose(a2[0, 0], a[0, 0])     # untouched away from the crossing
+
+
+# ------------------------------------------------------------------ joint labelling (near-isometry)
+
+def test_slope_project_is_exact_and_keeps_fixed_nodes():
+    rng = np.random.default_rng(0)
+    X = rng.normal(0, 10, (40, 50)).astype(np.float32)
+    X[10:15, 10:15] = np.nan
+    caps = (np.full((39, 50), 2.3, np.float32), np.full((40, 49), 2.3, np.float32))
+    fixed = np.zeros(X.shape, bool)
+    fixed[0] = True
+    X[0] = 0.0
+    assert R.slope_violations(X, caps) > 0
+    Y, left = R.slope_project(X, caps, fixed)
+    assert left == 0 and R.slope_violations(Y, caps) == 0
+    assert np.all(Y[0] == 0) and np.isnan(Y[12, 12])
+
+
+def test_viterbi_rows_is_exact_on_a_small_row():
+    import itertools
+    rng = np.random.default_rng(1)
+    for trial in range(10):
+        U = rng.normal(0, 1, (1, 5, 5)).astype(np.float32)
+        D = rng.normal(0, 0.7, (1, 5)).astype(np.float32)
+        cap = np.full((1, 4), 1.2, np.float32)
+        lab = R._viterbi_rows(U, D, cap, 0.1, 2.0, 4)
+
+        def E(l):
+            e = sum(U[0, i, l[i]] for i in range(5))
+            for i in range(4):
+                k = l[i + 1] - l[i]
+                if abs(k) > 4:
+                    return np.inf
+                e += R._pair_cost(k, D[0, i + 1] - D[0, i], cap[0, i], 0.1, 2.0)
+            return e
+        best = min(itertools.product(range(5), repeat=5), key=E)
+        assert abs(E(best) - E(tuple(lab[0]))) < 1e-4
+
+
+def test_labelling_never_switches_wraps_between_grid_neighbours():
+    """Two wraps 20 voxels apart; the published sheet sits between them, nearer the lower band on its left half
+    and nearer the upper one on its right half. Per node + smoothing: the halves take different wraps and the
+    smoothed step is a steep ramp through empty space (sheet switch). Joint labelling: every edge within the
+    slope cap, the sheet stays on one wrap over most of its length, and the ramp region is short."""
+    shape = (16, 80, 96)
+    V = np.maximum(band_volume(shape, lambda x: 30 + 0 * x, 1.2), band_volume(shape, lambda x: 50 + 0 * x, 1.2))
+    Z, X = np.meshgrid(np.arange(2, 14, 2, dtype=np.float32), np.arange(2, 94, 2, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, np.where(X < 48, 37.0, 43.0), X], -1).astype(np.float32)
+    kw = dict(far=[12, 8], iters=2, sigma=1.0, thr=0.3, taper=0.0)
+    (old,), _ = R.refine_many([g], V, (0, 0, 0), AX_Y, **kw)
+    dg = {}
+    (new,), st = R.refine_many([g], V, (0, 0, 0), AX_Y, labelling=True, diag=dg, **kw)
+    caps = R.edge_caps(g, dg["eff_slope"])
+    Xo = ((old - g) * R.normals(g, AX_Y)).sum(-1)
+    Xn = ((new - g) * R.normals(g, AX_Y)).sum(-1)
+    assert R.slope_violations(Xo, caps) > 0                # the smoothed per-node choice switches
+    assert R.slope_violations(Xn, caps) == 0
+    assert st[0]["switches_free"] > 0 and st[-1]["switches"] == 0
+    y = new[..., 1]
+    on = (np.abs(y - 30) < 1.5) | (np.abs(y - 50) < 1.5)
+    assert on[1:-1, 1:-1].mean() > 0.6, on.mean()
+
+
+def test_labelling_follows_a_tilted_band_and_keeps_the_grid():
+    """A band tilted 0.2 voxel per voxel, the sheet published flat 5 voxels off: the labelled sheet lies on the
+    band (within the slope cap) and its spacing barely changes."""
+    shape = (16, 80, 64)
+    yc = lambda x: 30 + 0.2 * x   # noqa: E731
+    V = band_volume(shape, yc, 1.2)
+    Z, X = np.meshgrid(np.arange(2, 14, 2, dtype=np.float32), np.arange(2, 62, 2, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, yc(X) + 5.0, X], -1).astype(np.float32)
+    (new,), st = R.refine_many([g], V, (0, 0, 0), AX_Y, labelling=True, far=[8, 4], iters=2, sigma=1.0, thr=0.3,
+                               taper=0.0)
+    inner = (slice(1, -1), slice(1, -1))
+    d = np.abs(new[inner][..., 1] - yc(new[inner][..., 2]))
+    assert np.median(d) < 1.0, np.median(d)
+    s = R.strain(new, g)
+    assert np.percentile(s, 90) < 0.05
+
+
+def test_labelling_reverts_moves_that_end_without_a_ridge():
+    """No band anywhere: nothing may move (no node ends away from a ridge)."""
+    V = np.zeros((16, 64, 32), np.float32)
+    g = flat_sheet(30.0)
+    (new,), st = R.refine_many([g], V, (0, 0, 0), AX_Y, labelling=True, far=[8], iters=1, sigma=1.0, thr=0.3,
+                               taper=0.0)
+    assert np.allclose(new, g, atol=1e-4)
