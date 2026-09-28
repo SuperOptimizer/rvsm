@@ -102,6 +102,68 @@ prediction, keeps render3d's drag anchors fixed, and writes the surface back in 
    the final grids are 0 by construction (`tile_pairs.*.no_cross_pulled` counts the nodes it touched).
    Free tangential moves were tried first and random-walked nodes 0.4 voxel sideways.
 
+### Solvers (`--solver cut | label | snap`)
+
+Steps 3-7 above are `--solver snap`, the per-node peak choice plus smoothing. It lets grid neighbours
+5 voxels apart take wraps 20-40 voxels apart, and the smoothing turns that into a zigzag. The user's
+verdict on that strip was: jumps forward and backward, sheet switches, local length doubled.
+
+The two other solvers are near-isometric. Every node still moves only along its original normal, and
+between 4-neighbours `|d_i − d_j| <= spacing × slope`. The slope is min(`--max-slope` 0.5,
+sqrt((1 + `--max-strain` 0.10)² − 1)) = 0.458, so a slope adds at most 10% strain. After every guard,
+`slope_project` restores the caps exactly. It keeps the fixed nodes and takes the mean of the largest
+cap-Lipschitz minorant and the smallest majorant (min-plus on the grid). Hole edges, grid borders and
+seams (`stable_nodes`) get no data term and only follow their neighbours. The box taper zone does not
+move. `--far-total` 40 caps the cumulative move. A node whose placed feature is not real at the end
+goes back toward its published position, as far as the caps allow.
+
+- **`cut`** (default) is the exact optimal-surface solve (Li, Wu, Chen & Sonka 2006) by s-t min cut
+  (PyMaxflow), one grid at a time (`two_surface_cut`). Per node, the recto and verso profiles along its
+  normal are sampled from the stores in world space (no flattened volume). The solve finds a recto depth
+  r and a verso depth w for every node that minimise Σ −log p_recto(r) + Σ −log p_verso(w), under three
+  hard constraints:
+  - the slope caps on r and on w;
+  - t_min <= r − w <= t_max (`--t-min` 6, `--t-max` 28; the verso lies inward, n points verso → recto);
+  - the neighbour-wrap bounds (the whole sheet stays between them).
+
+  The verso's labels are shifted inward by the thickness estimate, so the window covers both faces.
+  Passes are set by `--cut-depths` 24,12,6 and `--cut-steps` 2,1,1. The max-flow time grows steeply with
+  the label count: 12 s for a 200 × 440 grid at 25 labels, minutes at 49.
+
+  `--snap` picks the placement:
+  - `recto`, `verso` and `mid` place the node on r, w or (r + w)/2 of the coupled solve;
+  - `contrast`, `edge` and `ct` solve ONE surface with cost −score, where the score is recto − verso,
+    the steepest rise of the σ=1 smoothed recto − verso, or the CT.
+
+  Per node, the free choice of every mode on the final profile is written to
+  `mode_positions/<surface>.npz`, so the modes can be compared without rerunning.
+- **`label`**: the same caps and unaries on a ladder of integer offsets, solved by semi-global matching
+  plus line-wise ICM (`label_solve`), coarse to fine (`--label-pitch` 20,20,10,5).
+
+On tile 1 of the 2.4 µm strip, the snap solver scores recall@2 0.65 and offset_le3 0.88. Label scores
+0.45 and 0.55, and cut (recto) scores 0.46 and 0.47. But folds drop from 16590 to ~100, moves over 30
+voxels from 17787 to ~30, and strain p90 from 0.48 to 0.10. Projecting the snap result onto the same
+caps drops its on-band fraction from 0.68 to 0.47. So the recall gap IS the switches: the recall
+metrics are measured against the nearest recto ridge, and they reward jumping to whichever wrap is
+nearest.
+
+Per pass, the report gives:
+- `at_ridge`;
+- `both_faces` (a valid recto AND verso at r, w);
+- `thickness_fit` percentiles;
+- switches;
+- folds;
+- strain.
+
+Per surface and pooled, it adds `sheet_switches`, `zigzag` / `zigzag_1vox`, `strain`, `moved_gt30`,
+`no_ridge_end` and `ridge_reverted`.
+
+**Output pitch** (`--write-pitch fine`, the default). The refined tifxyz is the crop of the surface that
+touches the box, at the refinement pitch: every upsampled node, and meta scale × up. `refined.crop_rc`
+and `write_up` record where it sits in the published grid. The `.before` is the same crop, upsampled,
+so `render.py --compare` puts both on one layout. `published` writes the full surface at the published
+pitch with the moved nodes replaced, as before. A whole 3748 × 9740 surface at 4× would be 7 GB.
+
 **Anchors** (`--anchors anchors.jsonl`, render3d's append-only log). The log is replayed (`add` / `del`,
 and a torn last line is ignored), and each record is matched to a surface by its `surface` name (the
 tifxyz dir name, with or without `.tifxyz`, or the segment id). Each surface's anchors become a

@@ -321,7 +321,7 @@ def test_end_to_end_slab_in_the_legacy_frame(tmp_path, has_volcomp):
     rc = R.main(["--recto", rp, "--verso", vp, "--paths", str(tmp_path / "paths"), "--umbilicus", str(umb),
                  "--out", str(out), "--z0", str(o[0] + 32), "--dz", "64", "--legacy-scale", "2.0",
                  "--legacy-offset", "10", "20", "30", "--far", "8", "--sigma-vox", "8", "--thr", "0.3",
-                 "--eval-store", ep, "--slices", "3", "--taper", "4", "--crops", "3", "--crop-montage"])
+                 "--eval-store", ep, "--slices", "3", "--taper", "4", "--crops", "3", "--crop-montage", "--write-pitch", "published", "--solver", "snap"])
     assert rc == 0
     import tifffile
     got = np.stack([tifffile.imread(str(out / "segA-on-20230205180739-7.91um" / f"{c}.tif")) for c in "zyx"], -1)
@@ -412,7 +412,7 @@ def test_tiled_slab_matches_one_tile(tmp_path, has_volcomp):
         assert R.main(["--recto", rp, "--verso", vp, "--paths", str(tmp_path / "paths"), "--umbilicus", str(umb),
                        "--out", str(out), "--z0", str(o[0] + 32), "--dz", "64", "--far", "8", "--sigma-vox", "8",
                        "--thr", "0.3", "--thickness", "8", "--slices", "2", "--taper", "4", "--tile", str(t),
-                       "--no-surface-png"]) == 0
+                       "--no-surface-png", "--write-pitch", "published"]) == 0
         outs[t] = np.stack([tifffile.imread(str(out / "segB-on-20260411134726-2.4um" / f"{c}.tif")) for c in "zyx"], -1)
         rep = json.load(open(out / "refine_report.json"))
         assert len(rep["stats"]) == (1 if t == 0 else 9)
@@ -700,3 +700,81 @@ def test_labelling_reverts_moves_that_end_without_a_ridge():
     (new,), st = R.refine_many([g], V, (0, 0, 0), AX_Y, labelling=True, far=[8], iters=1, sigma=1.0, thr=0.3,
                                taper=0.0)
     assert np.allclose(new, g, atol=1e-4)
+
+
+# ------------------------------------------------------------------ exact coupled surface solve (max-flow)
+
+def test_two_surface_cut_is_exact_on_a_tiny_grid():
+    import itertools
+    pytest.importorskip("maxflow")
+    rng = np.random.default_rng(0)
+    for trial in range(4):
+        Cr, Cw = rng.random((1, 3, 6)), rng.random((1, 3, 6))
+        r, w = R.two_surface_cut(Cr, Cw, (1, 1), 1, 3)
+        best = None
+        for rr in itertools.product(range(6), repeat=3):
+            for ww in itertools.product(range(6), repeat=3):
+                if any(abs(rr[i] - rr[i + 1]) > 1 or abs(ww[i] - ww[i + 1]) > 1 for i in range(2)):
+                    continue
+                if any(not (1 <= rr[i] - ww[i] <= 3) for i in range(3)):
+                    continue
+                e = sum(Cr[0, i, rr[i]] + Cw[0, i, ww[i]] for i in range(3))
+                best = e if best is None else min(best, e)
+        assert abs(sum(Cr[0, i, r[0, i]] + Cw[0, i, w[0, i]] for i in range(3)) - best) < 1e-6
+
+
+def test_cut_solver_puts_a_sheet_on_its_recto_face_with_no_switch():
+    """A sheet (recto band at y 36, its verso 10 voxels inward at 26) and the published surface 6 voxels
+    off: the coupled solve lands the recto on 36 (snap recto) or the mid-sheet on 31 (snap mid), every
+    grid edge within the slope cap."""
+    pytest.importorskip("maxflow")
+    shape = (16, 80, 40)
+    Vr = band_volume(shape, lambda x: 36 + 0 * x, 1.2)
+    Vv = band_volume(shape, lambda x: 26 + 0 * x, 1.2)
+    g = flat_sheet(42.0, x=(2, 38))
+    for snap, want in (("recto", 36.0), ("mid", 31.0)):
+        dg = {}
+        (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, T=10.0, cut=True, snap=snap,
+                                   cut_depths=(12, 6), cut_steps=(1, 1), t_min=4, t_max=16, taper=0.0,
+                                   sigma=1.0, thr=0.3, diag=dg)
+        inner = new[2:-2, 2:-2, 1]
+        assert abs(np.median(inner) - want) <= 1.0, (snap, np.median(inner))
+        X = ((new - g) * R.normals(g, AX_Y)).sum(-1)
+        assert R.slope_violations(X, R.edge_caps(g, dg["eff_slope"])) == 0
+    assert st[0]["both_faces"] > 0.5
+
+
+def test_fine_write_pitch_writes_every_refined_node(tmp_path, has_volcomp):
+    """--write-pitch fine (the default): the refined tifxyz is the crop at the refinement pitch, (h-1)*up+1 rows,
+    meta scale x up with crop_rc / write_up, and the .before is the same crop upsampled."""
+    if not has_volcomp:
+        pytest.skip("volcomp not available")
+    import tifffile
+
+    from rvsm import stores
+    o = np.array([128, 256, 384])
+    z, y, x = np.mgrid[:128, :128, :128].astype(np.float32)
+    yc = 60 + 0.1 * x
+    rp, vp = str(tmp_path / "recto.zarr"), str(tmp_path / "verso.zarr")
+    stores.write(rp, stores.u8(np.exp(-0.5 * ((y - yc) / 1.5) ** 2)), o, q=0)
+    stores.write(vp, stores.u8(np.exp(-0.5 * ((y - (yc - 8)) / 1.5) ** 2)), o, q=0)
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": -20000, "x": 448}, {"z": 1000, "y": -20000, "x": 448}]}))
+    g = slanted_grid(H=34, W=22, step=6.0)
+    g[..., 1] = o[1] + 60 + 0.1 * (g[..., 2] - o[2]) + 3.0
+    write_tifxyz_raw(str(tmp_path / "paths" / "segB" / "segB-on-20260411134726-2.4um.tifxyz"), g)
+    out = tmp_path / "out"
+    assert R.main(["--recto", rp, "--verso", vp, "--paths", str(tmp_path / "paths"), "--umbilicus", str(umb),
+                   "--out", str(out), "--z0", str(o[0] + 32), "--dz", "64", "--pitch", "3", "--thr", "0.3",
+                   "--thickness", "8", "--slices", "2", "--taper", "4", "--no-surface-png"]) == 0
+    d = out / "segB-on-20260411134726-2.4um"
+    meta = json.load(open(d / "meta.json"))
+    up = meta["refined"]["write_up"]
+    assert up >= 2
+    r0, c0 = meta["refined"]["crop_rc"]
+    fz = tifffile.imread(str(d / "z.tif"))
+    bz = tifffile.imread(str(out / "segB-on-20260411134726-2.4um.before" / "z.tif"))
+    assert fz.shape == bz.shape and (fz.shape[0] - 1) % up == 0 and (fz.shape[1] - 1) % up == 0
+    fy = tifffile.imread(str(d / "y.tif"))
+    by = tifffile.imread(str(out / "segB-on-20260411134726-2.4um.before" / "y.tif"))
+    assert (np.abs(fy - by) > 0.5).sum() > 50                 # nodes between the published ones moved too

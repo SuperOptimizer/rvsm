@@ -901,6 +901,192 @@ def spacing(g):
     return np.concatenate(out) if out else np.zeros(0, np.float32)
 
 
+def _offset_structure(off):
+    """A PyMaxflow grid structure with a single 1 at `off` from its centre."""
+    shp = tuple(2 * abs(int(v)) + 1 for v in off)
+    st = np.zeros(shp)
+    st[tuple(abs(int(v)) + int(v) for v in off)] = 1
+    return st
+
+
+def two_surface_cut(Cr, Cw, dz, t_min=0, t_max=0, big=1e9):
+    """EXACT joint optimum of two coupled terrain-like surfaces over an (H,W) grid (Li, Wu, Chen & Sonka 2006,
+    'Optimal surface segmentation in volumetric images'; one minimum closed set by s-t min cut): per node a
+    recto index r and a verso index w in 0..Z-1 along its normal, minimising sum Cr[r] + sum Cw[w] under
+    |r_i - r_j| <= dz[0] (grid axis 0 neighbours) and <= dz[1] (axis 1), |w_i - w_j| likewise, and
+    t_min <= r - w <= t_max (the verso lies one sheet thickness inward, n points verso -> recto).
+    Cr, Cw: (H,W,Z) float costs; Cw None = ONE surface (r only; returns (r, None)). Z <= ~25: the max-flow
+    time grows steeply with the depth range (a 200 x 440 grid: 12 s at Z 25, minutes at Z 49).
+    Returns (r, w) (H,W) int indices."""
+    import maxflow
+    H, Wd, Z = Cr.shape
+    one = Cw is None
+    C = (Cr[None] if one else np.stack([Cw, Cr])).transpose(0, 3, 1, 2).astype(np.float64)   # (verso, recto; Z,H,W)
+    if not one:   # the ends of the range: t_min <= r - w <= t_max must fit in 0..Z-1 (either may be < 0 when
+        a, b = int(t_min), int(t_max)   # the verso's labels are shifted, see _cut_move)
+        if a > 0:
+            C[0, max(Z - a, 0):] += 1e4     # w <= Z-1-a
+            C[1, :min(a, Z)] += 1e4         # r >= a
+        if b < 0:
+            C[0, :min(-b, Z)] += 1e4        # w >= -b
+            C[1, max(Z + b, 0):] += 1e4     # r <= Z-1+b
+    # the bottom node of every column is always in the closed set: it is not a graph node at all (node k of
+    # the graph = depth k + 1), so arcs into depth <= 0 are simply absent and no big bottom weight is needed
+    wgt = C[:, 1:] - C[:, :-1]
+    g = maxflow.Graph[float]()
+    ids = g.add_grid_nodes(wgt.shape)
+    g.add_grid_edges(ids, weights=big, structure=_offset_structure((0, -1, 0, 0)), symmetric=False)
+    for dh, dw, k in ((1, 0, 0), (-1, 0, 0), (0, 1, 1), (0, -1, 1)):
+        d_ = int(max(dz[k], 0))
+        g.add_grid_edges(ids, weights=big, structure=_offset_structure((0, -d_, dh, dw)), symmetric=False)
+    if not one:   # verso at >= z  =>  recto at >= z + t_min;  recto at >= z  =>  verso at >= z - t_max
+        g.add_grid_edges(ids, weights=big, structure=_offset_structure((1, int(t_min), 0, 0)), symmetric=False)
+        g.add_grid_edges(ids, weights=big, structure=_offset_structure((-1, -int(t_max), 0, 0)), symmetric=False)
+    g.add_grid_tedges(ids, np.maximum(-wgt, 0), np.maximum(wgt, 0))
+    g.maxflow()
+    idx = (~g.get_grid_segments(ids)).sum(1)                             # nodes above the bottom in the set
+    del g
+    if one:
+        return np.clip(idx[0], 0, Z - 1), None
+    return np.clip(idx[1], 0, Z - 1), np.clip(idx[0], 0, Z - 1)
+
+
+SNAP_MODES = ("recto", "verso", "mid", "contrast", "edge", "ct")
+
+
+def mode_scores(Sr, Sw, Sc=None, sigma=1.0):
+    """Per snap mode the score along the normal profile (L,n) (higher = better), from the recto, verso (and CT)
+    profiles in [0,1]: recto, verso, contrast = recto - verso, edge = d/ds of the sigma-smoothed recto - verso
+    (n points verso -> recto, so the verso -> recto face transition rises along +s), ct."""
+    from scipy.ndimage import gaussian_filter1d
+    out = {"recto": Sr}
+    if Sw is not None:
+        f = Sr - Sw
+        out.update(verso=Sw, contrast=f, edge=np.gradient(gaussian_filter1d(f, sigma, axis=0), axis=0))
+    if Sc is not None:
+        out["ct"] = Sc
+    return out
+
+
+def mode_positions(Sr, Sw, Sc=None, far=None):
+    """Per node the free (per-node, unconstrained) choice of every snap mode: offsets (n,) along the normal of
+    the profile's argmax (mid = the mean of the recto and verso argmaxes). NaN where a mode has no data."""
+    L = Sr.shape[0]
+    far = (L - 1) // 2 if far is None else far
+    sc = mode_scores(Sr, Sw, Sc)
+    out = {k: (v.argmax(0) - far).astype(np.float32) for k, v in sc.items()}
+    if "verso" in out:
+        out["mid"] = 0.5 * (out["recto"] + out["verso"])
+    return out
+
+
+def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, hi, thr, vthr, snap, t_min,
+              t_max, T_est, far_total, movable, st, lo_w=None):
+    """One grid's move for one pass of the exact surface solve (`two_surface_cut`): per node the recto, verso
+    (and CT) profiles along its original normal over -D..D, every `step` voxels; the snap mode picks the
+    costs and the placement:
+
+        recto / verso / mid   coupled recto + verso surfaces (-log p each), t_min <= r - w <= t_max; the node
+                              goes to r / w / (r + w) / 2
+        contrast / edge / ct  ONE surface with cost -score (mode_scores)
+
+    Hard slope caps between grid neighbours (per axis, the median cap in whole steps), the neighbour-wrap
+    bounds (the sheet between lo and hi) and --far-total as forbidden labels. Returns (dd (H,W), conf (n,),
+    valid (H,W): the node's placed feature is real -- recto >= thr for recto/mid, verso >= vthr for
+    verso/mid, recto - verso >= thr/2 for contrast, a rising face with a recto ridge within 4 voxels in front
+    for edge; always for ct)."""
+    H, Wd = g.shape[:2]
+    ts = np.arange(-D, D + 1, step, dtype=np.float32)
+    Z = len(ts)
+    BIGC = np.float32(1e3)
+    nr = np.nan_to_num(n_rest)
+    Dcur = np.nan_to_num(((g - rest) * nr).sum(-1)).astype(np.float32)
+    Sr = profile(V, qi, nn, D)
+    Sw = profile(W, qi, nn, D) if W is not None else None
+    # the verso of a recto at depth d lies near d - T: its labels are the recto's shifted inward by `shift`
+    Tm = float(np.clip(T_est if np.isfinite(T_est) else 0.5 * (t_min + t_max), t_min, t_max))
+    shift = int(round(Tm / step)) * step
+    Sws = profile(W, qi, nn, D + shift)[:2 * D + 1] if W is not None else None     # depths -D-shift .. D-shift
+    Sc = profile(CTV, qi, nn, D) if (CTV is not None and snap == "ct") else None
+    sub = np.round((ts + D)).astype(np.int64)
+    coupled = snap in ("recto", "verso", "mid") and Sw is not None
+    ii = np.nonzero(ok)
+    Dq = Dcur[ok]
+    forbid_far = np.abs(Dq[None] + ts[:, None]) > far_total + 1e-3 if far_total is not None else np.zeros((Z, len(Dq)), bool)
+    lo_, hi_ = lo[None], hi[None]
+    if coupled:
+        cr = -np.log(np.clip(Sr[sub], 1e-3, 1.0))
+        cw = -np.log(np.clip(Sws[sub], 1e-3, 1.0))
+        tw = ts - shift
+        forbid_w = np.abs(Dq[None] + tw[:, None]) > far_total + t_max + 1e-3 if far_total is not None else forbid_far
+        cr = np.where((ts[:, None] > hi_ + 1e-3) | forbid_far, cr + BIGC, cr)     # the whole sheet [w, r]
+        lw = lo_ if lo_w is None else lo_w[None]      # the verso: only a real neighbour below bounds it
+        cw = np.where((tw[:, None] < lw - 1e-3) | forbid_w, cw + BIGC, cw)        # stays inside the bounds
+    else:
+        sc = mode_scores(Sr, Sw, Sc)[snap][sub]
+        cr = -sc / max(float(np.abs(sc).max()), 1e-6)
+        cr = np.where((ts[:, None] < lo_ - 1e-3) | (ts[:, None] > hi_ + 1e-3) | forbid_far, cr + BIGC, cr)
+        cw = None
+    Cr = np.zeros((H, Wd, Z), np.float32)
+    Cr[ii] = cr.T
+    Cw = None
+    if coupled:
+        Cw = np.zeros((H, Wd, Z), np.float32)
+        Cw[ii] = cw.T
+    if movable is not None:   # hole edges / borders / seams: no data, they follow their neighbours
+        bl = ok & ~movable
+        Cr[bl] = 0.0
+        if Cw is not None:
+            Cw[bl] = 0.0
+    # fixed columns (outside the tile's box, the taper zone): the PLACED surface stays where it is
+    fx = ~ok | (fade < 1.0)
+    c0 = int(np.argmin(np.abs(ts)))
+    tstep_min, tstep_max = int(np.ceil(t_min / step)), int(np.floor(t_max / step))
+    half = int(np.clip(round(0.5 * (T_est if np.isfinite(T_est) else 0.5 * (t_min + t_max)) / step),
+                       tstep_min / 2, tstep_max / 2))
+    pin = {"recto": ("r", c0), "verso": ("w", c0), "mid": ("r", min(c0 + half, Z - 1))}.get(snap, ("r", c0))
+    tgt = Cr if (pin[0] == "r" or Cw is None) else Cw
+    tgt[fx] = BIGC
+    tgt[fx, pin[1]] = 0.0
+    dz = []
+    for c in caps:
+        m = float(np.nanmedian(c)) if np.isfinite(c).any() else step
+        dz.append(max(1, int(np.floor(m / step + 1e-6))))
+    r_i, w_i = two_surface_cut(Cr, Cw, dz, int(np.ceil((t_min - shift) / step)), int(np.floor((t_max - shift) / step)))
+    r = ts[r_i]
+    w = ts[w_i] - shift if w_i is not None else None
+    if snap == "verso" and coupled:
+        place = w
+    elif snap == "mid" and coupled:
+        place = 0.5 * (r + w)
+    else:
+        place = r
+    dd = np.where(ok & (fade >= 1.0), place, 0.0).astype(np.float32)
+    # validity of the placed feature, and the diagnostics
+    rq = np.clip(np.round(r[ii] + D).astype(np.int64), 0, 2 * D)
+    pr = np.take_along_axis(Sr, rq[None], 0)[0]
+    valid = np.zeros((H, Wd), bool)
+    if coupled:
+        wq = np.clip(np.round(w[ii] + shift + D).astype(np.int64), 0, 2 * D)
+        pw = np.take_along_axis(Sws, wq[None], 0)[0]
+        both = (pr >= thr) & (pw >= vthr)
+        st.setdefault("_both", [0, 0])
+        st["_both"][0] += int(both.sum())
+        st["_both"][1] += int(len(both))
+        st.setdefault("_thick", []).append((r - w)[ii].astype(np.float32))
+        v = {"recto": pr >= thr, "verso": pw >= vthr, "mid": both}[snap]
+    elif snap == "contrast":
+        v = (pr - np.take_along_axis(Sw, rq[None], 0)[0]) >= 0.5 * thr
+    elif snap == "edge":
+        win = np.stack([np.take_along_axis(Sr, np.clip(rq + k, 0, 2 * D)[None], 0)[0] for k in range(0, 5)])
+        v = win.max(0) >= thr
+    else:
+        v = np.ones(len(rq), bool)
+    valid[ii] = v
+    conf = np.where(v, 1.0, 0.0).astype(np.float32)
+    return dd, conf, valid
+
+
 def upsample_field(f, valid, shape, s):
     """An (h,w) field on every s-th node (valid mask) bilinearly onto the full (H,W) grid (normalised, so a
     hole or a missing coarse node does not pull toward 0)."""
@@ -1003,8 +1189,9 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 holds=None, taper=0.0, box=None, sigma_final=None, local_normal=False, relax=0.5, relax_iters=2,
                 guard=True, min_spacing=None, peak_tol=0.15, reparam_on=False, dup_gap=None, dup_frac=0.4,
                 labelling=False, max_slope=0.5, pair_weight=0.02, slope_excess=2.0, label_sweeps=2,
-                max_strain=0.10, move_prior=0.002, far_total=40.0, ridge_reach=2.0, label_pitch=None, diag=None,
-                log=None):
+                max_strain=0.10, move_prior=0.002, far_total=40.0, ridge_reach=2.0, label_pitch=None, cut=False,
+                snap="recto", cut_depths=(24, 12, 6), cut_steps=(2, 1, 1), t_min=6.0, t_max=28.0, ctv=None,
+                diag=None, log=None):
     """Joint refinement of several (H,W,3) zyx grids (NaN = hole) against V, a (Z,Y,X) probability (float in
     [0,1] or uint8) at `origin`. Each iteration, for every node: the peaks along its normal ray within
     far[it] and the other sheets on that ray are matched in order (assign()); the matched peak's offset is
@@ -1038,6 +1225,9 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     o = np.asarray(origin, np.float32)
     grids = [g.copy() for g in grids]
     rest = [g.copy() for g in grids]
+    if cut:   # the exact surface solve: one pass per (depth, step)
+        iters = len(cut_depths)
+        far = list(cut_depths)
     radii = far_schedule(far, iters)
     rmax = max(radii) if radii else 3
     size = np.array(V.shape, np.float32)
@@ -1065,11 +1255,13 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     # the slope cap also caps the strain a slope adds: a flat edge of length s whose ends differ by d is
     # sqrt(s^2 + d^2) long, so max_strain allows d <= s sqrt((1 + max_strain)^2 - 1) (0.458 s at 10%)
     eff_slope = max_slope if max_strain is None else min(max_slope, float(np.sqrt((1 + max_strain) ** 2 - 1)))
-    caps = [edge_caps(g, eff_slope) for g in grids] if labelling else None
+    iso = labelling or cut
+    caps = [edge_caps(g, eff_slope) for g in grids] if iso else None
     strides = [max(1, int(round(float(p_) / max(pm, 1e-3)))) for p_ in
                (label_pitch if label_pitch is not None else [pm] * iters)]
     strides = [strides[min(i, len(strides) - 1)] for i in range(iters)]
-    movables = [stable_nodes(g, n) for g, n in zip(grids, n_rest)] if labelling else None
+    movables = [stable_nodes(g, n) for g, n in zip(grids, n_rest)] if iso else None
+    last_valid = [np.zeros(g.shape[:2], bool) for g in grids] if cut else None
     if diag is not None:
         diag["eff_slope"] = eff_slope
     if dgap is None:   # the duplicate gap, from the adjacent-wrap spacing on the recto
@@ -1141,6 +1333,23 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             above = np.where(np.abs(a2) <= r, a2, np.nan).astype(np.float32)
             lo = np.where(np.isfinite(b2), np.maximum(b2 / 2.0, -float(r)), -float(r)).astype(np.float32)
             hi = np.where(np.isfinite(a2), np.minimum(a2 / 2.0, float(r)), float(r)).astype(np.float32)
+            if cut:
+                dd, conf, vmask = _cut_move(
+                    g, qm, qi, nn, rest[j], n_rest[j], caps[j], fades[j], V, W, ctv, int(r),
+                    int(cut_steps[min(it, len(cut_steps) - 1)]), lo, hi, thr, vthr, snap, t_min, t_max,
+                    float(Tg) if Tg is not None else float("nan"), far_total, movables[j], st,
+                    lo_w=np.where(np.isfinite(b2), b2 / 2.0, -np.inf).astype(np.float32))
+                last_valid[j] = vmask
+                moves.append(dd)
+                st["points"] += int(qm.sum())
+                tot += len(q)
+                st["with_peak"] += float((conf > 0).sum())
+                st["capped"] += float((np.isfinite(below) | np.isfinite(above)).sum())
+                st["mean_abs_move"] += float(np.abs(dd[qm]).sum())
+                st["max_move"] = max(st["max_move"], float(np.abs(dd).max()))
+                if diag is not None and it == 0:
+                    diag["first_move"][j] = dd.astype(np.float32)
+                continue
             if labelling:
                 c_ = caps[j] if sk == 1 else edge_caps(rest[j][::sk, ::sk], eff_slope)
                 dd, conf, nfree = _label_move(
@@ -1213,17 +1422,17 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 new = reparam(new, rest[j], fades[j].astype(np.float32))
             if relax and relax > 0:   # in the refined surface's own tangent plane: nodes stay on it
                 wr = (relax * fades[j] * (np.isfinite(g).all(-1))).astype(np.float32)
-                if labelling:   # the fixed nodes stay exactly where they are
+                if iso:   # the fixed nodes stay exactly where they are
                     wr = wr * (fades[j] >= 1.0)
                 new = relax_tangential(new, np.nan_to_num(normals(new, ax)), wr, relax_iters, P0=rest[j])
-            if labelling:
+            if iso:
                 st.setdefault("strain_free", []).append(strain(new, rest[j]))
             if guard:
                 new, nev = fold_guard(g, new, rest[j], n_rest[j], min_sps[j])
                 st["folds"] += nev
                 if diag is not None:
                     diag["folds"][j] += nev
-            if labelling:   # the guards pull nodes back one by one: the slope caps hold again, exactly
+            if iso:   # the guards pull nodes back one by one: the slope caps hold again, exactly
                 nr = np.nan_to_num(n_rest[j])
                 X = ((new - rest[j]) * nr).sum(-1)
                 fixed = ~(insides[j] & (fades[j] >= 1.0)) | ~np.isfinite(X)
@@ -1241,6 +1450,13 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         for k in ("with_peak", "mean_abs_move", "capped", "verso_blocked"):
             if k in st:
                 st[k] = st[k] / max(tot, 1)
+        if "_both" in st:
+            b_ = st.pop("_both")
+            st["both_faces"] = round(b_[0] / max(b_[1], 1), 4)
+        if "_thick" in st:
+            th_ = np.concatenate(st.pop("_thick"))
+            st["thickness_fit"] = {q_: round(float(np.percentile(th_, v_)), 2) for q_, v_ in
+                                   (("p10", 10), ("p50", 50), ("p90", 90))} if len(th_) else None
         if "_ridge" in st:
             rr = st.pop("_ridge")
             st["at_ridge"] = round(rr[0] / max(rr[1], 1), 4)
@@ -1250,7 +1466,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         stats.append(st)
         if log:
             log(json.dumps(st))
-    if labelling and ridge_reach:   # a node that ends with no ridge goes back to where it was published,
+    if iso and ridge_reach:   # a node that ends with no ridge goes back to where it was published,
         rv = {"reverted": 0, "no_ridge_left": 0}   # as far as its neighbours' slope caps allow
         for j, g in enumerate(grids):
             nr = np.nan_to_num(n_rest[j])
@@ -1259,7 +1475,10 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             if not cand.any():
                 continue
             okr = np.zeros(g.shape[:2], bool)
-            okr[cand] = ridge_at(V, g[cand] - o, nr[cand], thr, int(np.ceil(ridge_reach)))
+            if cut:   # the placed feature of the last pass (recto / verso / both / contrast / face)
+                okr = last_valid[j].copy()
+            else:
+                okr[cand] = ridge_at(V, g[cand] - o, nr[cand], thr, int(np.ceil(ridge_reach)))
             bad = cand & ~okr
             if not bad.any():
                 continue
@@ -1267,7 +1486,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             Xp, _ = slope_project(X0, caps[j], ~bad | ~np.isfinite(X))
             grids[j] = g + np.nan_to_num(Xp - X)[..., None] * nr
             left = bad & (np.abs(Xp) > 0.5)
-            if left.any():
+            if left.any() and not cut:
                 left[left] = ~ridge_at(V, grids[j][left] - o, nr[left], thr, int(np.ceil(ridge_reach)))
             rv["reverted"] += int(bad.sum())
             rv["no_ridge_left"] += int(left.sum())
@@ -2133,6 +2352,10 @@ def run(args):
     args.far_sched = far_schedule(sched if len(sched) > 1 else sched[0], args.iters)
     args.far = max(args.far_sched)
     args.label_pitch_list = [float(v) for v in str(getattr(args, "label_pitch", "") or "").split(",") if v.strip()] or None
+    args.labelling = args.solver == "label"
+    args.iso = args.solver in ("label", "cut")
+    args.cut_depths_list = [int(float(v)) for v in str(args.cut_depths).split(",") if v.strip()]
+    args.cut_steps_list = [int(float(v)) for v in str(args.cut_steps).split(",") if v.strip()]
     o_s, S_s, _ = store_box(args.recto)
     lo, shape = o_s.copy(), S_s.copy()
     if args.z0 is not None:
@@ -2285,6 +2508,7 @@ def run(args):
         W = read_box(args.verso, rlo, rs) if args.verso else None
         thick = read_box(args.thickness_store, rlo, rs) if args.thickness_store else None
         ct_mask = read_ct(ct, rlo, rs) if (ct and args.ct_mask) else None
+        ctv = read_ct(ct, rlo, rs) if (ct and args.solver == "cut" and args.snap == "ct") else None
         holds, g0 = [], []
         for pz in pieces:
             x = surf[pz["si"]]
@@ -2315,7 +2539,10 @@ def run(args):
                              dup_gap=args.dup_gap, dup_frac=args.dup_frac, labelling=args.labelling,
                              max_slope=args.max_slope, pair_weight=args.pair_weight, slope_excess=args.slope_excess,
                              label_sweeps=args.label_sweeps, max_strain=args.max_strain, far_total=args.far_total,
-                             ridge_reach=args.ridge_reach, label_pitch=args.label_pitch_list, diag=dg, log=None)
+                             ridge_reach=args.ridge_reach, label_pitch=args.label_pitch_list,
+                             cut=args.solver == "cut", snap=args.snap, cut_depths=args.cut_depths_list,
+                             cut_steps=args.cut_steps_list, t_min=args.t_min, t_max=args.t_max, ctv=ctv,
+                             diag=dg, log=None)
         folds = list(dg.get("folds", [0] * len(g1)))
         Tt = st[-1].get("thickness", args.thickness or 8.0) if st else (args.thickness or 8.0)
         min_gap = max(float(Tt), min_sp)
@@ -2341,11 +2568,11 @@ def run(args):
                 folds[j] += nev
             tp["mesh_opt"] = mh
         ncx = 0
-        for rnd in range(4 if args.labelling else 1):
+        for rnd in range(4 if args.iso else 1):
             g1, nc_, pulled = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0,
                                        return_masks=True)
             ncx += nc_
-            if not args.labelling or not nc_ or rnd == 3:
+            if not args.iso or not nc_ or rnd == 3:
                 break                  # the last word is the no-crossing guard's
             for j in range(len(g1)):   # the slope caps again around the pulled-back nodes, then re-check
                 if not pulled[j].any():
@@ -2378,6 +2605,20 @@ def run(args):
             x["own_r"].append((rr + pz["r0"]).astype(np.int32))
             x["own_c"].append((cc + pz["c0"]).astype(np.int32))
             x["own_v"].append(b[::up, ::up][cn].astype(np.float32))
+            if args.write_pitch == "fine":   # every refined node at the refinement pitch
+                rf, cf = np.nonzero(core & np.isfinite(b).all(-1))
+                x.setdefault("own_f", []).append(((rf + pz["r0"] * up).astype(np.int32), (cf + pz["c0"] * up).astype(np.int32),
+                                                  b[rf, cf].astype(np.float32), a[rf, cf].astype(np.float32)))
+            if args.solver == "cut":        # the free per-node choice of every snap mode, for comparisons
+                n0m = normals(a, ax)
+                kk = core & np.isfinite(b).all(-1) & np.isfinite(n0m).all(-1)
+                if kk.any():
+                    qq, nq = b[kk] - rlo, np.nan_to_num(n0m)[kk]
+                    Dm = 24
+                    mp = mode_positions(profile(V, qq, nq, Dm), profile(W, qq, nq, Dm) if W is not None else None,
+                                        profile(ctv, qq, nq, Dm) if ctv is not None else None, Dm)
+                    x.setdefault("modes", []).append((b[kk].astype(np.float32), nq.astype(np.float16),
+                                                      {k: v.astype(np.float16) for k, v in mp.items()}))
             n0 = normals(a, ax)
             dvg = ((b - a) * np.nan_to_num(n0)).sum(-1)
             moves[x["name"]].append(dvg[core].astype(np.float32))
@@ -2449,7 +2690,7 @@ def run(args):
                 for arr, c in ((V, 0), (W, 1)):
                     if arr is not None:
                         canv[z][c][np.ix_(sy, sx)] = arr[zi][np.ix_(iy[sy] - rlo[1], ix[sx] - rlo[2])]
-        del V, W, thick, Ve, ct_mask, g0, g1, pieces
+        del V, W, thick, Ve, ct_mask, ctv, g0, g1, pieces
 
     # ---- write: one full published grid in memory at a time
     os.makedirs(args.out, exist_ok=True)
@@ -2465,11 +2706,37 @@ def run(args):
                 "joint_with": len(surf), "frame": x["frame"].name, "anchors": bool(anchors.get(surf.index(x))),
                 "tile": tile, "halo": halo}
         src = E.read_surface(x["dir"])
-        full = write_back(src, x["rc"], 1, x["crop"], new, x["frame"], inplace=True)
-        del src, new
-        copy_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), {"unrefined_input": True})
-        write_tifxyz(x["dir"], os.path.join(args.out, x["name"]), full, note)
-        del full
+        if args.write_pitch == "fine":   # the crop that touches the box, at the refinement pitch
+            up = int(x["up"])
+            r0c, c0c = x["rc"]
+            h, w = x["crop"].shape[:2]
+            fine = upsample(src[r0c:r0c + h, c0c:c0c + w], up)
+            before = fine.copy()
+            for rf, cf, nv, ov in x.pop("own_f", []):
+                ok_ = (rf < fine.shape[0]) & (cf < fine.shape[1])
+                rf, cf, nv, ov = rf[ok_], cf[ok_], nv[ok_], ov[ok_]
+                mv = np.isfinite(fine[rf, cf]).all(-1) & (np.abs(nv - ov) > 1e-3).any(-1)
+                fine[rf[mv], cf[mv]] += x["frame"].to_src(nv[mv]) - x["frame"].to_src(ov[mv])
+            meta_x = {"crop_rc": [int(r0c), int(c0c)], "write_up": up, "write_pitch": "fine",
+                      "source_grid_shape": list(src.shape[:2])}
+            del src, new
+            write_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), before,
+                         {"unrefined_input": True, **meta_x}, up=up)
+            write_tifxyz(x["dir"], os.path.join(args.out, x["name"]), fine, {**note, **meta_x}, up=up)
+            del fine, before
+        else:
+            full = write_back(src, x["rc"], 1, x["crop"], new, x["frame"], inplace=True)
+            del src, new
+            copy_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), {"unrefined_input": True})
+            write_tifxyz(x["dir"], os.path.join(args.out, x["name"]), full, note)
+            del full
+        if x.get("modes"):
+            md = os.path.join(args.out, "mode_positions")
+            os.makedirs(md, exist_ok=True)
+            ms = x.pop("modes")
+            np.savez_compressed(os.path.join(md, x["name"] + ".npz"), zyx=np.concatenate([m[0] for m in ms]),
+                                normal=np.concatenate([m[1] for m in ms]),
+                                **{k: np.concatenate([m[2][k] for m in ms]) for k in ms[0][2]})
         log(json.dumps({"wrote": os.path.join(args.out, x["name"]), "mean_abs_move": float(np.abs(dv).mean()) if len(dv) else 0.0,
                         "p95_abs_move": float(np.percentile(np.abs(dv), 95)) if len(dv) else 0.0}))
 
@@ -2671,9 +2938,22 @@ def parser():
                          "wrap (they snap to one band, they do not bound each other); default --dup-frac x the "
                          "wrap spacing measured on the recto per tile")
     ap.add_argument("--dup-frac", type=float, default=0.4)
-    ap.add_argument("--labelling", action=argparse.BooleanOptionalAction, default=True,
-                    help="joint labelling of the per-node offsets with a hard slope cap between grid neighbours "
-                         "(near-isometry: no sheet switches, no zigzag); --no-labelling = per-node assign + smoothing")
+    ap.add_argument("--solver", choices=("cut", "label", "snap"), default="cut",
+                    help="cut: the EXACT coupled recto/verso surface solve by max-flow over each grid (hard slope "
+                         "caps, thickness coupling; two_surface_cut); label: joint labelling (SGM + line ICM) with the "
+                         "slope cap; snap: the per-node peak choice + smoothing (the 83cf73c refiner)")
+    ap.add_argument("--snap", choices=SNAP_MODES, default="recto",
+                    help="(--solver cut) what the surface is placed on along the normal profile: recto / verso / "
+                         "mid (the coupled solve's r, w or (r+w)/2), contrast (max recto - verso), edge (steepest "
+                         "rise of recto - verso), ct (max CT)")
+    ap.add_argument("--cut-depths", default="24,12,6", help="(--solver cut) depth half-range per pass, voxels")
+    ap.add_argument("--cut-steps", default="2,1,1", help="(--solver cut) depth step per pass, voxels")
+    ap.add_argument("--t-min", type=float, default=6.0, help="(--solver cut) sheet thickness bounds, voxels")
+    ap.add_argument("--t-max", type=float, default=28.0)
+    ap.add_argument("--write-pitch", choices=("fine", "published"), default="fine",
+                    help="fine: the refined tifxyz is the crop of the surface that touches the box, at the "
+                         "refinement pitch (every upsampled node; meta crop_rc / write_up); published: the full "
+                         "surface at its published pitch with the moved nodes replaced")
     ap.add_argument("--max-slope", type=float, default=0.5,
                     help="largest |displacement difference| of two grid neighbours per voxel of their spacing")
     ap.add_argument("--max-strain", type=float, default=0.10,
