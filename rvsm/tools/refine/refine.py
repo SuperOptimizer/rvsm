@@ -292,7 +292,9 @@ def pair_stats(grids_ref, grids_now, ns, min_gap, R=None, lateral=None, stride=3
     if not Ps or not sum(len(x) for x in Ps):
         return {"pairs": 0, "under_min": 0, "crossings": 0}
     P, Rr, N, G, Qm = (np.concatenate(x) for x in (Ps, Rs, Ns, G, Qm))
-    lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_now])))
+    # the pairs are found on the published grids, with the published pitch -- exactly as `no_cross` finds
+    # them (the refined pitch here let 4 pairs of the strip be counted that the guard never saw)
+    lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_ref])))
     R = float(R) if R is not None else 2.0 * max(float(min_gap), float(dup_gap)) + 8.0
     if dup is not None:
         i, j = sheet_pairs(Rr, N, G, R, lat, qmask=Qm, dup=dup)
@@ -357,6 +359,30 @@ def thickness_from_peaks(pos, stren, vpos, vstren, tmin=TMIN, tmax=TMAX):
     gap = np.where((gap >= tmin) & (gap <= tmax), gap, np.inf).min(0)
     g = gap[ok & np.isfinite(gap)]
     return float(np.median(g)) if len(g) else float("nan")
+
+
+def verso_lag(V, W, q, n, reach=30, max_lag=24):
+    """Where the verso lies relative to the recto along n: the lag (voxels) that maximises the mean
+    cross-correlation of the demeaned recto and verso profiles sampled along n at q (index frame of V/W), and
+    that correlation normalised to [-1, 1]. lag > 0: the verso lies along +n of the recto (outward, for
+    outward normals). (nan, nan) without points."""
+    if not len(q):
+        return float("nan"), float("nan")
+    a = profile(V, q, n, reach)
+    b = profile(W, q, n, reach)
+    a = a - a.mean(0, keepdims=True)
+    b = b - b.mean(0, keepdims=True)
+    L = a.shape[0]
+    best, bl = -np.inf, float("nan")
+    na = float(np.sqrt((a * a).mean() * (b * b).mean()))
+    for k in range(-int(max_lag), int(max_lag) + 1):
+        lo_, hi_ = max(0, -k), min(L, L - k)
+        if hi_ - lo_ < 8:
+            continue
+        c = float((a[lo_:hi_] * b[lo_ + k:hi_ + k]).mean())
+        if c > best:
+            best, bl = c, float(k)
+    return bl, (best / na if na > 0 else float("nan"))
 
 
 # ============================================================================================ grids
@@ -496,9 +522,30 @@ def filled(g, sigma=1.0):
 
 
 def normals(g, ax):
-    """Hole-tolerant unit normals oriented outward from the axis (VERSO -> RECTO): computed on the filled grid."""
-    n = E._normals_raw(filled(g), ax)
-    return np.where(np.isfinite(g).all(-1)[..., None], n, np.nan)
+    """Hole-tolerant unit normals oriented outward from the axis, ONE sign per connected piece of the grid.
+
+    The grid's own normal (cross of its two tangents, on the hole-filled grid) is continuous along the sheet;
+    it is flipped as a whole, per 4-connected component of valid nodes, so that it points outward on
+    (weighted) majority. evalsurf's per-node test (dot(n, radial) >= 0) flips single nodes wherever the sheet
+    runs nearly perpendicular to the radial direction (normal close to the scroll axis): neighbours then
+    move in opposite directions and the grid folds -- 91% of the strip's final folds sat within 3 nodes of
+    such a per-node flip (docs/refine.md, "Folds")."""
+    from scipy.ndimage import label
+    f = filled(g)
+    ok = np.isfinite(g).all(-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        n = np.cross(np.gradient(f, axis=0), np.gradient(f, axis=1)) if min(g.shape[:2]) >= 2 else np.full(g.shape, np.nan)
+        n = n / np.linalg.norm(n, axis=-1, keepdims=True)
+    ok &= np.isfinite(n).all(-1)
+    if ok.any():
+        cy, cx = np.interp(f[..., 0], ax[0], ax[1]), np.interp(f[..., 0], ax[0], ax[2])
+        r = np.stack([np.zeros_like(cy), f[..., 1] - cy, f[..., 2] - cx], -1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            c = np.nan_to_num((n * r).sum(-1) / np.linalg.norm(r, axis=-1))
+        lab, k = label(ok)
+        vote = np.bincount(lab.ravel(), weights=np.where(ok, c, 0.0).ravel(), minlength=k + 1)
+        n = n * np.where(vote[lab] < 0, -1.0, 1.0)[..., None]
+    return np.where(ok[..., None], n, np.nan).astype(np.float32)
 
 
 def box_taper(g, origin, size, taper):
@@ -872,9 +919,10 @@ def bad_nodes(P, P0, n0, min_sp):
     return bad
 
 
-def fold_guard(P_prev, P_new, P0, n0, min_sp, steps=4, max_strain=None):
+def fold_guard(P_prev, P_new, P0, n0, min_sp, steps=4, max_strain=None, return_mask=False):
     """P_prev + t * (P_new - P_prev) with t = 1, except at nodes that fold or bunch (`bad_nodes`): their t is
-    halved up to `steps` times, then 0 (the previous position, which passed). Returns (P, n pulled-back nodes)."""
+    halved up to `steps` times, then 0 (the previous position, which passed). Returns (P, n pulled-back nodes)
+    (and with return_mask the (H,W) mask of those nodes)."""
     D = np.nan_to_num(P_new - P_prev)
     t = np.ones(P_prev.shape[:2], np.float32)
     ev = np.zeros(P_prev.shape[:2], bool)
@@ -889,7 +937,8 @@ def fold_guard(P_prev, P_new, P0, n0, min_sp, steps=4, max_strain=None):
         ev |= bad
         t[bad] = 0.0 if s >= steps else t[bad] * 0.5
     P = P_prev + t[..., None] * D
-    return np.where(np.isfinite(P_new).all(-1)[..., None], P, np.nan).astype(np.float32), int(ev.sum())
+    P = np.where(np.isfinite(P_new).all(-1)[..., None], P, np.nan).astype(np.float32)
+    return (P, int(ev.sum()), ev) if return_mask else (P, int(ev.sum()))
 
 
 def spacing(g):
@@ -899,6 +948,16 @@ def spacing(g):
         d = np.linalg.norm(np.diff(g, axis=ax_), axis=-1)
         out.append(d[np.isfinite(d)])
     return np.concatenate(out) if out else np.zeros(0, np.float32)
+
+
+def require_maxflow():
+    """PyMaxflow, or a loud failure with the install hint (`--solver cut`, the default, needs it)."""
+    try:
+        import maxflow
+    except ImportError as e:
+        raise ImportError("rvsm refine --solver cut needs PyMaxflow: pip install 'rvsm[refine]' (or "
+                          "`uv pip install PyMaxflow`); --solver label runs without it") from e
+    return maxflow
 
 
 def _offset_structure(off):
@@ -918,7 +977,7 @@ def two_surface_cut(Cr, Cw, dz, t_min=0, t_max=0, big=1e9):
     Cr, Cw: (H,W,Z) float costs; Cw None = ONE surface (r only; returns (r, None)). Z <= ~25: the max-flow
     time grows steeply with the depth range (a 200 x 440 grid: 12 s at Z 25, minutes at Z 49).
     Returns (r, w) (H,W) int indices."""
-    import maxflow
+    maxflow = require_maxflow()
     H, Wd, Z = Cr.shape
     one = Cw is None
     C = (Cr[None] if one else np.stack([Cw, Cr])).transpose(0, 3, 1, 2).astype(np.float64)   # (verso, recto; Z,H,W)
@@ -981,7 +1040,8 @@ def mode_positions(Sr, Sw, Sc=None, far=None):
 
 
 def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, hi, thr, vthr, snap, t_min,
-              t_max, T_est, far_total, movable, st, lo_w=None, hi_r=None):
+              t_max, T_est, far_total, movable, st, lo_w=None, hi_r=None, info=None, ridge_reach=2.0,
+              revert_thr=None):
     """One grid's move for one pass of the exact surface solve (`two_surface_cut`): per node the recto, verso
     (and CT) profiles along its original normal over -D..D, every `step` voxels; the snap mode picks the
     costs and the placement:
@@ -1021,7 +1081,16 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
     if coupled:
         Rf, Wf = profile(V, qi, nn, R_), profile(W, qi, nn, R_)          # depths -R_ .. R_
         cr = -np.log(np.clip(Rf[np.round(tr + R_).astype(np.int64)], 1e-3, 1.0))
-        cw = -np.log(np.clip(Wf[np.round(tw + R_).astype(np.int64)], 1e-3, 1.0))
+        Ww = Wf[np.round(tw + R_).astype(np.int64)]
+        cw = -np.log(np.clip(Ww, 1e-3, 1.0))
+        # graceful degradation: a column whose verso window holds no verso face (nothing >= vthr) gets a FLAT
+        # verso cost -- its verso is free within the thickness bounds, so a recto-only column is neither
+        # penalised nor pulled toward whatever faint verso noise the -log would otherwise amplify
+        w_have = Ww.max(0) >= vthr
+        cw = np.where(w_have[None], cw, 0.0)
+        st.setdefault("_w_have", [0, 0])
+        st["_w_have"][0] += int(w_have.sum())
+        st["_w_have"][1] += int(len(w_have))
         if far_total is not None:
             fr_ = np.abs(Dq[None] + tr[:, None]) > far_total + 1e-3
             fw_ = np.abs(Dq[None] + tw[:, None]) > far_total + t_max + 1e-3
@@ -1098,7 +1167,73 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
         v = np.ones(len(rq), bool)
     valid[ii] = v
     conf = np.where(v, 1.0, 0.0).astype(np.float32)
+    if info is not None and coupled and snap == "recto":
+        _cut_info(info, ii, (H, Wd), r[ii], v, Rf, R_, thr, ridge_reach, revert_thr, movable, lo, hi_r, Dq,
+                  far_total, D, Cr, dz, Rf_at=lambda rr: np.take_along_axis(
+                      Rf, np.clip(np.round(rr + R_).astype(np.int64), 0, 2 * R_)[None], 0)[0], tr=tr)
     return dd, conf, valid
+
+
+REVERT_CATS = ("nonmovable", "no_peak", "weak_peak", "near_miss", "peak_past_neighbour", "held_by_coupling",
+               "held_by_slope", "peak_past_window")
+
+
+def _cut_info(info, ii, shape, r, v, Rf, R_, thr, reach, revert_thr, movable, lo, hi_r, Dq, far_total, D, Cr, dz,
+              Rf_at, tr):
+    """The last pass's per-node diagnostics for the no-ridge revert (snap recto, coupled): why a node's placed
+    recto r is not on a ridge (pr < thr at the placed label), as one of REVERT_CATS (codes 1..8, 0 = on a
+    ridge), and `soft` = a recto >= revert_thr within +-reach of r (the revert's own test).
+
+        nonmovable          a hole edge / grid border / seam node: no data term, it follows its neighbours
+        no_peak             no recto >= thr/2 anywhere within +-8 voxels of r
+        weak_peak           the recto near r peaks between thr/2 and thr
+        near_miss           a recto >= thr within +-reach of r, just not at the rounded label
+        peak_past_neighbour a recto >= thr within +-8 of r, but past the neighbour-wrap bound or --far-total
+        peak_past_window    ... past the last pass's search window (+-D of the node) instead
+        held_by_coupling    the recto-only solve (same caps and bounds, no verso) does put it on a ridge
+        held_by_slope       the rest: the slope caps hold it off the ridge its neighbours do not share"""
+    H, Wd = shape
+    n = len(r)
+    rt = float(revert_thr if revert_thr is not None else 0.5 * thr)
+    ks = np.arange(-8, 9, dtype=np.float32)
+    near8 = np.stack([Rf_at(r + k) for k in ks])                        # (17, n)
+    kr = np.abs(ks) <= reach
+    soft = near8[kr].max(0) >= rt
+    cat = np.zeros(n, np.int8)
+    bad = ~v
+    mov = movable[ii] if movable is not None else np.ones(n, bool)
+    cat[bad & ~mov] = 1
+    m8 = near8.max(0)
+    rest = bad & mov
+    cat[rest & (m8 < 0.5 * thr)] = 2
+    cat[rest & (m8 >= 0.5 * thr) & (m8 < thr)] = 3
+    rest &= m8 >= thr
+    cat[rest & (near8[kr].max(0) >= thr)] = 4
+    rest &= near8[kr].max(0) < thr
+    if rest.any():   # where is the nearest >= thr sample, and may the solve go there?
+        pos = r[None] + ks[:, None]
+        dist = np.where(near8 >= thr, np.abs(ks)[:, None], np.inf)
+        pk = np.take_along_axis(pos, dist.argmin(0)[None], 0)[0]
+        hb = hi_r if hi_r is not None else np.full(n, np.inf, np.float32)
+        oob = (pk > hb + 1e-3) | (pk < lo - 1e-3)
+        if far_total is not None:
+            oob |= np.abs(Dq + pk) > far_total + 1e-3
+        cat[rest & oob] = 5
+        rest &= ~oob
+        pw = (pk > D) | (pk < -D)
+        cat[rest & pw] = 8
+        rest &= ~pw
+    if rest.any():   # the recto-only solve under the same caps and bounds: does it reach a ridge there?
+        r1, _ = two_surface_cut(Cr, None, dz)
+        r1v = tr[r1[ii]]
+        on1 = Rf_at(r1v) >= thr
+        cat[rest & on1] = 6
+        cat[rest & ~on1] = 7
+    C = np.zeros((H, Wd), np.int8)
+    S = np.zeros((H, Wd), bool)
+    C[ii] = cat
+    S[ii] = soft
+    info["cat"], info["soft"] = C, S
 
 
 def upsample_field(f, valid, shape, s):
@@ -1205,7 +1340,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 labelling=False, max_slope=0.5, pair_weight=0.02, slope_excess=2.0, label_sweeps=2,
                 max_strain=0.10, move_prior=0.002, far_total=40.0, ridge_reach=2.0, label_pitch=None, cut=False,
                 snap="recto", cut_depths=(24, 12, 6), cut_steps=(2, 1, 1), t_min=6.0, t_max=28.0, ctv=None,
-                diag=None, log=None):
+                verso_side="auto", revert_thr=None, revert_support=0.5, revert_sigma=2.0, diag=None, log=None):
     """Joint refinement of several (H,W,3) zyx grids (NaN = hole) against V, a (Z,Y,X) probability (float in
     [0,1] or uint8) at `origin`. Each iteration, for every node: the peaks along its normal ray within
     far[it] and the other sheets on that ray are matched in order (assign()); the matched peak's offset is
@@ -1259,6 +1394,28 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     lateral = max(3.0, 0.75 * pm)
     min_sps = [float(min_spacing) if min_spacing is not None else 0.4 * (p if np.isfinite(p) else pm) for p in pit]
     n_rest = [normals(g, ax) for g in grids]
+    # the side the verso lies on: export.SIGN_CONVENTION says inward (n points verso -> recto, radially
+    # outward), but on PHerc Paris 4 both the student's and the recto teacher's verso lie ~10 voxels OUTWARD of
+    # the recto. Measured (or given), and every solver below works in the frame where n points verso -> recto
+    vside = verso_side if W is not None else "inward"
+    if W is not None:
+        oks_ = [np.isfinite(g).all(-1) & np.isfinite(n).all(-1) & (np.isfinite(g).all(-1) & (g >= o).all(-1) &
+                                                                    (g <= o + np.array(V.shape) - 1).all(-1))
+                for g, n in zip(grids, n_rest)]
+        q_ = np.concatenate([g[k] for g, k in zip(grids, oks_) if k.any()] or [np.zeros((0, 3), np.float32)])
+        n_ = np.concatenate([n[k] for n, k in zip(n_rest, oks_) if k.any()] or [np.zeros((0, 3), np.float32)])
+        sub_ = np.linspace(0, len(q_) - 1, min(len(q_), 30_000)).astype(np.int64) if len(q_) else np.zeros(0, np.int64)
+        lag, corr = verso_lag(V, W, q_[sub_] - o, n_[sub_])
+        if vside == "auto":
+            vside = "outward" if (np.isfinite(lag) and lag >= TMIN and corr > 0.05) else "inward"
+        if diag is not None:
+            diag["verso_lag"] = None if not np.isfinite(lag) else float(lag)
+            diag["verso_corr"] = None if not np.isfinite(corr) else round(float(corr), 4)
+    if diag is not None:
+        diag["verso_side"] = vside
+    vsign = -1.0 if vside == "outward" else 1.0
+    if vsign < 0:
+        n_rest = [-n for n in n_rest]
     tunit = THICK_UNIT if thick is not None and thick.dtype == np.uint8 else 1.0
     Tg = None if T is None else float(T)
     dgap = None if dup_gap is None else float(dup_gap)
@@ -1276,6 +1433,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     strides = [strides[min(i, len(strides) - 1)] for i in range(iters)]
     movables = [stable_nodes(g, n) for g, n in zip(grids, n_rest)] if iso else None
     last_valid = [np.zeros(g.shape[:2], bool) for g in grids] if cut else None
+    last_info = [{} for _ in grids] if cut else None
     if diag is not None:
         diag["eff_slope"] = eff_slope
     if dgap is None:   # the duplicate gap, from the adjacent-wrap spacing on the recto
@@ -1303,7 +1461,7 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         if W is not None:
             st["verso_blocked"] = 0.0
         if local_normal:
-            ns = [normals(g, ax) for g in grids]
+            ns = [vsign * normals(g, ax) for g in grids]
         else:   # the published normals, masked to the cells that are still points
             ns = [np.where(np.isfinite(g).all(-1)[..., None], n, np.nan) for g, n in zip(grids, n_rest)]
         sig_it = sigmas_f if it == iters - 1 else sigmas
@@ -1353,7 +1511,8 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                     int(cut_steps[min(it, len(cut_steps) - 1)]), lo, hi, thr, vthr, snap, t_min, t_max,
                     float(Tg) if Tg is not None else float("nan"), far_total, movables[j], st,
                     lo_w=np.where(np.isfinite(b2), b2 / 2.0, -np.inf).astype(np.float32),
-                    hi_r=np.where(np.isfinite(a2), a2 / 2.0, np.inf).astype(np.float32))
+                    hi_r=np.where(np.isfinite(a2), a2 / 2.0, np.inf).astype(np.float32),
+                    info=last_info[j] if it == iters - 1 else None, ridge_reach=ridge_reach, revert_thr=revert_thr)
                 last_valid[j] = vmask
                 moves.append(dd)
                 st["points"] += int(qm.sum())
@@ -1443,10 +1602,12 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             if iso:
                 st.setdefault("strain_free", []).append(strain(new, rest[j]))
             if guard:
-                new, nev = fold_guard(g, new, rest[j], n_rest[j], min_sps[j])
+                new, nev, fm = fold_guard(g, new, rest[j], n_rest[j], min_sps[j], return_mask=True)
                 st["folds"] += nev
                 if diag is not None:
                     diag["folds"][j] += nev
+                    fmk = diag.setdefault("fold_mask", [None] * len(grids))
+                    fmk[j] = fm if fmk[j] is None else (fmk[j] | fm)
             if iso:   # the guards pull nodes back one by one: the slope caps hold again, exactly
                 nr = np.nan_to_num(n_rest[j])
                 X = ((new - rest[j]) * nr).sum(-1)
@@ -1468,6 +1629,9 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         if "_both" in st:
             b_ = st.pop("_both")
             st["both_faces"] = round(b_[0] / max(b_[1], 1), 4)
+        if "_w_have" in st:
+            b_ = st.pop("_w_have")
+            st["verso_in_window"] = round(b_[0] / max(b_[1], 1), 4)
         if "_thick" in st:
             th_ = np.concatenate(st.pop("_thick"))
             st["thickness_fit"] = {q_: round(float(np.percentile(th_, v_)), 2) for q_, v_ in
@@ -1490,11 +1654,34 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             if not cand.any():
                 continue
             okr = np.zeros(g.shape[:2], bool)
-            if cut:   # the placed feature of the last pass (recto / verso / both / contrast / face)
+            inf_ = last_info[j] if cut else {}
+            if cut and "soft" in inf_:   # snap recto: a ridge >= revert_thr within ridge_reach of the placed recto,
+                okr = inf_["soft"].copy()   # or a node inside a ridge-backed neighbourhood: the slope-consistent
+                if revert_support is not None and revert_support > 0:   # interpolation of its neighbours stands
+                    from scipy.ndimage import gaussian_filter
+                    base = (insides[j] & np.isfinite(X)).astype(np.float32)
+                    sup = gaussian_filter((okr & (base > 0)).astype(np.float32), revert_sigma) / \
+                        np.maximum(gaussian_filter(base, revert_sigma), 1e-6)
+                    okr |= sup >= revert_support
+                cat = inf_["cat"]
+                old_bad = cand & (cat > 0)
+                rv.setdefault("candidates", 0)
+                rv["candidates"] += int(cand.sum())
+                rv.setdefault("no_ridge_placed", 0)
+                rv["no_ridge_placed"] += int(old_bad.sum())
+                for ci, cn in enumerate(REVERT_CATS, 1):
+                    rv.setdefault("why", {}).setdefault(cn, 0)
+                    rv["why"][cn] += int((old_bad & (cat == ci)).sum())
+                if diag is not None:
+                    diag.setdefault("revert_cand", [None] * len(grids))[j] = cand
+                    diag.setdefault("revert_cat", [None] * len(grids))[j] = np.where(cand, cat, 0).astype(np.int8)
+            elif cut:   # the placed feature of the last pass (verso / both / contrast / face)
                 okr = last_valid[j].copy()
             else:
                 okr[cand] = ridge_at(V, g[cand] - o, nr[cand], thr, int(np.ceil(ridge_reach)))
             bad = cand & ~okr
+            if diag is not None:
+                diag.setdefault("revert_mask", [None] * len(grids))[j] = bad
             if not bad.any():
                 continue
             X0 = np.where(bad, 0.0, X)
@@ -2371,6 +2558,11 @@ def run(args):
     args.iso = args.solver in ("label", "cut")
     args.cut_depths_list = [int(float(v)) for v in str(args.cut_depths).split(",") if v.strip()]
     args.cut_steps_list = [int(float(v)) for v in str(args.cut_steps).split(",") if v.strip()]
+    if args.solver == "cut":
+        try:
+            require_maxflow()
+        except ImportError as e:
+            raise SystemExit(f"ERROR: {e}")
     o_s, S_s, _ = store_box(args.recto)
     lo, shape = o_s.copy(), S_s.copy()
     if args.z0 is not None:
@@ -2466,6 +2658,11 @@ def run(args):
     tile = int(args.tile) if args.tile and args.tile > 0 else int(max(shape[1], shape[2]))
     rpad = int(args.far) + 4                     # the snap samples +-far around a halo point
     circ = not args.eval_store or os.path.abspath(args.eval_store) == os.path.abspath(args.recto)
+    if not circ:
+        eval_o, eval_s, _ = store_box(args.eval_store)
+        eval_o, eval_s = eval_o.astype(np.float32), eval_s.astype(np.float32)
+        log(json.dumps({"eval_store": args.eval_store, "eval_box": [*eval_o.tolist(), *eval_s.tolist()],
+                        "note": "metrics count only points inside the eval store's box (16 voxels in)"}))
     if circ:
         log("WARNING: metrics below are measured on the SAME store the surfaces were refined against -- the "
             "gain is circular. Pass --eval-store with a different store (another teacher / the student) for "
@@ -2482,8 +2679,26 @@ def run(args):
     first = {x["name"]: [] for x in surf}          # |first-pass move| of core nodes
     diagn = {x["name"]: {"folds": 0, "drift_sum": 0.0, "n": 0, "sp_b": [0.0, 0.0, 0], "sp_a": [0.0, 0.0, 0],
                          "moved_gt30": 0, "no_ridge": 0, "moved": 0, "switches_free": 0, "switches": 0,
-                         "zz": [0, 0], "zz1": [0, 0], "strain": [], "reverted": 0}
+                         "zz": [0, 0], "zz1": [0, 0], "strain": [], "reverted": 0, "revert_cand": 0,
+                         "why": {c: 0 for c in REVERT_CATS}, "folds_final": 0}
              for x in surf}
+    # fold diagnostics: where the fold-guard events are (docs/refine.md, "Folds")
+    seam_y = sorted({int(y) for y in range(int(lo[1]), int(lo[1] + shape[1]), max(int(args.tile), 1) if args.tile else int(shape[1]))} - {int(lo[1])})
+    seam_x = sorted({int(x) for x in range(int(lo[2]), int(lo[2] + shape[2]), max(int(args.tile), 1) if args.tile else int(shape[2]))} - {int(lo[2])})
+    FBINS = [0, 8, 16, 32, 64, 160, np.inf]
+    fdiag = {"seam": np.zeros(len(FBINS) - 1, np.int64), "seam_nodes": np.zeros(len(FBINS) - 1, np.int64),
+             "hole": np.zeros(len(FBINS) - 1, np.int64), "hole_nodes": np.zeros(len(FBINS) - 1, np.int64),
+             "face": np.zeros(len(FBINS) - 1, np.int64), "radial_cos_lt03": 0, "radial_cos_lt03_nodes": 0,
+             "final_seam": np.zeros(len(FBINS) - 1, np.int64)}
+    fold_canv = {}
+    bf_acc = []
+
+    def seam_dist(p_):
+        d = np.full(len(p_), np.inf)
+        for sv, k in ((seam_y, 1), (seam_x, 2)):
+            if sv:
+                d = np.minimum(d, np.abs(p_[:, k:k + 1] - np.asarray(sv, np.float64)[None]).min(1))
+        return d
     sp_bins = np.linspace(0, 3 * float(args.pitch), 61)
     sp_hist = {"before": np.zeros(60, np.int64), "after": np.zeros(60, np.int64)}
     tile_pairs = []
@@ -2557,14 +2772,22 @@ def run(args):
                              ridge_reach=args.ridge_reach, label_pitch=args.label_pitch_list,
                              cut=args.solver == "cut", snap=args.snap, cut_depths=args.cut_depths_list,
                              cut_steps=args.cut_steps_list, t_min=args.t_min, t_max=args.t_max, ctv=ctv,
-                             diag=dg, log=None)
+                             verso_side=args.verso_side, revert_thr=args.revert_thr,
+                             revert_support=args.revert_support, diag=dg, log=None)
+        if W is not None and args.verso_side == "auto" and dg.get("verso_side"):
+            args.verso_side = dg["verso_side"]   # measured once, on the first tile: every tile uses the same side
+            log(json.dumps({"verso_side": args.verso_side, "verso_lag": dg.get("verso_lag"),
+                            "verso_corr": dg.get("verso_corr"), "measured_on_tile": ti + 1}))
         folds = list(dg.get("folds", [0] * len(g1)))
+        if st:
+            bf_acc.append((st[-1].get("both_faces"), st[-1].get("verso_in_window"), st[-1].get("points", 0)))
         Tt = st[-1].get("thickness", args.thickness or 8.0) if st else (args.thickness or 8.0)
         min_gap = max(float(Tt), min_sp)
         n_rest = [normals(g, ax) for g in g0]
         dgap = float(dg.get("dup_gap", min_sp))
         tp = {"tile": ti + 1, "min_gap": round(min_gap, 3), "dup_gap": round(dgap, 3),
-              "wrap_spacing": dg.get("wrap_spacing"),
+              "wrap_spacing": dg.get("wrap_spacing"), "verso_side": dg.get("verso_side"),
+              "verso_lag": dg.get("verso_lag"), "verso_corr": dg.get("verso_corr"),
               "published": pair_stats(g0, g0, n_rest, min_gap, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0),
               "snap": pair_stats(g0, g1, n_rest, min_gap, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0)}
         if args.mesh_opt:
@@ -2608,6 +2831,9 @@ def run(args):
                         **{k: v for k, v in st[-1].items() if k != "iter"}, "folds_total": int(sum(folds)),
                         "pairs": {k: v for k, v in tp.items() if k not in ("tile",)}}))
         Ve = V if circ else read_box(args.eval_store, rlo, rs)
+        if not circ:   # metrics only where the eval store has data (its box, 16 voxels in: the profiles)
+            e_lo = np.maximum(eval_o + 16, o)
+            e_hi = np.minimum(eval_o + eval_s - 16, o + s)
         for pi_, (pz, b) in enumerate(zip(pieces, g1)):
             x, a, up = surf[pz["si"]], pz["pub"], surf[pz["si"]]["up"]
             ina = np.isfinite(a).all(-1) & ((a >= o) & (a < o + s)).all(-1)
@@ -2640,7 +2866,35 @@ def run(args):
             dn = diagn[x["name"]]
             if "first_move" in dg:
                 first[x["name"]].append(np.abs(dg["first_move"][pi_][core]).astype(np.float32))
-            dn["folds"] += int(folds[pi_])
+            fmk = dg.get("fold_mask", [None] * len(g1))[pi_]
+            fcore = (fmk & core) if fmk is not None else np.zeros(core.shape, bool)
+            dn["folds"] += int(fcore.sum())   # core nodes the fold guard pulled back (a piece's halo is another tile's core)
+            ffin = bad_nodes(b, a, n0, min_sp) & core
+            dn["folds_final"] += int(ffin.sum())
+            from scipy.ndimage import distance_transform_edt
+            pc = a[core]
+            hd = distance_transform_edt(np.isfinite(a).all(-1))
+            fdiag["seam_nodes"] += np.histogram(seam_dist(pc), FBINS)[0]
+            fdiag["hole_nodes"] += np.histogram(hd[core], FBINS)[0]
+            cy_, cx_ = np.interp(a[..., 0], ax[0], ax[1]), np.interp(a[..., 0], ax[0], ax[2])
+            rr_ = np.stack([np.zeros_like(cy_), a[..., 1] - cy_, a[..., 2] - cx_], -1)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                rc_ = np.abs((np.nan_to_num(n0) * rr_).sum(-1) / np.linalg.norm(rr_, axis=-1))
+            fdiag["radial_cos_lt03_nodes"] += int((core & (rc_ < 0.3)).sum())
+            if fcore.any():
+                pf = a[fcore]
+                fdiag["seam"] += np.histogram(seam_dist(pf), FBINS)[0]
+                fdiag["hole"] += np.histogram(hd[fcore], FBINS)[0]
+                fdiag["face"] += np.histogram(np.minimum(pf[:, 1:] - o[1:], o[1:] + s[1:] - 1 - pf[:, 1:]).min(1), FBINS)[0]
+                fdiag["radial_cos_lt03"] += int((fcore & (rc_ < 0.3)).sum())
+            if ffin.any():
+                fdiag["final_seam"] += np.histogram(seam_dist(a[ffin]), FBINS)[0]
+            fc = fold_canv.setdefault(x["name"], np.zeros(cshape + (3,), np.uint8))
+            for msk, col in ((core, (70, 70, 70)), (fcore, (255, 40, 40)), (ffin, (255, 200, 0))):
+                if msk.any():
+                    iyx = ((a[msk][:, 1:] - ext_lo) // pstride).astype(np.int64)
+                    iyx = np.clip(iyx, 0, np.array(cshape) - 1)
+                    fc[iyx[:, 0], iyx[:, 1]] = col
             Xc = np.where(core, dvg, np.nan)
             mvd = core & np.isfinite(dvg) & (np.abs(dvg) > 0.5)
             dn["moved"] += int(mvd.sum())
@@ -2648,7 +2902,14 @@ def run(args):
             if mvd.any():
                 dn["no_ridge"] += int((~ridge_at(V, b[mvd] - rlo, np.nan_to_num(n0)[mvd], args.thr, 2)).sum())
             dn["switches_free"] += int(dg.get("switches_free", [0] * len(g1))[pi_])
-            dn["reverted"] += int(dg.get("reverted", [0] * len(g1))[pi_])
+            rvm = dg.get("revert_mask", [None] * len(g1))[pi_]
+            dn["reverted"] += int((rvm & core).sum()) if rvm is not None else 0
+            rcm = dg.get("revert_cand", [None] * len(g1))[pi_]
+            if rcm is not None:
+                dn["revert_cand"] += int((rcm & core).sum())
+                rct = dg["revert_cat"][pi_]
+                for ci, cn in enumerate(REVERT_CATS, 1):
+                    dn["why"][cn] += int(((rct == ci) & core).sum())
             dn["switches"] += slope_violations(Xc, edge_caps(a, dg.get("eff_slope", args.max_slope)))
             _, zn, zv = zigzag_frac(Xc)
             dn["zz"][0] += zn
@@ -2691,8 +2952,11 @@ def run(args):
                         keep = (mid[:, 0] >= cy0) & (mid[:, 0] < cy1) & (mid[:, 1] >= cx0) & (mid[:, 1] < cx1)
                         if keep.any():
                             dst[z].append(sg[keep])
+            mcore = core
+            if not circ:
+                mcore = core & ((a >= e_lo) & (a < e_hi)).all(-1) & ((b >= e_lo) & (b < e_hi)).all(-1)
             for nm, g in (("before", a), ("after", b)):
-                mm = surface_metrics(Ve, rlo, g, ax, thr=args.thr, mask=core)
+                mm = surface_metrics(Ve, rlo, g, ax, thr=args.thr, mask=mcore)
                 if mm.get("n_points", 0):
                     met[x["name"]][nm].append(mm)
         # the slab pictures' recto/verso planes, filled from this tile's core
@@ -2759,6 +3023,17 @@ def run(args):
     png = args.png_dir or os.path.join(args.out, "png")
     os.makedirs(png, exist_ok=True)
     hist_png(os.path.join(png, "displacement_hist.png"), moves, args.far)
+    from PIL import Image
+    for nm, fc in fold_canv.items():   # yx map per surface: gray = core nodes, red = fold-guard events, yellow = final
+        im = fc.copy()                  # folds, blue = tile seams
+        for sv, k in ((seam_y, 0), (seam_x, 1)):
+            for v_ in sv:
+                i_ = int((v_ - ext_lo[k]) // pstride)
+                if 0 <= i_ < im.shape[k]:
+                    line = im[i_] if k == 0 else im[:, i_]
+                    line[line.sum(-1) == 0] = (40, 110, 255)
+        Image.fromarray(im).save(os.path.join(png, f"folds_{nm}.png"))
+    fold_canv.clear()
     spacing_png(os.path.join(png, "spacing_hist.png"), sp_bins, sp_hist, float(args.pitch))
     ct_cache = {}
 
@@ -2836,6 +3111,10 @@ def run(args):
         mr["no_ridge_end"] = int(dn["no_ridge"])
         mr["moved_nodes"] = int(dn["moved"])
         mr["ridge_reverted"] = int(dn["reverted"])
+        mr["revert_candidates"] = int(dn["revert_cand"])
+        mr["reverted_frac"] = round(dn["reverted"] / max(dn["revert_cand"], 1), 4) if dn["revert_cand"] else None
+        mr["no_ridge_why"] = dict(dn["why"])
+        mr["folds_final"] = int(dn["folds_final"])
         mr["sheet_switches_free"] = int(dn["switches_free"])
         mr["sheet_switches"] = int(dn["switches"])
         mr["zigzag"] = round(dn["zz"][0] / max(dn["zz"][1], 1), 4)
@@ -2895,6 +3174,30 @@ def run(args):
     sall = [a for x in diagn for a in diagn[x]["strain"]]
     tot_mv["strain"] = pct(np.concatenate(sall) if sall else np.zeros(0))
     tot_mv["no_cross_pulled"] = int(sum(tp.get("no_cross_pulled", 0) for tp in tile_pairs))
+    tot_mv["folds_final"] = int(sum(diagn[x]["folds_final"] for x in diagn))
+    tot_mv["revert_candidates"] = int(sum(diagn[x]["revert_cand"] for x in diagn))
+    tot_mv["reverted_frac"] = round(tot_mv["ridge_reverted"] / max(tot_mv["revert_candidates"], 1), 4) \
+        if tot_mv["revert_candidates"] else None
+    why = {c: int(sum(diagn[x]["why"][c] for x in diagn)) for c in REVERT_CATS}
+    tot_mv["no_ridge_why"] = {**why, "total": int(sum(why.values()))}
+    for k_, i_ in (("both_faces", 0), ("verso_in_window", 1)):
+        v_ = [(b_[i_], b_[2]) for b_ in bf_acc if b_[i_] is not None]
+        tot_mv[k_] = round(sum(a_ * w_ for a_, w_ in v_) / max(sum(w_ for _, w_ in v_), 1), 4) if v_ else None
+    tot_mv["verso_side"] = args.verso_side if args.verso else None
+    bl = [f"{FBINS[i]:g}-{FBINS[i + 1]:g}" for i in range(len(FBINS) - 1)]
+    tot_mv["fold_locations"] = {
+        "what": "core nodes the fold guard pulled back (events) and folded nodes left in the output (final), by distance "
+                "(voxels) to the nearest interior tile seam, to a hole / grid border (nodes), to the box's y/x faces; "
+                "radial_cos_lt03 = on a sheet whose normal is within ~17 deg of perpendicular to the radial direction",
+        "seams_y": seam_y, "seams_x": seam_x,
+        "events_by_seam_dist": dict(zip(bl, fdiag["seam"].tolist())),
+        "nodes_by_seam_dist": dict(zip(bl, fdiag["seam_nodes"].tolist())),
+        "final_by_seam_dist": dict(zip(bl, fdiag["final_seam"].tolist())),
+        "events_by_hole_dist": dict(zip(bl, fdiag["hole"].tolist())),
+        "nodes_by_hole_dist": dict(zip(bl, fdiag["hole_nodes"].tolist())),
+        "events_by_face_dist": dict(zip(bl, fdiag["face"].tolist())),
+        "events_radial_cos_lt03": int(fdiag["radial_cos_lt03"]),
+        "nodes_radial_cos_lt03": int(fdiag["radial_cos_lt03_nodes"])}
     tot_mv["duplicate_sheet_pairs"] = int(sum(tp.get("published", {}).get("coincident", 0) for tp in tile_pairs))
     log(json.dumps({"pooled": pooled, "circular": bool(circ), "geometry": tot_mv, "far_off": far_off}))
     with open(os.path.join(args.out, "refine_report.json"), "w") as f:
@@ -2965,6 +3268,16 @@ def parser():
     ap.add_argument("--cut-steps", default="2,1,1", help="(--solver cut) depth step per pass, voxels")
     ap.add_argument("--t-min", type=float, default=6.0, help="(--solver cut) sheet thickness bounds, voxels")
     ap.add_argument("--t-max", type=float, default=28.0)
+    ap.add_argument("--verso-side", choices=("auto", "inward", "outward"), default="auto",
+                    help="where the verso face lies relative to the recto along the outward normal: inward = "
+                         "export.SIGN_CONVENTION; auto (default) measures it on the first tile (recto/verso "
+                         "cross-correlation along the normals) -- on PHerc Paris 4 it is outward, ~10 voxels")
+    ap.add_argument("--revert-thr", type=float, default=None,
+                    help="(--solver cut --snap recto) a moved node keeps its move when the recto reaches this "
+                         "within --ridge-reach of it (default --thr / 2: a weak ridge is still a ridge)")
+    ap.add_argument("--revert-support", type=float, default=0.5,
+                    help="(--solver cut --snap recto) ... or when this fraction of its neighbourhood (Gaussian, "
+                         "sigma 2 nodes) is on a ridge: the slope-consistent interpolation stands (0 = off)")
     ap.add_argument("--write-pitch", choices=("fine", "published"), default="fine",
                     help="fine: the refined tifxyz is the crop of the surface that touches the box, at the "
                          "refinement pitch (every upsampled node; meta crop_rc / write_up); published: the full "

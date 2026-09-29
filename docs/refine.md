@@ -175,6 +175,52 @@ clipped to `--anchor-clip`. The field is applied BEFORE the snap, and the snap i
 `grid_rc` of the published grid, or, when that is null, the grid point nearest `from_zyx`. Anchor
 coordinates are taken as fine-frame voxels unless `--anchor-frame legacy` is given.
 
+## Folds, the verso side, a missing verso, the no-ridge revert (2026-09-29)
+
+Measured on tile 1 (`--box 55552 13696 13312 128 1024 1024`) and the 6-tile strip
+(`--box 55552 13696 13312 128 1024 6144 --tile 1024 --halo 160`) of the student slab.
+
+- **Folds were orientation flips, not seams.** The strip's fold events grew tile by tile (132, 172, 816, 2241,
+  6727, 12647); tiles 5-6 hold sheets lying almost flat in z (|n_z| ~ 0.93). There dot(n, radial) is near 0 and
+  evalsurf's per-node orientation flips single nodes; neighbours then move in opposite directions. 91% of the
+  strip's final folded nodes (2955 of 3250) were within 3 nodes of such a flip; only 0.6% within 8 voxels of a
+  tile seam (1.3% of the nodes are). `normals` now takes the grid's own cross-product normal and flips it as a
+  whole, per connected piece, by the weighted outward vote.
+  Folds are now counted per CORE node (the halo of a piece is another tile's core and was counted twice), and
+  `folds_final` counts the nodes still folded in the output. `geometry.fold_locations` bins the events by the
+  distance to the nearest interior tile seam, to a hole or grid border, to the box's faces, and counts the
+  ones on sheets nearly perpendicular to the radial direction. `png/folds_<surface>.png` maps them (gray nodes,
+  red events, yellow final folds, blue seams).
+- **Crossings.** `pair_stats` found its pairs with the REFINED grid's pitch as lateral tolerance while
+  `no_cross` used the published one, so 4 strip pairs were counted that the guard never checked. Both use the
+  published pitch now; final crossings are 0 by construction.
+- **The verso lies OUTWARD here.** `export.SIGN_CONVENTION` says verso -> recto points outward. On this slab the
+  recto/verso cross-correlation along the outward normal peaks at +7 to +13 voxels in every region tried, for the
+  student AND for the recto teacher (`teacher_regions/{recto,verso}`); the student recto matches the teacher recto
+  at lag 0 (corr 0.66). So the old coupling searched the verso on the wrong side: 80% of recto peaks have a verso
+  >= 0.5 within 6-28 voxels outward, 21% inward. `--verso-side auto` (default) measures the lag on the first tile
+  and uses that side for every tile (`inward` / `outward` force it). The solvers then work with n pointing verso ->
+  recto. Thickness estimate: 22 -> 9 voxels; both faces found on tile 1: 13% -> 33%.
+- **A missing verso is free, not a cost.** A node whose verso window holds nothing >= `--verso-thr` gets a flat
+  verso cost, so faint verso noise cannot pull a recto-only column (the -log of 0.28 against 0.001 used to
+  outweigh 4 voxels of a wide recto band). `verso_in_window` reports the fraction of columns with a verso face.
+- **The no-ridge revert.** Per candidate (moved > 0.5 voxel) the last pass records why its placed recto is not on
+  a ridge (`no_ridge_why`, see `_cut_info`): nonmovable, no_peak (nothing >= thr/2 within 8 voxels), weak_peak
+  (thr/2..thr), near_miss (>= thr within `--ridge-reach`, just not at the rounded label), peak_past_neighbour,
+  peak_past_window, held_by_coupling (the recto-only solve does reach it), held_by_slope. A node now keeps its
+  move when a recto >= `--revert-thr` (default thr/2) is within `--ridge-reach`, or when at least
+  `--revert-support` (0.5) of its neighbourhood (Gaussian, sigma 2 nodes) is on a ridge: there the slope-consistent
+  interpolation of the neighbours stands instead of a dimple toward the published position.
+- **Fair evaluation.** `--eval-store` metrics now count only points inside the eval store's own box (16 voxels
+  in), and `python -m rvsm.tools.refine.evalrun --store S --box ... --umbilicus U RUN...` re-scores finished runs
+  the same way. The only independent store over this slab is the recto teacher's 1024^3 regions
+  (`forlindesk2:/vesuvius/usrm2/teacher_regions/recto/region_55296_13312_13312.zarr`, copied to
+  `/home/forrest/refine/pred_eval/`); it covers y < 14336 of tile 1 (62%). The student was distilled partly from
+  this teacher, so it is independent of the refinement target, not of the student's lineage.
+
+PyMaxflow is the `refine` extra (`pip install 'rvsm[refine]'`); `--solver cut` fails at start-up with that hint
+when it is missing.
+
 ## Frames (the one thing that goes silently wrong)
 
 - The stores and the umbilicus are in the fine volume `20260411134726` (2.4 µm, rung 2) frame.

@@ -778,6 +778,11 @@ def test_fine_write_pitch_writes_every_refined_node(tmp_path, has_volcomp):
     fy = tifffile.imread(str(d / "y.tif"))
     by = tifffile.imread(str(out / "segB-on-20260411134726-2.4um.before" / "y.tif"))
     assert (np.abs(fy - by) > 0.5).sum() > 50                 # nodes between the published ones moved too
+    rep = json.load(open(out / "refine_report.json"))
+    fl = rep["geometry"]["fold_locations"]
+    assert sum(fl["nodes_by_seam_dist"].values()) > 0 and "events_by_seam_dist" in fl
+    assert rep["geometry"]["verso_side"] == "inward" and rep["geometry"]["both_faces"] is not None
+    assert (out / "png" / "folds_segB-on-20260411134726-2.4um.png").exists()
 
 
 def test_cut_solver_verso_and_mid_placements_are_stable_over_passes():
@@ -797,3 +802,91 @@ def test_cut_solver_verso_and_mid_placements_are_stable_over_passes():
         assert abs(np.median(new[2:-2, 2:-2, 1]) - want) <= 1.0, (snap, np.median(new[2:-2, 2:-2, 1]))
         assert st[-1]["mean_abs_move"] < 1.0
         assert st[-1]["thickness_fit"]["p50"] == 20.0
+
+
+# ------------------------------------------------- normal orientation, verso side, missing verso, revert
+
+def test_normals_take_one_sign_per_piece_where_the_per_node_test_flips():
+    """A sheet whose normal is close to the scroll axis (z) with a small wobble: dot(n, radial) changes sign
+    node by node, so evalsurf's per-node orientation flips neighbours (moves then fold the grid); refine's
+    normals keep one sign over the whole piece."""
+    from rvsm import evalsurf as E
+    Y, X = np.meshgrid(np.arange(10, 60, dtype=np.float32), np.arange(0, 40, dtype=np.float32), indexing="ij")
+    g = np.stack([20.0 + 0.4 * np.sin(Y / 4.0), Y, X], -1).astype(np.float32)
+    old = E.normals(g, AX_Y)
+    assert (old[..., 0] > 0).any() and (old[..., 0] < 0).any()          # the per-node test flips
+    n = R.normals(g, AX_Y)
+    assert (n[..., 0] > 0).all() or (n[..., 0] < 0).all()
+    assert np.allclose(np.abs(n), np.abs(old), atol=1e-5)
+
+
+def test_verso_lag_and_auto_side_put_the_recto_on_its_face_when_the_verso_is_outward():
+    """Paris 4's stores: the verso lies ~10 voxels OUTWARD of the recto (against export.SIGN_CONVENTION).
+    verso_lag sees +10; verso_side auto couples the faces on that side and the recto lands on 36 with both
+    faces found; forced 'inward' finds (almost) no verso face."""
+    pytest.importorskip("maxflow")
+    shape = (16, 80, 40)
+    Vr = band_volume(shape, lambda x: 36 + 0 * x, 1.2)
+    Vv = band_volume(shape, lambda x: 46 + 0 * x, 1.2)
+    g = flat_sheet(40.0, x=(2, 38))
+    q = g.reshape(-1, 3)
+    lag, corr = R.verso_lag(Vr, Vv, q, np.tile([0.0, 1.0, 0.0], (len(q), 1)).astype(np.float32))
+    assert abs(lag - 10) <= 1 and corr > 0.3
+    res = {}
+    for side in ("auto", "inward"):
+        dg = {}
+        (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, cut=True, snap="recto", cut_depths=(12, 6),
+                                   cut_steps=(1, 1), t_min=4, t_max=16, taper=0.0, sigma=1.0, thr=0.3,
+                                   verso_side=side, diag=dg)
+        res[side] = (dg["verso_side"], float(np.median(new[2:-2, 2:-2, 1])), st[-1]["both_faces"])
+    assert res["auto"][0] == "outward" and abs(res["auto"][1] - 36) <= 1.0 and res["auto"][2] > 0.8
+    assert res["inward"][2] < 0.2
+
+
+def test_a_missing_verso_neither_penalises_nor_pulls_the_recto():
+    """Recto band (wide) at 36 everywhere; its verso 10 inward only for x < 20, and for x >= 20 only faint
+    verso noise (0.28 < vthr) at 16, out of the thickness range: the faint noise must not pull the recto
+    (the -log of 0.28 vs 0.001 used to outweigh 4 voxels of a wide recto band)."""
+    pytest.importorskip("maxflow")
+    shape = (16, 80, 40)
+    Vr = band_volume(shape, lambda x: 36 + 0 * x, 2.5)
+    z, y, x = np.mgrid[:shape[0], :shape[1], :shape[2]].astype(np.float32)
+    Vv = np.where(x < 20, np.exp(-0.5 * ((y - 26) / 1.2) ** 2), 0.28 * np.exp(-0.5 * ((y - 16) / 1.2) ** 2))
+    g = flat_sheet(38.0, x=(2, 38))
+    (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv.astype(np.float32), T=10.0, cut=True, snap="recto",
+                               cut_depths=(12, 6), cut_steps=(1, 1), t_min=4, t_max=16, taper=0.0, sigma=1.0,
+                               thr=0.3, verso_side="inward")
+    yy = new[2:-2, 2:-2, 1]
+    assert np.abs(yy - 36).max() <= 1.0, (yy.min(), yy.max())
+    assert 0.3 < st[-1]["verso_in_window"] < 0.8
+
+
+def test_a_small_gap_in_the_recto_keeps_the_interpolated_move_instead_of_a_dimple():
+    """The recto band at 36 has a hole (a 3 x 3 node patch with no ridge): the slope-consistent interpolation
+    of the neighbours stands there (revert_support), where the old revert pulled the patch back toward the
+    published 44 as far as the caps allowed; with revert_support 0 it does dimple, and the breakdown names why."""
+    pytest.importorskip("maxflow")
+    shape = (20, 80, 40)
+    z, y, x = np.mgrid[:shape[0], :shape[1], :shape[2]].astype(np.float32)
+    hole = (np.abs(z - 10) <= 2.5) & (np.abs(x - 20) <= 2.5)
+    Vr = np.where(hole, 0.0, np.exp(-0.5 * ((y - 36) / 1.2) ** 2)).astype(np.float32)
+    Vv = np.exp(-0.5 * ((y - 26) / 1.2) ** 2).astype(np.float32)
+    Z, X = np.meshgrid(np.arange(2, 19, 2, dtype=np.float32), np.arange(2, 39, 2, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, np.full_like(Z, 44.0), X], -1)
+    out = {}
+    for sup in (0.5, 0.0):
+        (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, T=10.0, cut=True, snap="recto",
+                                   cut_depths=(12, 6), cut_steps=(1, 1), t_min=4, t_max=16, taper=0.0, sigma=1.0,
+                                   thr=0.3, verso_side="inward", revert_support=sup, revert_thr=0.3)
+        out[sup] = (new[3:6, 8:11, 1], st[-1])
+    assert out[0.5][0].mean() < out[0.0][0].mean() - 0.3
+    assert np.abs(out[0.5][0] - 36).max() <= 1.6
+    assert out[0.5][1]["reverted"] == 0 and out[0.0][1]["reverted"] >= 9
+    assert out[0.0][1]["why"]["no_peak"] > 0
+
+
+def test_cut_solver_fails_loudly_without_pymaxflow(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "maxflow", None)
+    with pytest.raises(ImportError, match=r"rvsm\[refine\]"):
+        R.two_surface_cut(np.zeros((1, 2, 3)), None, (1, 1))
