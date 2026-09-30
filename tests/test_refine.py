@@ -1009,3 +1009,19 @@ def test_refine_slab_resumes_a_tile_run_to_the_same_result(tmp_path, has_volcomp
     np.testing.assert_allclose(first, second, atol=1e-4)
     assert rep1["pooled"] == rep2["pooled"]
     assert rep1["geometry"]["folds"] == rep2["geometry"]["folds"]
+
+
+def test_a_solve_split_into_strips_matches_the_whole_solve_on_a_smooth_band(monkeypatch):
+    """--max-graph-nodes: a graph too big for one solve runs in overlapping strips; on a smooth band the strips
+    give the same labels as the one big solve."""
+    pytest.importorskip("maxflow")
+    H, W, Z = 60, 40, 13
+    yy = 6 + np.round(2 * np.sin(np.arange(H) / 9.0)).astype(int)
+    Cr = np.abs(np.arange(Z)[None, None] - yy[:, None, None]).astype(np.float32) * np.ones((H, W, Z), np.float32)
+    ok = np.ones((H, W), bool)
+    ok[[0, -1]] = False
+    ok[:, [0, -1]] = False
+    whole, _ = R.cut_cropped(Cr, None, ok, (1, 1), pin=6)
+    monkeypatch.setattr(R, "MAX_GRAPH_NODES", H * W * Z // 4)
+    strips, _ = R.cut_cropped(Cr, None, ok, (1, 1), pin=6)
+    assert (whole[ok] == strips[ok]).mean() > 0.99

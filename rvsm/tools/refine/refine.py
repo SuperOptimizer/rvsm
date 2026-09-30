@@ -1137,7 +1137,11 @@ def two_surface_cut(Cr, Cw, dz, t_min=0, t_max=0, big=1e9):
     return np.clip(idx[1], 0, Z - 1), np.clip(idx[0], 0, Z - 1)
 
 
-def cut_cropped(Cr, Cw, ok, dz, t_min=0, t_max=0, pin=0):
+MAX_GRAPH_NODES = 3_000_000   # one max-flow graph at most (~1.3 GB); bigger solves go in overlapping strips
+STRIP_OVERLAP = 24             # grid nodes each strip reaches past the part it keeps
+
+
+def cut_cropped(Cr, Cw, ok, dz, t_min=0, t_max=0, pin=0, split=True):
     """`two_surface_cut` on the bounding rectangle of the solved nodes (`ok`, grown by one node: the pinned
     neighbours that constrain them). A piece's grid is the bounding rectangle of a slanted band, mostly nodes
     outside the tile that are pinned at depth `pin` and constrain nothing but each other; they stay at `pin`."""
@@ -1149,6 +1153,37 @@ def cut_cropped(Cr, Cw, ok, dz, t_min=0, t_max=0, pin=0):
         return r, (r.copy() if Cw is not None else None)
     rows, cols = np.nonzero(okd.any(1))[0], np.nonzero(okd.any(0))[0]
     r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    gn = (r1 - r0) * (c1 - c0) * max(Cr.shape[2] - 1, 1) * (1 if Cw is None else 2)
+    if split and gn > MAX_GRAPH_NODES:   # too big for one graph (~450 bytes per node): overlapping strips along the longer
+        ax_ = 0 if (r1 - r0) >= (c1 - c0) else 1   # side, each solved alone, each keeping its middle; the
+        a0, a1 = (r0, r1) if ax_ == 0 else (c0, c1)   # slope projection after the pass joins them exactly
+        other = (c1 - c0) if ax_ == 0 else (r1 - r0)
+        per = max(Cr.shape[2] - 1, 1) * (1 if Cw is None else 2) * other   # graph nodes per strip line
+        tl = max(4, MAX_GRAPH_NODES // max(per, 1))                        # lines one graph can hold
+        ov = min(STRIP_OVERLAP, max(1, tl // 4))
+        keep = max(1, tl - 2 * ov)
+        k = int(np.ceil((a1 - a0) / keep))
+        edges = np.linspace(a0, a1, k + 1).round().astype(int)
+        r = np.full((H, Wd), pin, np.int64)
+        w = np.full((H, Wd), pin, np.int64) if Cw is not None else None
+        STAGES["graph_splits"] = STAGES.get("graph_splits", 0) + 1
+        for e0, e1 in zip(edges[:-1], edges[1:]):
+            s0, s1 = max(a0, e0 - ov), min(a1, e1 + ov)
+            sub = np.zeros_like(ok)
+            if ax_ == 0:
+                sub[s0:s1] = ok[s0:s1]
+            else:
+                sub[:, s0:s1] = ok[:, s0:s1]
+            rs, ws = cut_cropped(Cr, Cw, sub, dz, t_min, t_max, pin, split=False)
+            if ax_ == 0:
+                r[e0:e1] = rs[e0:e1]
+                if w is not None:
+                    w[e0:e1] = ws[e0:e1]
+            else:
+                r[:, e0:e1] = rs[:, e0:e1]
+                if w is not None:
+                    w[:, e0:e1] = ws[:, e0:e1]
+        return r, w
     if (r1 - r0) * (c1 - c0) == H * Wd:
         return two_surface_cut(Cr, Cw, dz, t_min, t_max)
     rc, wc = two_surface_cut(np.ascontiguousarray(Cr[r0:r1, c0:c1]),
@@ -1180,7 +1215,10 @@ def _cgroup_headroom():
         mx = open(base + "/memory.max").read().strip()
         if mx == "max":
             return None
-        return float(int(mx) - int(open(base + "/memory.current").read().strip()))
+        cur = int(open(base + "/memory.current").read().strip())
+        st_ = dict(ln.split() for ln in open(base + "/memory.stat"))
+        cur -= int(st_.get("active_file", 0)) + int(st_.get("inactive_file", 0))   # page cache is reclaimable
+        return float(int(mx) - max(cur, 0))
     except (OSError, IndexError, ValueError):
         return None
 
@@ -1195,7 +1233,7 @@ def _cut_graph_bytes(ca):
     rows, cols = np.nonzero(okd.any(1))[0], np.nonzero(okd.any(0))[0]
     Z = len(np.arange(-r, r + 1, step))
     ns = 2 if snap in ("recto", "verso", "mid") else 1
-    return float((rows[-1] - rows[0] + 1) * (cols[-1] - cols[0] + 1) * max(Z - 1, 1) * ns * 450)
+    return float(min((rows[-1] - rows[0] + 1) * (cols[-1] - cols[0] + 1) * max(Z - 1, 1) * ns, MAX_GRAPH_NODES) * 450)
 
 
 CUT_JOBS = 1          # worker processes for the per-grid cut solves of a pass (--jobs)
@@ -3139,6 +3177,7 @@ def run(args):
     globals()["REVERT_DIAG"] = bool(args.revert_diag)
     globals()["CUT_JOBS"] = max(1, int(args.jobs))
     globals()["SOLVE_MEM_GB"] = float(args.solve_mem_gb)
+    globals()["MAX_GRAPH_NODES"] = int(args.max_graph_nodes)
     ncrop = 0 if (args.no_surface_png or not pics) else max(int(args.crops), 0)
     cz_lo, cz_hi = lo[0] + args.taper + 4, lo[0] + shape[0] - args.taper - 4
     czs = [float(int(z)) + 0.5 for z in (np.linspace(cz_lo, cz_hi, ncrop) if ncrop > 1 and cz_hi > cz_lo
@@ -3994,6 +4033,9 @@ def parser():
     ap.add_argument("--jobs", type=int, default=4,
                     help="worker processes for the per-grid max-flow solves of a pass (forked; the stores are shared "
                          "copy-on-write, each worker holds one graph)")
+    ap.add_argument("--max-graph-nodes", type=int, default=3_000_000,
+                    help="largest single max-flow graph (~450 bytes per node); bigger solves run in overlapping "
+                         "strips of the grid, joined by the slope projection")
     ap.add_argument("--solve-mem-gb", type=float, default=2.0,
                     help="budget for the max-flow graphs the --jobs workers hold at once (~450 bytes per graph node)")
     ap.add_argument("--resume-dir", help="per-tile checkpoints: a tile whose tile_NNN.json is there is replayed, not "
