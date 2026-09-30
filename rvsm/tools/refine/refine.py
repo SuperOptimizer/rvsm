@@ -1165,6 +1165,26 @@ def cut_cropped(Cr, Cw, ok, dz, t_min=0, t_max=0, pin=0):
 SOLVE_MEM_GB = 2.0    # the estimated max-flow graph memory the concurrent workers may hold together (--solve-mem-gb)
 
 
+def _rss_gb():
+    try:
+        return int([ln.split()[1] for ln in open("/proc/self/status") if ln.startswith("VmRSS")][0]) / 2 ** 20
+    except (OSError, IndexError, ValueError):
+        return float("nan")
+
+
+def _cgroup_headroom():
+    """Bytes left under this process's cgroup-v2 memory limit (memory.max - memory.current), None without one."""
+    try:
+        cg = [ln.split(":", 2)[2].strip() for ln in open("/proc/self/cgroup") if ln.startswith("0::")][0]
+        base = "/sys/fs/cgroup" + cg
+        mx = open(base + "/memory.max").read().strip()
+        if mx == "max":
+            return None
+        return float(int(mx) - int(open(base + "/memory.current").read().strip()))
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def _cut_graph_bytes(ca):
     """The max-flow graph a task will build: the cropped rectangle x the labels (x 2 surfaces when coupled)."""
     from scipy.ndimage import binary_dilation
@@ -1211,6 +1231,9 @@ def run_cut_tasks(tasks, V, W, ctv, ct_air):
         order = sorted(range(len(tasks)), key=lambda i: -est[i])
         out = [None] * len(tasks)
         budget = float(SOLVE_MEM_GB) * 2 ** 30
+        head = _cgroup_headroom()
+        if head is not None:   # under a memory cap: never plan more graph memory than 70% of what is left
+            budget = max(min(budget, 0.7 * head), 0.0)
         # memory-aware: tasks start largest first while the running ones' estimated graphs fit the budget
         # (a graph is ~450 bytes per node; one over the budget runs alone)
         with mp.get_context("fork").Pool(min(CUT_JOBS, len(tasks))) as pool:
@@ -3562,8 +3585,10 @@ def run(args):
                         canv[z][c][np.ix_(sy, sx)] = arr[zi][np.ix_(iy[sy] - rlo[1], ix[sx] - rlo[2])]
         del V, W, thick, Ve, ct_mask, ctv, ct_air, g0, g1, pieces
         STAGES["tile_total"] = STAGES.get("tile_total", 0.0) + time.perf_counter() - t_tile
+        hd_ = _cgroup_headroom()
         log(json.dumps({"tile_time": ti + 1, "s": {k: round(v - st0.get(k, 0.0), 2) for k, v in STAGES.items()
-                                                    if v - st0.get(k, 0.0) > 0.005}}))
+                                                    if v - st0.get(k, 0.0) > 0.005},
+                        "rss_gb": round(_rss_gb(), 2), "cgroup_free_gb": None if hd_ is None else round(hd_ / 2 ** 30, 2)}))
         if snap0 is not None:
             _save(ti, snap0, time.perf_counter() - t_tile)
 
