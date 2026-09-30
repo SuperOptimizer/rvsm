@@ -93,6 +93,30 @@ def test_prepare_air_floor_zeroes_raw_grey_levels_of_every_image_cube_before_the
     assert torch.equal(x2, x0)                               # threshold 0 = off
 
 
+def test_air_floor_reaches_the_cascade_self_pass():
+    """The self cascade's coarse forward builds its own input from the raw cubes: it must be floored
+    with the same threshold, or the coarse prediction would see the CT the fine one does not."""
+    L = Config().layout()
+    b = prep.batch1(_fake_item(nctx=L.nctx, p=8))
+    seen = []
+
+    class Net(torch.nn.Module):
+        def forward(self, x):
+            seen.append(x[:, :L.i_cas].clone())
+            return torch.zeros(x.shape[0], L.cout, *x.shape[2:])
+    cas = prep.Cascade("self", self_p=1.0, drop=0.0, noise=False, net=Net())
+    prep.prepare(b, torch.device("cpu"), cascade=cas, layout=L)
+    prep.prepare(b, torch.device("cpu"), cascade=cas, layout=L, air_floor=torch.tensor([100.0]))
+    raw, fl = seen
+    cubes = torch.cat([b["ct"][0, 1:], b["cx"][0]]).float()
+    low = cubes < 100
+    assert not torch.equal(raw, fl)
+    for c in range(cubes.shape[0]):
+        v = fl[0, c][low[c]]
+        assert torch.allclose(v, v[0].expand_as(v))          # every floored voxel: one z-scored zero
+    assert cas.air_floor is None                             # nothing leaks into the next batch
+
+
 # --------------------------------------------------------------------- compact target rows
 
 def _recto_only(compact=True, seed=0, p=8, k=2, sym=0):

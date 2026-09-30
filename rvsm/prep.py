@@ -212,7 +212,11 @@ def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade
     zscore_cubes_(img, norm, dtype)
     if casc:
         cascade = cascade if cascade is not None else Cascade("off")
-        x[:, C:C + 1] = cascade.channel(b, x, norm, dtype, norad=norad, non_blocking=non_blocking)
+        cascade.air_floor = None if air_floor is None else (air_floor, bool(air_floor_soft))
+        try:
+            x[:, C:C + 1] = cascade.channel(b, x, norm, dtype, norad=norad, non_blocking=non_blocking)
+        finally:
+            cascade.air_floor = None
     if npl:
         fill_planes_(x, C + casc, cyx, lo, dtype=dtype,
                      rmax=(to(b["rmax"]).reshape(-1) if b.get("rmax") is not None else None),
@@ -369,6 +373,10 @@ class Cascade:
         npl = n_planes_b(b)
         x = torch.empty((1, C + 5 + npl) + tuple(S), dtype=dtype, device=dev)
         x[:, :C].copy_(cubes)
+        af = getattr(self, "air_floor", None)     # `prepare`'s air floor, sample i's threshold: the coarse
+        if af is not None:                        # pass must see the same floored CT as the fine one
+            from rvsm import aug as _A
+            _A.air_floor_(x[:, :C], torch.as_tensor(af[0]).reshape(-1)[i:i + 1], soft=af[1])
         zscore_cubes_(x[:, :C], b["norm"][i:i + 1].to(dev), dtype)
         x[:, C] = 0                                                   # its own cascade channel: truncated
         cyx1, lo1 = b["cyx1"][i:i + 1].to(dev), b["lo1"][i:i + 1].to(dev)
