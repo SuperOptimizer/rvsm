@@ -528,11 +528,17 @@ class ShardCache:
     def pin_small_levels(self, max_vox=ladder.CACHE_VOX):
         """Fetch WHOLE every level of at most `max_vox` voxels and pin it: the coarse rungs are a few
         shards each and every sample's context cubes read them, so they are pulled once and never
-        evicted. Returns the pinned rungs."""
+        evicted. Returns the pinned rungs.
+
+        The COARSEST level is always pinned, whatever its size: `regions.occupancy` reads it whole when
+        no level is under the occupancy cap, and every rung above the pyramid's top is pooled from it. A
+        pyramid whose top is big (PHercParis4 on the volcomp URL stops at level 5, 2.5 Gvox) otherwise
+        read as all air, and a fresh run on it found 0 regions."""
         pyr, out = self.levels(), []
         todo = []
+        top = max(pyr) if pyr else None
         for k in sorted(pyr):
-            if int(np.prod(pyr[k].shape[-3:])) > int(max_vox):
+            if int(np.prod(pyr[k].shape[-3:])) > int(max_vox) and k != top:
                 continue
             todo += self._paths(pyr[k], all_keys(pyr[k]))
             out.append(k)

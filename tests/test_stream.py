@@ -75,6 +75,7 @@ def test_release_and_evict_keep_pinned_levels_and_live_regions(ct_origin, tmp_pa
     cache = stream.ShardCache(ct_origin.url, str(tmp_path / "c"), budget_gb=1)
     pinned_rungs = cache.pin_small_levels(max_vox=4_000_000)   # rungs 3..5, not the 256^3 level 0
     assert pinned_rungs and 2 not in pinned_rungs
+    assert max(cache.levels()) in cache.pin_small_levels(max_vox=1)   # the top level, whatever its size
     pin_files = [p for p in cache.pin if os.path.exists(p)]
     assert pin_files
 
