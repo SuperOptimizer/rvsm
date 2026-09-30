@@ -955,3 +955,16 @@ def test_a_sheet_flat_in_z_near_the_slab_face_is_not_pushed_by_the_empty_outside
                                thr=0.3, verso_side="inward" if n[5, 5, 0] > 0 else "outward", diag=dg)
     assert abs(np.median(new[2:-2, 2:-2, 0]) - 9) <= 1.0, np.median(new[2:-2, 2:-2, 0])
     assert st[-1].get("hard_flat", 0) == 0 and st[-1].get("hard_reverted", 0) == 0
+
+
+def test_bad_nodes_ignores_quads_the_published_grid_already_collapsed():
+    g = flat_sheet(10.0, x=(0, 6), z=(0, 6))
+    g[2, 3] = g[2, 2] + np.array([0.0, 0.0, 0.01], np.float32)   # a crumpled published patch: a zero-area quad
+    n = R.normals(g, AX_Y)
+    moved = g.copy()
+    moved[2, 3, 2] -= 0.02                                        # noise-sized move "flips" it
+    assert not R.bad_nodes(moved, g, n, 0.001)[2, 3]
+    ok = flat_sheet(10.0, x=(0, 6), z=(0, 6))
+    fold = ok.copy()
+    fold[2, 2, 2] += 1.6                                          # a real fold of a healthy quad is still caught
+    assert R.bad_nodes(fold, ok, R.normals(ok, AX_Y), 0.001)[2, 2]

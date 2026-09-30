@@ -224,20 +224,39 @@ Measured on tile 1 (`--box 55552 13696 13312 128 1024 1024`) and the 6-tile stri
   The min cut also has ties wherever a column's costs are flat, and its tie-break slid such columns to the edge
   of the window every pass, up to --far-total. Now:
   - a small cost per voxel of total move (0.01) breaks those ties toward staying;
-  - `--far-evidence` (16): a node passes 16 voxels of total move (up to `--far-total`) only while every pass
-    that moved it put its placed feature on a ridge >= thr (`evidence_capped`, `at_move_cap`,
-    `moved_on_ridge_per_pass`; per node `ridge_passes/<surface>.npz`: published zyx, recto per pass, evidence);
+  - `--far-evidence` (16): a node keeps more than 16 voxels of total move (up to `--far-total`) only when its
+    FINAL place has a recto >= thr within 2 voxels, is not air (no CT above `--ct-air` within 3 voxels along the
+    normal: the recto face itself is the papyrus/air edge), and at least 60% of the nodes within 3 grid steps
+    moved over 8 voxels the same way; else it is clipped to 16 (`allowance_used`, `allowance_denied` and why).
+    An earlier version demanded a ridge under EVERY pass; the wide early passes cross air on the way to the
+    real sheet, so it forbade exactly the corrections the wide search is for. Per node,
+    `ridge_passes/<surface>.npz` logs the recto at the placed recto per pass (published zyx, per-pass value,
+    and whether every moving pass landed on a ridge);
   - `--revert-support` never rescues a node without evidence of its own: no recto >= `--revert-thr` within
     `--ridge-reach` of it AND (a recto profile flat below 0.15 over the window, OR its destination in air, CT
     below `--ct-air`, default the 2-means air/papyrus midpoint measured on the first tile, 79.7 here). Such a
-    node goes back to its published place and its neighbours give way (`hard_reverted`, `hard_air`, `hard_flat`);
+    node goes back toward its published place as far as its neighbours' caps allow (`--hard-revert caps`,
+    default; `full` makes the neighbours give way instead, which cost tile 1 0.035 of teacher recall@2)
+    (`hard_reverted`, `hard_air`, `hard_flat`);
+  - the stores end at the box: a profile label outside it is NO DATA (the node's median in-box cost), and a node
+    whose +-24 voxel window leaves the box is neither "flat" nor "air". A sheet lying flat in z in a 128-deep slab
+    otherwise saw the empty outside as "no ridge" and was pushed away from the face (the kinks on 20260623141135
+    near yx 13938,15852: normal sign consistent, |n_z| 0.92, 66% of the windows there left the slab);
+  - the later steps (the evidence clip, the revert, the guard) never re-ran the fold guard: the final repair
+    loop now also halves the move of any folded node (toward its published place) before the caps and the
+    crossings are re-checked (`fold_repairs`);
   - the no-crossing guard holds the nodes it pulled while the caps are restored around them (up to 8 rounds);
     the held nodes can still contradict each other (642 strip switches left that way), so `shrink_to_caps`
     then closes every violated edge by moving nodes only TOWARD their published place, alternating with the
     guard until both hold. The solve itself leaves 0 switches; `switch_stages` counts them after the solve,
     after the first guard round, after the guard rounds and at the end.
-  Tile 1: moves > 30 108 -> 0, switches 22 -> 0, final folds 44 -> 0, reverted 10.9% -> 11.3%; recall@2 against
-  the recto teacher 0.648 -> 0.590 (published 0.407).
+  - the flip test ignores quads the PUBLISHED grid already collapsed (oriented area under 5% of the grid's
+    median quad) and the bunching test ignores noise-sized shortenings (< 5%): 20260603222816 has a crumpled
+    published patch (x 17019-17080, y 14574-14610, quad areas ~0.1 vs 25, 88% inverted) whose "folds" were
+    noise; a node still folded after 6 halvings is put back on its published point, tangential part included.
+  Tile 1 (published / fix 1 / this): recall@2 against the recto teacher 0.407 / 0.648 / 0.639, moves > 30
+  0 / 108 / 0 (none of fix 1's ended on a ridge >= thr outside air), switches 22 -> 0, final folds 44 -> 0,
+  crossings 0.
 
 PyMaxflow is the `refine` extra (`pip install 'rvsm[refine]'`); `--solver cut` fails at start-up with that hint
 when it is missing.

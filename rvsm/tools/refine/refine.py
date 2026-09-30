@@ -935,6 +935,12 @@ def bad_nodes(P, P0, n0, min_sp):
             j2 = (np.cross(G[1:, :-1] - G[1:, 1:], G[:-1, 1:] - G[1:, 1:]) * nq).sum(-1)
             if sgn is None:
                 s1, s2 = np.sign(np.nan_to_num(j1)), np.sign(np.nan_to_num(j2))
+                # a quad the PUBLISHED grid already collapsed (oriented area under 5% of the grid's median quad
+                # -- crumpled patches of some segments) has no orientation to keep: noise would "flip" it
+                ja = np.abs(np.concatenate([j1[np.isfinite(j1)], j2[np.isfinite(j2)]]))
+                jm = 0.05 * float(np.median(ja)) if len(ja) else 0.0
+                s1 = np.where(np.abs(np.nan_to_num(j1)) >= jm, s1, 0)
+                s2 = np.where(np.abs(np.nan_to_num(j2)) >= jm, s2, 0)
             else:
                 flip = qok & (((s1 != 0) & (np.nan_to_num(j1) * s1 <= 0)) | ((s2 != 0) & (np.nan_to_num(j2) * s2 <= 0)))
         bad[:-1, :-1] |= flip
@@ -948,7 +954,7 @@ def bad_nodes(P, P0, n0, min_sp):
         a, b = tuple(a), tuple(b)
         L = np.linalg.norm(P[b] - P[a], axis=-1)
         L0 = np.linalg.norm(P0[b] - P0[a], axis=-1)
-        short = fin[a] & fin[b] & (L < min_sp) & (L0 >= min_sp)
+        short = fin[a] & fin[b] & (L < min_sp) & (L0 >= min_sp) & (L0 - L > 0.05 * L0)   # not a noise-sized shortening
         bad[a] |= short
         bad[b] |= short
     return bad
@@ -3065,6 +3071,9 @@ def run(args):
                         Xs = shrink_to_caps(Xs, caps_t[j], fx)
                     if Xs is not X:
                         g1[j] = g1[j] + np.nan_to_num(Xs - X)[..., None] * nr
+                    gone = fb & (halv[j] >= 6)   # still folded with no normal move left: the tangential part
+                    if gone.any():               # (relaxation) goes too -- the node IS its published point
+                        g1[j][gone] = g0[j][gone]
                 fold_fixed += nf_
                 g1, nc_, _ = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0,
                                       return_masks=True)
