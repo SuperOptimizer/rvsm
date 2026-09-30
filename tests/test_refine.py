@@ -861,7 +861,7 @@ def test_a_missing_verso_neither_penalises_nor_pulls_the_recto():
     assert 0.3 < st[-1]["verso_in_window"] < 0.8
 
 
-def _gap_run(level, sup):
+def _gap_run(level, sup, hard="caps"):
     shape = (20, 80, 40)
     z, y, x = np.mgrid[:shape[0], :shape[1], :shape[2]].astype(np.float32)
     hole = (np.abs(z - 10) <= 2.5) & (np.abs(x - 20) <= 2.5)
@@ -872,7 +872,8 @@ def _gap_run(level, sup):
     g = np.stack([Z, np.full_like(Z, 44.0), X], -1)
     (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, T=10.0, cut=True, snap="recto",
                                cut_depths=(12, 6), cut_steps=(1, 1), t_min=4, t_max=16, taper=0.0, sigma=1.0,
-                               thr=0.3, verso_side="inward", revert_support=sup, revert_thr=0.3)
+                               thr=0.3, verso_side="inward", revert_support=sup, revert_thr=0.3,
+                               hard_revert=hard)
     return new[3:6, 8:11, 1], st[-1]
 
 
@@ -893,9 +894,11 @@ def test_no_recto_at_all_reverts_the_node_whatever_its_neighbours_say():
     """An EMPTY patch (flat recto profile): neighbour support must not rescue it; it goes back to the published
     44 and its neighbours give way (caps kept, no switch)."""
     pytest.importorskip("maxflow")
-    y5, s5 = _gap_run(0.0, 0.5)
+    y5, s5 = _gap_run(0.0, 0.5, hard="full")
     assert abs(y5[1, 1] - 44) <= 0.6
     assert s5["hard_reverted"] >= 1 and s5["switches_after_revert"] == 0
+    yc, sc = _gap_run(0.0, 0.5, hard="caps")          # the default: back as far as the neighbours' caps allow
+    assert yc[1, 1] > 36.5 and sc["hard_reverted"] >= 1 and sc["switches_after_revert"] == 0
 
 
 def test_cut_solver_fails_loudly_without_pymaxflow(monkeypatch):
@@ -932,3 +935,23 @@ def test_shrink_to_caps_only_moves_toward_the_published_place():
     assert R.slope_violations(Y, caps) == 0
     assert (np.abs(Y) <= np.abs(X) + 1e-6).all() and (np.sign(Y) * np.sign(X) >= 0).all()
     assert (Y[fixed] == X[fixed]).all()
+
+
+def test_a_sheet_flat_in_z_near_the_slab_face_is_not_pushed_by_the_empty_outside():
+    """A sheet lying flat in z (normal along z) in a 16-deep slab, its recto band 3 voxels above it: the
+    +-24 profile leaves the slab, and the samples outside are no data (neutral), not 'no ridge' -- the sheet
+    lands on its band and is not reverted as flat/air."""
+    pytest.importorskip("maxflow")
+    shape = (16, 60, 60)
+    z, y, x = np.mgrid[:shape[0], :shape[1], :shape[2]].astype(np.float32)
+    Vr = np.exp(-0.5 * ((z - 9) / 1.2) ** 2).astype(np.float32)
+    Vv = np.exp(-0.5 * ((z - 3) / 1.2) ** 2).astype(np.float32)
+    Y, X = np.meshgrid(np.arange(4, 56, 2, dtype=np.float32), np.arange(4, 56, 2, dtype=np.float32), indexing="ij")
+    g = np.stack([np.full_like(Y, 6.0), Y, X], -1)
+    n = R.normals(g, AX_Y)
+    dg = {}
+    (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, T=6.0, cut=True, snap="recto",
+                               cut_depths=(12, 6), cut_steps=(1, 1), t_min=3, t_max=10, taper=0.0, sigma=1.0,
+                               thr=0.3, verso_side="inward" if n[5, 5, 0] > 0 else "outward", diag=dg)
+    assert abs(np.median(new[2:-2, 2:-2, 0]) - 9) <= 1.0, np.median(new[2:-2, 2:-2, 0])
+    assert st[-1].get("hard_flat", 0) == 0 and st[-1].get("hard_reverted", 0) == 0

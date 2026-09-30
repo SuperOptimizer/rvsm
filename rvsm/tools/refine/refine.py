@@ -1135,12 +1135,28 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
     if coupled:
         Rf, Wf = profile(V, qi, nn, R_), profile(W, qi, nn, R_)          # depths -R_ .. R_
         cr = -np.log(np.clip(Rf[np.round(tr + R_).astype(np.int64)], 1e-3, 1.0))
+        # the stores end at the box (a slab is only 128 deep): a label whose sample point lies outside is NO
+        # DATA, not "no ridge" -- it gets the node's median in-box cost (neutral), else a normal nearly
+        # parallel to z made every out-of-slab label look like air and pushed the node away from the face
+        shp = np.array(V.shape, np.float32) - 1
+
+        def inside(t_):
+            P_ = qi[None] + t_[:, None, None] * nn[None]
+            return ((P_ >= 0) & (P_ <= shp)).all(-1)
+        in_r, in_w = inside(tr), inside(tw)
+
+        def neutral(c_, m_):
+            med = np.nanmedian(np.where(m_, c_, np.nan), axis=0)
+            return np.where(m_, c_, np.nan_to_num(med, nan=0.0)[None]).astype(np.float32)
+        cr = neutral(cr, in_r)
+        leaves = ~inside(np.array([-24.0, 24.0], np.float32)).all(0)
         # a small cost per voxel of TOTAL move: where the profile is flat (air, no prediction) the min cut has
         # ties, and its closed-set tie-break slid such columns to the edge of the window every pass (the
         # strip's +-40 voxel moves); this keeps them where they are
         cr = cr + np.float32(move_prior) * np.abs(Dq[None] + tr[:, None])
         Ww = Wf[np.round(tw + R_).astype(np.int64)]
-        cw = -np.log(np.clip(Ww, 1e-3, 1.0))
+        cw = neutral(-np.log(np.clip(Ww, 1e-3, 1.0)), in_w)
+        Ww = np.where(in_w, Ww, 0.0)
         # graceful degradation: a column whose verso window holds no verso face (nothing >= vthr) gets a FLAT
         # verso cost -- its verso is free within the thickness bounds, so a recto-only column is neither
         # penalised nor pulled toward whatever faint verso noise the -log would otherwise amplify
@@ -1234,7 +1250,7 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
         _cut_info(info, ii, (H, Wd), r[ii], v, Rf, R_, thr, ridge_reach, revert_thr, movable, lo, hi_r, Dq,
                   ftq, D, Cr, dz, Rf_at=lambda rr: np.take_along_axis(
                       Rf, np.clip(np.round(rr + R_).astype(np.int64), 0, 2 * R_)[None], 0)[0], tr=tr,
-                  dest=qi + r[ii][:, None] * nn, ct_air=ct_air)
+                  dest=qi + r[ii][:, None] * nn, ct_air=ct_air, leaves=leaves)
     return dd, conf, valid
 
 
@@ -1243,7 +1259,7 @@ REVERT_CATS = ("nonmovable", "no_peak", "weak_peak", "near_miss", "peak_past_nei
 
 
 def _cut_info(info, ii, shape, r, v, Rf, R_, thr, reach, revert_thr, movable, lo, hi_r, Dq, far_total, D, Cr, dz,
-              Rf_at, tr, dest=None, ct_air=None, flat=0.15):
+              Rf_at, tr, dest=None, ct_air=None, flat=0.15, leaves=None):
     """The last pass's per-node diagnostics for the no-ridge revert (snap recto, coupled): why a node's placed
     recto r is not on a ridge (pr < thr at the placed label), as one of REVERT_CATS (codes 1..8, 0 = on a
     ridge), and `soft` = a recto >= revert_thr within +-reach of r (the revert's own test).
@@ -1306,8 +1322,15 @@ def _cut_info(info, ii, shape, r, v, Rf, R_, thr, reach, revert_thr, movable, lo
         cv = sample(ct_air[0], dest)
         cv = cv * 255.0 if ct_air[0].dtype == np.uint8 else cv
         air = cv < float(ct_air[1])
+    if leaves is not None:   # the +-24 window leaves the box: no data there, neither flat nor air
+        fl &= ~leaves
+        air &= ~leaves
     Fl = np.zeros((H, Wd), bool)
     Ai = np.zeros((H, Wd), bool)
+    Lv = np.zeros((H, Wd), bool)
+    if leaves is not None:
+        Lv[ii] = leaves
+    info["leaves_box"] = Lv
     Fl[ii] = fl
     Ai[ii] = air
     info["cat"], info["soft"], info["flat"], info["air"] = C, S, Fl, Ai
@@ -1418,7 +1441,8 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 max_strain=0.10, move_prior=0.002, far_total=40.0, ridge_reach=2.0, label_pitch=None, cut=False,
                 snap="recto", cut_depths=(24, 12, 6), cut_steps=(2, 1, 1), t_min=6.0, t_max=28.0, ctv=None,
                 verso_side="auto", revert_thr=None, revert_support=0.5, revert_sigma=2.0, ct_air=None,
-                far_evidence=16.0, diag=None, log=None):
+                far_evidence=16.0, coherent_reach=3, coherent_frac=0.6, cut_prior=0.01, hard_revert="caps",
+                diag=None, log=None):
     """Joint refinement of several (H,W,3) zyx grids (NaN = hole) against V, a (Z,Y,X) probability (float in
     [0,1] or uint8) at `origin`. Each iteration, for every node: the peaks along its normal ray within
     far[it] and the other sheets on that ray are matched in order (assign()); the matched peak's offset is
@@ -1512,8 +1536,8 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
     movables = [stable_nodes(g, n) for g, n in zip(grids, n_rest)] if iso else None
     last_valid = [np.zeros(g.shape[:2], bool) for g in grids] if cut else None
     last_info = [{} for _ in grids] if cut else None
-    # --far-total scales with evidence: a node may pass `far_evidence` voxels of total move only while every
-    # pass that moved it put its recto on a ridge >= thr
+    # per node: did every pass that moved it put its placed feature on a ridge (logged, not enforced: the
+    # early wide passes cross air on the way to a real sheet)
     ev_ok = [np.ones(g.shape[:2], bool) for g in grids] if cut else None
     pass_pr = [[] for _ in grids] if cut else None
     if diag is not None:
@@ -1592,12 +1616,11 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                     g, qm, qi, nn, rest[j], n_rest[j], caps[j], fades[j], V, W, ctv, int(r),
                     int(cut_steps[min(it, len(cut_steps) - 1)]), lo, hi, thr, vthr, snap, t_min, t_max,
                     float(Tg) if Tg is not None else float("nan"),
-                    (np.where(ev_ok[j], far_total, min(far_total, far_evidence)).astype(np.float32)
-                     if (far_total is not None and far_evidence is not None) else far_total), movables[j], st,
+                    far_total, movables[j], st,
                     lo_w=np.where(np.isfinite(b2), b2 / 2.0, -np.inf).astype(np.float32),
                     hi_r=np.where(np.isfinite(a2), a2 / 2.0, np.inf).astype(np.float32),
                     info=last_info[j] if it == iters - 1 else None, ridge_reach=ridge_reach, revert_thr=revert_thr,
-                    passinfo=(pi_ := {}), ct_air=ct_air)
+                    passinfo=(pi_ := {}), ct_air=ct_air, move_prior=cut_prior)
                 last_valid[j] = vmask
                 prg = pi_.get("pr", np.full(g.shape[:2], np.nan, np.float32))
                 mv_ = qm & (np.abs(dd) > 0.5) & movables[j]   # hole edges / borders carry no data: they follow
@@ -1706,15 +1729,6 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 fixed = ~(insides[j] & (fades[j] >= 1.0)) | ~np.isfinite(X)
                 Xp, left = slope_project(X, caps[j], fixed)
                 new = new + np.nan_to_num(Xp - X)[..., None] * nr
-                if cut and far_evidence is not None and far_total is not None and far_evidence < far_total:
-                    X = ((new - rest[j]) * nr).sum(-1)   # the evidence cap: clip, then the caps again around it
-                    over = ~ev_ok[j] & np.isfinite(X) & (np.abs(X) > far_evidence + 1e-3) & ~fixed
-                    st.setdefault("evidence_capped", 0)
-                    st["evidence_capped"] += int(over.sum())
-                    if over.any():
-                        Xc_ = np.where(over, np.clip(X, -far_evidence, far_evidence), X)
-                        Xp, _ = slope_project(Xc_, caps[j], fixed | over)
-                        new = new + np.nan_to_num(Xp - X)[..., None] * nr
                 st.setdefault("switches", 0)
                 st["switches"] += slope_violations(((new - rest[j]) * nr).sum(-1), caps[j])
                 st.setdefault("strain_final", []).append(strain(new, rest[j]))
@@ -1749,6 +1763,54 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         stats.append(st)
         if log:
             log(json.dumps(st))
+    if cut and far_evidence is not None and far_total is not None and far_evidence < far_total:
+        # the move allowance beyond `far_evidence`: (i) the FINAL destination has a recto >= thr within 2 voxels
+        # and is not air in the CT, and (ii) the move is coherent -- at least `coherent_frac` of the nodes
+        # within `coherent_reach` grid steps moved > far_evidence / 2 the same way (no single-node excursion).
+        # Else the move is clipped to far_evidence and the caps restored around it.
+        from scipy.ndimage import uniform_filter
+        fe = float(far_evidence)
+        gate = {"allowance_used": 0, "allowance_denied": 0, "denied_no_ridge": 0, "denied_air": 0,
+                "denied_incoherent": 0}
+        for j, g in enumerate(grids):
+            nr = np.nan_to_num(n_rest[j])
+            X = ((g - rest[j]) * nr).sum(-1)
+            fixed = ~(insides[j] & (fades[j] >= 1.0)) | ~np.isfinite(X)
+            big = ~fixed & (np.abs(np.nan_to_num(X)) > fe + 1e-3) & movables[j]   # hole edges follow their neighbours
+            if not big.any():
+                continue
+            val = (~fixed).astype(np.float32)
+            k = 2 * int(coherent_reach) + 1
+            den = np.maximum(uniform_filter(val, k, mode="constant"), 1e-6)
+            fpos = uniform_filter((val * (np.nan_to_num(X) > fe / 2)).astype(np.float32), k, mode="constant") / den
+            fneg = uniform_filter((val * (np.nan_to_num(X) < -fe / 2)).astype(np.float32), k, mode="constant") / den
+            coh = np.where(X > 0, fpos, fneg) >= coherent_frac
+            ok = np.zeros(X.shape, bool)
+            rid = np.zeros(X.shape, bool)
+            air = np.zeros(X.shape, bool)
+            ii = np.nonzero(big)
+            if snap == "recto":
+                rid[ii] = ridge_at(V, g[ii] - o, nr[ii], thr, 2)
+            else:   # the placed feature of the last pass (verso / both faces / contrast / edge / ct)
+                rid = last_valid[j].copy()
+            if ct_air is not None:   # air = no papyrus within 3 voxels along the normal: the recto face IS the
+                cv = profile(ct_air[0], g[ii] - o, nr[ii], 3).max(0)   # papyrus/air boundary, so the CT exactly
+                air[ii] = (cv * 255.0 if ct_air[0].dtype == np.uint8 else cv) < float(ct_air[1])   # there is ~half
+            ok = big & rid & ~air & coh
+            over = big & ~ok
+            gate["allowance_used"] += int(ok.sum())
+            gate["allowance_denied"] += int(over.sum())
+            gate["denied_no_ridge"] += int((over & ~rid).sum())
+            gate["denied_air"] += int((over & air).sum())
+            gate["denied_incoherent"] += int((over & ~coh).sum())
+            if over.any():
+                Xc_ = np.where(over, np.clip(X, -fe, fe), X)
+                Xp, _ = slope_project(Xc_, caps[j], fixed | over)
+                grids[j] = g + np.nan_to_num(Xp - X)[..., None] * nr
+            if diag is not None:
+                diag.setdefault("allowance", [None] * len(grids))[j] = ok
+        if stats:
+            stats[-1].update(gate)
     if iso and ridge_reach:   # a node that ends with no ridge goes back to where it was published,
         rv = {"reverted": 0, "no_ridge_left": 0}   # as far as its neighbours' slope caps allow
         for j, g in enumerate(grids):
@@ -1772,6 +1834,8 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 rv["hard_reverted"] += int((cand & hard).sum())
                 rv.setdefault("hard_air", 0)
                 rv["hard_air"] += int((cand & ~inf_["soft"] & inf_["air"]).sum())
+                rv.setdefault("window_leaves_box", 0)
+                rv["window_leaves_box"] += int((cand & inf_.get("leaves_box", np.zeros(cand.shape, bool))).sum())
                 rv.setdefault("hard_flat", 0)
                 rv["hard_flat"] += int((cand & ~inf_["soft"] & inf_["flat"]).sum())
                 cat = inf_["cat"]
@@ -1797,7 +1861,8 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
                 continue
             X0 = np.where(bad, 0.0, X)
             hard_ = (cand & hard) if (cut and "soft" in inf_) else np.zeros(bad.shape, bool)
-            if hard_.any():   # no evidence: back to the published place, full stop -- its neighbours give way
+            if hard_.any() and hard_revert == "full":   # no evidence: back to the published place, full stop --
+                # its neighbours give way (hard_revert "caps": as far as the neighbours' caps allow, like the rest)
                 fx_ = hard_ | ~(insides[j] & (fades[j] >= 1.0)) | ~np.isfinite(X)
                 Xp, _ = slope_project(X0, caps[j], fx_)
             else:
@@ -1821,10 +1886,9 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
         cap_hit = 0
         for j, g in enumerate(grids):
             X = ((g - rest[j]) * np.nan_to_num(n_rest[j])).sum(-1)
-            capj = np.where(ev_ok[j], far_total, min(far_total, far_evidence if far_evidence is not None else far_total))
-            cap_hit += int((insides[j] & np.isfinite(X) & (np.abs(X) >= capj - 0.5)).sum())
+            cap_hit += int((insides[j] & np.isfinite(X) & (np.abs(X) >= far_total - 0.5)).sum())
         stats[-1]["at_move_cap"] = cap_hit
-        stats[-1]["no_evidence_nodes"] = int(sum((~e & ins).sum() for e, ins in zip(ev_ok, insides)))
+        stats[-1]["some_pass_off_ridge"] = int(sum((~e & ins).sum() for e, ins in zip(ev_ok, insides)))
     return grids, stats
 
 
@@ -2913,6 +2977,7 @@ def run(args):
                              cut_steps=args.cut_steps_list, t_min=args.t_min, t_max=args.t_max, ctv=ctv,
                              verso_side=args.verso_side, revert_thr=args.revert_thr,
                              revert_support=args.revert_support, ct_air=ct_air, far_evidence=args.far_evidence,
+                             cut_prior=args.cut_prior, hard_revert=args.hard_revert,
                              diag=dg, log=None)
         if W is not None and args.verso_side == "auto" and dg.get("verso_side"):
             args.verso_side = dg["verso_side"]   # measured once, on the first tile: every tile uses the same side
@@ -2976,8 +3041,13 @@ def run(args):
                 g1[j] = g1[j] + np.nan_to_num(Xp - X)[..., None] * nr
         sw_stage["after_no_cross_rounds"] = n_switch(g1)
         sw_stage["no_cross_rounds"] = rnd + 1
-        if args.iso:   # the held nodes can contradict each other: close the caps by moves TOWARD the published
-            for rr_ in range(20):   # place only, re-check crossings (the guard only halves moves), until both hold
+        if args.iso:   # the held nodes can contradict each other, and the later steps (evidence clip, revert, the
+            # guard) never re-ran the fold guard: close the caps and undo folds by moves TOWARD the published place
+            # only (halving a folded node's move, then the caps around it), re-check crossings, until all hold
+            fold_fixed = 0
+            halv = [np.zeros(g.shape[:2], np.int8) for g in g0]
+            for rr_ in range(40):
+                nf_ = 0
                 for j in range(len(g1)):
                     nr = np.nan_to_num(n_rest[j])
                     X = ((g1[j] - g0[j]) * nr).sum(-1)
@@ -2985,14 +3055,23 @@ def run(args):
                     fx = ~inb | (box_taper(g0[j], o, s, args.taper) < 1.0) | ~np.isfinite(X)
                     if holds[j] is not None:
                         fx |= holds[j] > 0
-                    if slope_violations(X, caps_t[j]):
-                        Xs = shrink_to_caps(X, caps_t[j], fx)
+                    Xs = X
+                    fb = bad_nodes(g1[j], g0[j], n_rest[j], min_sp) & ~fx
+                    if fb.any():
+                        nf_ += int(fb.sum())
+                        halv[j][fb] += 1
+                        Xs = np.where(fb, np.where(halv[j] >= 6, 0.0, 0.5 * X), X).astype(np.float32)
+                    if slope_violations(Xs, caps_t[j]):
+                        Xs = shrink_to_caps(Xs, caps_t[j], fx)
+                    if Xs is not X:
                         g1[j] = g1[j] + np.nan_to_num(Xs - X)[..., None] * nr
+                fold_fixed += nf_
                 g1, nc_, _ = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0,
                                       return_masks=True)
                 ncx += nc_
-                if not nc_ and not n_switch(g1):
+                if not nc_ and not nf_ and not n_switch(g1):
                     break
+            sw_stage["fold_repairs"] = fold_fixed
             sw_stage["repair_rounds"] = rr_ + 1
         sw_stage["final"] = n_switch(g1)
         tp["switch_stages"] = sw_stage
@@ -3071,7 +3150,16 @@ def run(args):
             Xc = np.where(core, dvg, np.nan)
             mvd = core & np.isfinite(dvg) & (np.abs(dvg) > 0.5)
             dn["moved"] += int(mvd.sum())
-            dn["moved_gt30"] += int((core & (np.abs(np.nan_to_num(dvg)) > 30)).sum())
+            b30 = core & (np.abs(np.nan_to_num(dvg)) > 30)
+            dn["moved_gt30"] += int(b30.sum())
+            if b30.any():   # where the big moves start and end: air -> ridge is a real correction
+                er = ridge_at(V, b[b30] - rlo, np.nan_to_num(n0)[b30], args.thr, 2)
+                sa = np.zeros(int(b30.sum()), bool)
+                if ct_air is not None:
+                    cv = sample(ct_air[0], a[b30] - rlo)
+                    sa = (cv * 255.0 if ct_air[0].dtype == np.uint8 else cv) < float(ct_air[1])
+                for k_, v_ in (("gt30_start_air", sa), ("gt30_end_ridge", er), ("gt30_air_to_ridge", sa & er)):
+                    dn[k_] = dn.get(k_, 0) + int(v_.sum())
             if mvd.any():
                 dn["no_ridge"] += int((~ridge_at(V, b[mvd] - rlo, np.nan_to_num(n0)[mvd], args.thr, 2)).sum())
             dn["switches_free"] += int(dg.get("switches_free", [0] * len(g1))[pi_])
@@ -3359,7 +3447,11 @@ def run(args):
     tot_mv["strain"] = pct(np.concatenate(sall) if sall else np.zeros(0))
     tot_mv["no_cross_pulled"] = int(sum(tp.get("no_cross_pulled", 0) for tp in tile_pairs))
     tot_mv["folds_final"] = int(sum(diagn[x]["folds_final"] for x in diagn))
-    for k_ in ("at_move_cap", "no_evidence_nodes", "hard_reverted", "hard_air", "hard_flat", "switches_after_revert"):
+    for k_ in ("gt30_start_air", "gt30_end_ridge", "gt30_air_to_ridge"):
+        tot_mv[k_] = int(sum(diagn[x].get(k_, 0) for x in diagn))
+    for k_ in ("at_move_cap", "some_pass_off_ridge", "hard_reverted", "hard_air", "hard_flat", "switches_after_revert",
+               "allowance_used", "allowance_denied", "denied_no_ridge", "denied_air", "denied_incoherent",
+               "window_leaves_box"):
         tot_mv[k_] = int(sum((st_["iters"][-1].get(k_) or 0) for st_ in stats if st_.get("iters")))
     tot_mv["evidence_capped"] = int(sum(sum((i_.get("evidence_capped") or 0) for i_ in st_["iters"]) for st_ in stats
                                         if st_.get("iters")))
@@ -3474,8 +3566,14 @@ def parser():
                     help="(--solver cut --snap recto) a moved node keeps its move when the recto reaches this "
                          "within --ridge-reach of it (default --thr / 2: a weak ridge is still a ridge)")
     ap.add_argument("--far-evidence", type=float, default=16.0,
-                    help="(--solver cut) a node may move more than this in total (up to --far-total) only while "
-                         "every pass that moved it landed on a ridge >= --thr")
+                    help="(--solver cut) a node keeps a total move beyond this (up to --far-total) only when its "
+                         "final place has a recto >= --thr within 2 voxels, is not CT air, and >= 60%% of the "
+                         "nodes within 3 grid steps moved > half of it the same way; else it is clipped here")
+    ap.add_argument("--cut-prior", type=float, default=0.01,
+                    help="(--solver cut) cost per voxel of total move: breaks the min cut's ties on flat columns")
+    ap.add_argument("--hard-revert", choices=("full", "caps"), default="caps",
+                    help="a node with no evidence (no ridge near, air / flat) goes fully back and its neighbours "
+                         "give way (full), or back as far as its neighbours' caps allow (caps)")
     ap.add_argument("--ct-air", type=float, default=None,
                     help="CT grey level below which a node's destination is air (default: measured on the first "
                          "tile, 2-means midpoint); an air destination without a ridge always reverts")
