@@ -75,6 +75,24 @@ def test_prepare_norad_zeroes_only_the_radial_channels():
     assert x[:, L.i_radius].any()
 
 
+def test_prepare_air_floor_zeroes_raw_grey_levels_of_every_image_cube_before_the_zscore():
+    L = Config().layout()
+    b = prep.batch1(_fake_item(nctx=L.nctx, p=8))
+    x0, t0, w0 = prep.prepare(b, torch.device("cpu"), layout=L)
+    x1, t1, w1 = prep.prepare(b, torch.device("cpu"), layout=L, air_floor=torch.tensor([100.0]))
+    ct = b["ct"].float()
+    low = ct < 100
+    for c in range(L.i_cas):                                 # the CT and every context cube
+        v = x1[0, c]
+        lo = v[low[0, c]]
+        assert torch.allclose(lo, lo[0].expand_as(lo))       # one value: the z-scored zero
+        assert float(lo[0]) < float(v[~low[0, c]].min())
+    assert torch.equal(x1[:, L.i_cas:], x0[:, L.i_cas:])     # cascade, planes, radial: untouched
+    assert torch.equal(t1, t0) and torch.equal(w1, w0)       # the target is the raw-CT teacher's
+    x2, _, _ = prep.prepare(b, torch.device("cpu"), layout=L, air_floor=torch.tensor([0.0]))
+    assert torch.equal(x2, x0)                               # threshold 0 = off
+
+
 # --------------------------------------------------------------------- compact target rows
 
 def _recto_only(compact=True, seed=0, p=8, k=2, sym=0):

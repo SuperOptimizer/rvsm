@@ -9,7 +9,8 @@ from rvsm import aug, ladder, scanmeta
 
 def test_only_four_presets_and_full2_adds_exactly_the_physics_pair():
     assert sorted(aug.PRESETS) == ["full", "full2", "geo", "none"]
-    assert set(aug.get("full2")) - set(aug.get("full")) == {"paganin", "shuffle"}
+    assert set(aug.get("full2")) - set(aug.get("full")) == {"paganin", "shuffle", "air_floor"}
+    assert aug.get("full2")["air_floor"]["p"] == 0.0       # off unless the Config switches it on
     assert set(aug.get("full")) - set(aug.get("full2")) == set()
     assert aug.get("none") == {"sym": False}
     assert set(aug.get("geo")) == {"sym"} and aug.get("geo")["sym"] is True
@@ -135,3 +136,39 @@ def test_sigma_keys_cover_every_psf_op_the_presets_configure():
     assert set(aug.SIGMA_KEYS) == {"blur", "sharpen", "unsharp", "aniso_blur", "haze"}
     assert {"blur", "sharpen", "aniso_blur"} <= set(cfg)
     assert math.isclose(aug.RUNG2_UM, ladder.rung_um(2))
+
+
+def test_air_floor_hard_soft_and_per_sample_thresholds():
+    img = torch.arange(256, dtype=torch.float32).view(1, 1, 1, 1, 256).repeat(3, 2, 1, 1, 1)
+    t = torch.tensor([0.0, 48.0, 96.0])
+    h = aug.air_floor_(img.clone(), t)
+    assert torch.equal(h[0], img[0])                                   # t 0 = untouched
+    for i, tv in ((1, 48), (2, 96)):
+        assert float(h[i, :, ..., :tv].abs().max()) == 0.0
+        assert torch.equal(h[i, :, ..., tv:], img[i, :, ..., tv:])      # at and above t: unchanged
+        assert torch.equal(h[i, 0], h[i, 1])                            # every image cube, same t
+    s = aug.air_floor_(img.clone(), t, soft=True)
+    assert torch.equal(s[0], img[0])
+    assert float(s[1, 0, 0, 0, 48]) == 0.0 and abs(float(s[1, 0, 0, 0, 255]) - 255.0) < 1e-4
+    assert float(s[2, 0, 0, 0, 95]) == 0.0 and 0 < float(s[2, 0, 0, 0, 97]) < 3
+
+
+def test_air_floor_draw_probability_and_range():
+    g = torch.Generator().manual_seed(0)
+    k = {"p": 0.7, "lo": 16.0, "hi": 128.0, "log": False}
+    t = aug.air_floor_draw(k, 20000, gen=g)
+    on = t > 0
+    assert abs(float(on.float().mean()) - 0.7) < 0.02
+    assert float(t[on].min()) >= 16 and float(t[on].max()) <= 128
+    assert abs(float(t[on].mean()) - 72.0) < 2.0
+    tl = aug.air_floor_draw({**k, "log": True}, 20000, gen=g)
+    assert float(tl[tl > 0].median()) < 60                            # log-uniform: median sqrt(16*128)=45
+    assert not bool(aug.air_floor_draw({**k, "p": 0.0}, 10).any())
+
+
+def test_air_floor_is_applied_before_the_zscore_in_prepare():
+    from rvsm import prep, train
+    from rvsm.config import Config
+    cfg = Config(air_floor_p=1.0, air_floor_lo=40.0, air_floor_hi=40.0)
+    assert train.aug_for(cfg)["air_floor"] == {"p": 1.0, "lo": 40.0, "hi": 40.0, "log": False, "soft": False}
+    assert Config(air_floor_p=0.7).fingerprint() != Config().fingerprint()     # it changes the math

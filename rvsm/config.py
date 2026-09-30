@@ -342,6 +342,11 @@ class Config:
     ema: str = "auto"                  # auto = horizon chosen from the step count
     ema_k: int = 50                    # the auto-EMA constant (horizon = steps / k)
     aug: str = "full2"                 # augmentation preset, ranges centred on the scan metadata
+    air_floor_p: float = 0.0           # probability a training sample's raw CT is air-floored (0 = off)
+    air_floor_lo: float = 16.0         # ... threshold range on the raw 0..255 grey level
+    air_floor_hi: float = 128.0
+    air_floor_log: bool = False        # ... drawn log-uniform instead of uniform
+    air_floor_soft: bool = False       # soft floor max(v - t, 0) * 255 / (255 - t) instead of v < t -> 0
 
     # ------------------------------------------------------------------ fixed recipe: cascade + planes
     cascade: str = "self"              # off | mask | self | mix: source of the cascade channel

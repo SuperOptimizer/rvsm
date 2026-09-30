@@ -180,7 +180,8 @@ def batch1(item):
     return {k: (v[None] if torch.is_tensor(v) else v) for k, v in item.items()}
 
 
-def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade=None, layout=None):
+def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade=None, layout=None,
+            air_floor=None, air_floor_soft=False):
     """A collated batch of compact samples (`sample.rung_item`) -> (x, target, weight) on `dev`.
 
     `x` is (B, cin, Z, Y, X) in exactly `Layout`'s order: every image cube z-scored with the sample's
@@ -192,7 +193,8 @@ def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade
     channel's values come from; None means OFF (zeros, the "no coarse prediction" value) -- never the
     `mask` source, which is the pooled TARGET: an oracle that must be asked for by name (the eval's
     `dice_mask` bracket is the one place it enters evaluation). `layout`, when given, is asserted
-    against the result."""
+    against the result. `air_floor`: (B,) raw grey-level thresholds (`aug.air_floor_draw`, 0 = off)
+    applied to every image cube before the z-score, hard or `air_floor_soft`."""
     to = lambda t: t.to(dev, non_blocking=non_blocking)  # noqa: E731
     ct, tgt, w = to(b["ct"]), to(b["tgt"]), to(b["w"])
     # a compact item carries only its supported target rows: the full (B, T) pair, before anything reads it
@@ -204,6 +206,9 @@ def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade
     x = torch.empty((B, C + 4 + casc + npl) + tuple(S), dtype=dtype, device=ct.device)  # filled in place
     img = x[:, :C]
     img.copy_(ct)
+    if air_floor is not None:
+        from rvsm import aug as _A
+        _A.air_floor_(img, air_floor, soft=air_floor_soft)
     zscore_cubes_(img, norm, dtype)
     if casc:
         cascade = cascade if cascade is not None else Cascade("off")

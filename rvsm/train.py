@@ -915,6 +915,10 @@ def aug_for(cfg, meta=None):
     DISTANCE heads and `loss_sdist` is on -- which, in rvsm's fixed recipe, it always is.
     """
     acfg = A.get(cfg.aug, meta=meta)
+    if "air_floor" in acfg:   # the raw-stage air floor is set by the Config, not the preset
+        acfg = {**acfg, "air_floor": {**acfg["air_floor"], "p": float(cfg.air_floor_p),
+                                      "lo": float(cfg.air_floor_lo), "hi": float(cfg.air_floor_hi),
+                                      "log": bool(cfg.air_floor_log), "soft": bool(cfg.air_floor_soft)}}
     layout = cfg.layout()
     if layout.cout_t > layout.nprob and float(cfg.loss_sdist) > 0:
         off = [q for q in NON_ISOMETRIC if q in acfg]
@@ -1493,7 +1497,10 @@ def train(cfg, out=None, init=None, resume=False, patches_factory=None, device=N
         cas.clock = ph.on
         ov_now = ovnet is not None and "ov_ct" in b
         cas.keep_coarse = ov_now
-        ct, tg, wt = prep.prepare(b, dev, cascade=cas, layout=layout)
+        afk = acfg.get("air_floor")
+        aft = A.air_floor_draw(afk, int(b["ct"].shape[0])) if afk and float(afk["p"]) > 0 else None
+        ct, tg, wt = prep.prepare(b, dev, cascade=cas, layout=layout, air_floor=aft,
+                                  air_floor_soft=bool(afk and afk.get("soft")))
         ph.mark("prepare+cascade")
         ph.note(cas.take_clock())
         ovE = None

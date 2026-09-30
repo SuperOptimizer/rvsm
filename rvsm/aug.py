@@ -510,6 +510,40 @@ def for_rung(cfg, rung=2):
     return out
 
 
+# --- the air floor ------------------------------------------------------------------------------
+# The masked volumes are 0 outside the scroll, but the void between the wraps INSIDE it is low but not
+# zero, and not cleanly bimodal against the papyrus. `air_floor_` zeroes it with a per-sample threshold
+# t on the RAW 0..255 grey level: hard, v < t -> 0; or soft, max(v - t, 0) * 255 / (255 - t) (the
+# papyrus contrast stretched back to full range). Every image cube of the sample -- the CT and all its
+# context cubes -- gets the same t, so the coarse context and the fine cube agree about what is air.
+
+
+def air_floor_draw(k, b, gen=None):
+    """(B,) float thresholds on the HOST for a batch of `b`: 0 = untouched (probability 1 - p), else
+    uniform in [lo, hi] (log-uniform with k["log"])."""
+    if not k or float(k.get("p", 0.0)) <= 0:
+        return torch.zeros(b)
+    on = torch.rand(b, generator=gen) < float(k["p"])
+    lo, hi = float(k["lo"]), float(k["hi"])
+    u = torch.rand(b, generator=gen)
+    t = torch.exp(math.log(lo) + u * (math.log(hi) - math.log(lo))) if k.get("log") else lo + u * (hi - lo)
+    return torch.where(on, t, torch.zeros(b))
+
+
+def air_floor_(img, t, soft=False):
+    """In place on (B,C,Z,Y,X) raw grey levels (0..255 floats): sample i floored at t[i] (0 = skip)."""
+    t = torch.as_tensor(t, dtype=torch.float32).reshape(-1)
+    if not bool((t > 0).any()):
+        return img
+    tt = t.to(img.device, img.dtype).view(-1, 1, 1, 1, 1)
+    if soft:
+        y = (img - tt).clamp_min(0) * (255.0 / (255.0 - tt))
+    else:
+        y = torch.where(img < tt, torch.zeros_like(img), img)
+    img.copy_(torch.where(tt > 0, y, img))
+    return img
+
+
 def _gate(c, m, f, k):
     """Apply op `f` to the samples `m` (a CPU bool (B,)) selects. The whole batch selected is just
     `f(c)`; a partial selection blends with `where`. `m` lives on the HOST on purpose: deciding
@@ -616,6 +650,10 @@ PAGANIN = {"paganin": {"p": 0.3, "energy_kev": 78.0, "dist_mm": 220.0, "db": 100
                        "db_lo": 250.0, "db_hi": 2000.0, "a_lo": 2.0, "a_hi": 8.0,
                        "s_lo": 1.375, "s_hi": 5.76, "gmax": 4.0, "keep": 0.25}}
 SHUFFLE = {"shuffle": True}  # SinoSynth-style per-sample composition order for the intensity ops
+# The air floor (`air_floor_draw` / `air_floor_`): a RAW-uint8 op like `window`, so it runs in
+# `prep.prepare` before the z-score, not in `apply`. Off (p 0) in the preset; `train.aug_for` fills it
+# from the Config's `air_floor_*` fields, which is where a run switches it on.
+AIRFLOOR = {"air_floor": {"p": 0.0, "lo": 16.0, "hi": 128.0, "log": False, "soft": False}}
 
 
 def _pre(*ds):
@@ -630,7 +668,7 @@ PRESETS = {
     "geo": _pre(),                      # the 48 cube symmetries only
     "full": _pre(SPATIAL, INTENSITY, CUTOUT, SCAN, TONE, THICK, POOL, VOLCOMP, BLANK, ZJIT, SHEETCOMP),
     "full2": _pre(SPATIAL, INTENSITY, CUTOUT, SCAN, TONE, THICK, POOL, VOLCOMP, BLANK, ZJIT, SHEETCOMP,
-                  PAGANIN, SHUFFLE),
+                  PAGANIN, SHUFFLE, AIRFLOOR),
 }
 
 
