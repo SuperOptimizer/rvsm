@@ -218,6 +218,27 @@ Measured on tile 1 (`--box 55552 13696 13312 128 1024 1024`) and the 6-tile stri
   `/home/forrest/refine/pred_eval/`); it covers y < 14336 of tile 1 (62%). The student was distilled partly from
   this teacher, so it is independent of the refinement target, not of the student's lineage.
 
+- **The strip's +-40 voxel moves (d6dc3bf -> this).** After the verso-side fix the strip had 6852 moves over 30
+  voxels (2525 before) and 4440 slope switches (1531). The moved nodes STARTED in air (87% of their published
+  positions below the CT air level) and 96% ended on a recto >= 0.25; the old inward-verso coupling had held them.
+  The min cut also has ties wherever a column's costs are flat, and its tie-break slid such columns to the edge
+  of the window every pass, up to --far-total. Now:
+  - a small cost per voxel of total move (0.01) breaks those ties toward staying;
+  - `--far-evidence` (16): a node passes 16 voxels of total move (up to `--far-total`) only while every pass
+    that moved it put its placed feature on a ridge >= thr (`evidence_capped`, `at_move_cap`,
+    `moved_on_ridge_per_pass`; per node `ridge_passes/<surface>.npz`: published zyx, recto per pass, evidence);
+  - `--revert-support` never rescues a node without evidence of its own: no recto >= `--revert-thr` within
+    `--ridge-reach` of it AND (a recto profile flat below 0.15 over the window, OR its destination in air, CT
+    below `--ct-air`, default the 2-means air/papyrus midpoint measured on the first tile, 79.7 here). Such a
+    node goes back to its published place and its neighbours give way (`hard_reverted`, `hard_air`, `hard_flat`);
+  - the no-crossing guard holds the nodes it pulled while the caps are restored around them (up to 8 rounds);
+    the held nodes can still contradict each other (642 strip switches left that way), so `shrink_to_caps`
+    then closes every violated edge by moving nodes only TOWARD their published place, alternating with the
+    guard until both hold. The solve itself leaves 0 switches; `switch_stages` counts them after the solve,
+    after the first guard round, after the guard rounds and at the end.
+  Tile 1: moves > 30 108 -> 0, switches 22 -> 0, final folds 44 -> 0, reverted 10.9% -> 11.3%; recall@2 against
+  the recto teacher 0.648 -> 0.590 (published 0.407).
+
 PyMaxflow is the `refine` extra (`pip install 'rvsm[refine]'`); `--solver cut` fails at start-up with that hint
 when it is missing.
 

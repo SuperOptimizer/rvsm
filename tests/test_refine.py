@@ -861,28 +861,41 @@ def test_a_missing_verso_neither_penalises_nor_pulls_the_recto():
     assert 0.3 < st[-1]["verso_in_window"] < 0.8
 
 
-def test_a_small_gap_in_the_recto_keeps_the_interpolated_move_instead_of_a_dimple():
-    """The recto band at 36 has a hole (a 3 x 3 node patch with no ridge): the slope-consistent interpolation
-    of the neighbours stands there (revert_support), where the old revert pulled the patch back toward the
-    published 44 as far as the caps allowed; with revert_support 0 it does dimple, and the breakdown names why."""
-    pytest.importorskip("maxflow")
+def _gap_run(level, sup):
     shape = (20, 80, 40)
     z, y, x = np.mgrid[:shape[0], :shape[1], :shape[2]].astype(np.float32)
     hole = (np.abs(z - 10) <= 2.5) & (np.abs(x - 20) <= 2.5)
-    Vr = np.where(hole, 0.0, np.exp(-0.5 * ((y - 36) / 1.2) ** 2)).astype(np.float32)
+    band = np.exp(-0.5 * ((y - 36) / 1.2) ** 2)
+    Vr = np.where(hole, level * band, band).astype(np.float32)
     Vv = np.exp(-0.5 * ((y - 26) / 1.2) ** 2).astype(np.float32)
     Z, X = np.meshgrid(np.arange(2, 19, 2, dtype=np.float32), np.arange(2, 39, 2, dtype=np.float32), indexing="ij")
     g = np.stack([Z, np.full_like(Z, 44.0), X], -1)
-    out = {}
-    for sup in (0.5, 0.0):
-        (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, T=10.0, cut=True, snap="recto",
-                                   cut_depths=(12, 6), cut_steps=(1, 1), t_min=4, t_max=16, taper=0.0, sigma=1.0,
-                                   thr=0.3, verso_side="inward", revert_support=sup, revert_thr=0.3)
-        out[sup] = (new[3:6, 8:11, 1], st[-1])
-    assert out[0.5][0].mean() < out[0.0][0].mean() - 0.3
-    assert np.abs(out[0.5][0] - 36).max() <= 1.6
-    assert out[0.5][1]["reverted"] == 0 and out[0.0][1]["reverted"] >= 9
-    assert out[0.0][1]["why"]["no_peak"] > 0
+    (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, T=10.0, cut=True, snap="recto",
+                               cut_depths=(12, 6), cut_steps=(1, 1), t_min=4, t_max=16, taper=0.0, sigma=1.0,
+                               thr=0.3, verso_side="inward", revert_support=sup, revert_thr=0.3)
+    return new[3:6, 8:11, 1], st[-1]
+
+
+def test_a_weak_gap_in_the_recto_keeps_the_interpolated_move_instead_of_a_dimple():
+    """The recto band at 36 is weak (0.2 < revert_thr) over a 3 x 3 node patch: the slope-consistent
+    interpolation of the neighbours stands there (revert_support), where the old revert pulled the patch back
+    toward the published 44 as far as the caps allowed; with revert_support 0 it dimples."""
+    pytest.importorskip("maxflow")
+    y5, s5 = _gap_run(0.2, 0.5)
+    y0, s0 = _gap_run(0.2, 0.0)
+    assert y5.mean() < y0.mean() - 0.3
+    assert np.abs(y5 - 36).max() <= 1.6
+    assert s5["reverted"] == 0 and s0["reverted"] >= 9
+    assert s0["why"]["weak_peak"] > 0
+
+
+def test_no_recto_at_all_reverts_the_node_whatever_its_neighbours_say():
+    """An EMPTY patch (flat recto profile): neighbour support must not rescue it; it goes back to the published
+    44 and its neighbours give way (caps kept, no switch)."""
+    pytest.importorskip("maxflow")
+    y5, s5 = _gap_run(0.0, 0.5)
+    assert abs(y5[1, 1] - 44) <= 0.6
+    assert s5["hard_reverted"] >= 1 and s5["switches_after_revert"] == 0
 
 
 def test_cut_solver_fails_loudly_without_pymaxflow(monkeypatch):
@@ -890,3 +903,32 @@ def test_cut_solver_fails_loudly_without_pymaxflow(monkeypatch):
     monkeypatch.setitem(sys.modules, "maxflow", None)
     with pytest.raises(ImportError, match=r"rvsm\[refine\]"):
         R.two_surface_cut(np.zeros((1, 2, 3)), None, (1, 1))
+
+
+def test_far_total_scales_with_evidence():
+    """A weak band (0.35 < thr 0.5) 24 voxels off the published sheet: without a ridge >= thr under every
+    move, the node may not pass --far-evidence (16) of total move; with the cap off it goes all the way."""
+    pytest.importorskip("maxflow")
+    shape = (16, 90, 40)
+    Vr = (0.35 * band_volume(shape, lambda x: 36 + 0 * x, 2.0)).astype(np.float32)
+    Vv = (0.35 * band_volume(shape, lambda x: 26 + 0 * x, 2.0)).astype(np.float32)
+    g = flat_sheet(60.0, x=(2, 38))
+    res = {}
+    for fe in (16.0, None):
+        (new,), st = R.refine_many([g], Vr, (0, 0, 0), AX_Y, W=Vv, T=10.0, cut=True, snap="recto",
+                                   cut_depths=(24, 12, 6), cut_steps=(2, 1, 1), t_min=4, t_max=16, taper=0.0,
+                                   sigma=1.0, thr=0.5, verso_side="inward", far_evidence=fe)
+        res[fe] = (float(np.median(new[2:-2, 2:-2, 1])), st[-1])
+    assert res[16.0][0] >= 60 - 16 - 0.6, res[16.0][0]     # at the cap, or reverted (no ridge there)
+    assert res[None][0] <= 38.0, res[None][0]
+
+
+def test_shrink_to_caps_only_moves_toward_the_published_place():
+    caps = (np.full((2, 4), 1.0, np.float32), np.full((3, 3), 1.0, np.float32))
+    X = np.array([[0, 0, 0, 0], [0, 5, 0.5, 0], [0, -4, 0, 0]], np.float32)
+    fixed = np.zeros(X.shape, bool)
+    fixed[:, 0] = True
+    Y = R.shrink_to_caps(X, caps, fixed)
+    assert R.slope_violations(Y, caps) == 0
+    assert (np.abs(Y) <= np.abs(X) + 1e-6).all() and (np.sign(Y) * np.sign(X) >= 0).all()
+    assert (Y[fixed] == X[fixed]).all()
