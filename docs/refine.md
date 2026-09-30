@@ -290,6 +290,16 @@ tile it saves what the tile added (`<out>/tiles/tile_NNN.pkl`, then `tile_NNN.js
 replays finished tiles and computes the rest (`test_refine_slab_resumes_a_tile_run_to_the_same_result`). The
 verso side and the CT air level are measured on the first computed tile and carried in the checkpoints.
 
+`--workers N` (with `--worker-mem 5G --worker-jobs 2`) turns it into a tile pool: tile 1 runs first alone (it
+fixes the verso side and the CT air level for every tile), then N worker processes, each in its own
+`systemd-run --user --scope -p MemoryMax=<worker-mem>` cgroup, claim the undone tiles in order
+(`tiles/tile_NNN.lock`, atomic create), checkpoint them and exit; the parent then replays every checkpoint and
+writes the surfaces. A worker that dies (OOM, a lost login session) leaves a lock without a json; the next round
+hands its tile out again. PyMaxflow holds the GIL, so the solves inside a tile use forked processes (`--jobs`),
+not threads. Tiles 1 and 2 of the Paris 4 slab from the pool and from the one-process run are identical (max
+difference 0 over 481 k nodes, identical pass statistics). Launch detached (`setsid`), or a closing login session
+takes the run with it.
+
 ## Frames (the one thing that goes silently wrong)
 
 - The stores and the umbilicus are in the fine volume `20260411134726` (2.4 µm, rung 2) frame.

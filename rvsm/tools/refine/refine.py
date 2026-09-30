@@ -3192,6 +3192,7 @@ def run(args):
              for x0 in range(int(lo[2]), int(lo[2] + shape[2]), tile)]
     log(json.dumps({"tiles": len(cores), "tile": tile, "halo": halo}))
     box_lo, box_hi = lo.astype(np.int64), (lo + shape).astype(np.int64)
+    only_tiles = None if not args.only_tiles else {int(v) for v in str(args.only_tiles).split(",") if v.strip()}
     # ---- per-tile checkpoints (--resume-dir): everything a tile adds to the run's accumulators is saved when
     # the tile is done (tile_NN.pkl, then tile_NN.json = the done marker) and replayed instead of recomputed
     LISTS = ("own_r", "own_c", "own_v", "own_f", "ridge_log")
@@ -3281,12 +3282,28 @@ def run(args):
 
     for ti, (cy0, cy1, cx0, cx1) in enumerate(cores):
         t_tile, st0 = time.perf_counter(), dict(STAGES)
+        if only_tiles is not None and (ti + 1) not in only_tiles:
+            continue
         if args.resume_dir and os.path.exists(os.path.join(args.resume_dir, f"tile_{ti + 1:03d}.json")):
+            if args.claim:   # a pool worker: finished tiles are the assembler's business
+                continue
             import pickle
             with open(os.path.join(args.resume_dir, f"tile_{ti + 1:03d}.pkl"), "rb") as f:
                 _apply(pickle.load(f))
             log(json.dumps({"tile": ti + 1, "of": len(cores), "resumed": True}))
             continue
+        if args.claim:   # a pool worker takes a tile no other worker holds (atomic create of tile_NNN.lock)
+            os.makedirs(args.resume_dir, exist_ok=True)
+            try:
+                fd = os.open(os.path.join(args.resume_dir, f"tile_{ti + 1:03d}.lock"), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+            except FileExistsError:
+                continue
+            # a worker's accumulators hold only its own tiles: start each tile from empty ones
+            for x in surf:
+                for k in LISTS:
+                    x[k] = []
         snap0 = _snap() if args.resume_dir else None
         tlo = np.array([box_lo[0], max(cy0 - halo, box_lo[1]), max(cx0 - halo, box_lo[2])], np.int64)
         thi = np.array([box_hi[0], min(cy1 + halo, box_hi[1]), min(cx1 + halo, box_hi[2])], np.int64)
@@ -3630,6 +3647,10 @@ def run(args):
                         "rss_gb": round(_rss_gb(), 2), "cgroup_free_gb": None if hd_ is None else round(hd_ / 2 ** 30, 2)}))
         if snap0 is not None:
             _save(ti, snap0, time.perf_counter() - t_tile)
+
+    if args.claim:   # a pool worker writes checkpoints only; the assembler replays them and writes the surfaces
+        log(json.dumps({"worker_done": os.getpid()}))
+        return 0
 
     # ---- write: one full published grid in memory at a time
     os.makedirs(args.out, exist_ok=True)
@@ -4040,6 +4061,10 @@ def parser():
                     help="budget for the max-flow graphs the --jobs workers hold at once (~450 bytes per graph node)")
     ap.add_argument("--resume-dir", help="per-tile checkpoints: a tile whose tile_NNN.json is there is replayed, not "
                                          "recomputed (rvsm refine-slab)")
+    ap.add_argument("--claim", action="store_true",
+                    help="tile-pool worker (rvsm refine-slab --workers): claim undone tiles in order via "
+                         "<resume-dir>/tile_NNN.lock, checkpoint them, write no surfaces")
+    ap.add_argument("--only-tiles", help="comma list of 1-based tile numbers to compute (others are skipped)")
     ap.add_argument("--no-ridge-log", action="store_true", help="no ridge_passes/<surface>.npz (per-node per-pass log)")
     ap.add_argument("--no-before", action="store_true", help="do not write the <surface>.before copies")
     ap.add_argument("--revert-diag", action=argparse.BooleanOptionalAction, default=True,
@@ -4073,6 +4098,9 @@ def slab_main(argv=None):
     sp = argparse.ArgumentParser(add_help=False)
     sp.add_argument("--pred-dir", required=True)
     sp.add_argument("--pictures", action="store_true")
+    sp.add_argument("--workers", type=int, default=1)
+    sp.add_argument("--worker-mem", default="5G")
+    sp.add_argument("--worker-jobs", type=int, default=2)
     a, rest = sp.parse_known_args(argv)
     pd_ = a.pred_dir
     base = ["--recto", os.path.join(pd_, "recto.zarr"), "--verso", os.path.join(pd_, "verso.zarr")]
@@ -4085,7 +4113,63 @@ def slab_main(argv=None):
              os.path.join(out, "tiles")]
     if not a.pictures:
         base += ["--no-pictures", "--no-before", "--no-ridge-log", "--no-revert-diag", "--crops", "0"]
+    if a.workers > 1:
+        _tile_pool(base + rest, os.path.join(out, "tiles"), a.workers, a.worker_mem, a.worker_jobs, out)
     return main(base + rest)   # later options win: anything given explicitly overrides these defaults
+
+
+def _tile_pool(argv, tdir, n, mem, jobs, out):
+    """The tile pool of `rvsm refine-slab --workers N`: N worker processes, each in its own
+    `systemd-run --user --scope -p MemoryMax=<mem>` cgroup, claim the undone tiles in order (tile_NNN.lock),
+    checkpoint them and exit; this process then assembles (replays every checkpoint and writes the surfaces).
+    The verso side and the CT air level are fixed first (tile 1, alone, when it is not done yet) so every tile
+    uses the same. Dead workers (OOM, a lost session) leave a lock without a json: the next round clears those
+    and hands the tiles out again (at most 3 rounds without progress)."""
+    import glob as _g
+    import pickle
+    import shutil
+    import subprocess
+    os.makedirs(tdir, exist_ok=True)
+    py = [sys.executable, "-m", "rvsm.tools.refine.refine"]
+    cap = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={mem}", "-p", "MemorySwapMax=0"] \
+        if shutil.which("systemd-run") else []
+    wargs = argv + ["--claim", "--jobs", str(jobs)]
+
+    def clear_stale():
+        for lk in _g.glob(os.path.join(tdir, "tile_*.lock")):
+            if not os.path.exists(lk[:-5] + ".json"):
+                os.remove(lk)
+
+    def done():
+        return len(_g.glob(os.path.join(tdir, "tile_*.json")))
+    clear_stale()
+    logf = open(os.path.join(out, "pool.log"), "a")
+    if not os.path.exists(os.path.join(tdir, "tile_001.json")):   # fixes the verso side and the CT air level
+        subprocess.run(cap + py + wargs + ["--only-tiles", "1"], stdout=logf, stderr=subprocess.STDOUT)
+    fixed = []
+    try:
+        with open(os.path.join(tdir, "tile_001.pkl"), "rb") as f:
+            d1 = pickle.load(f)
+        if d1.get("verso_side") not in (None, "auto") and "--verso-side" not in argv:
+            fixed += ["--verso-side", d1["verso_side"]]
+        if d1.get("ct_air") is not None and "--ct-air" not in argv:
+            fixed += ["--ct-air", str(d1["ct_air"])]
+    except (OSError, EOFError):
+        pass
+    stall = 0
+    while stall < 3:
+        before = done()
+        clear_stale()
+        procs = [subprocess.Popen(cap + py + wargs + fixed, stdout=logf, stderr=subprocess.STDOUT) for _ in range(n)]
+        for p_ in procs:
+            p_.wait()
+        stall = stall + 1 if done() == before else 0
+        undone = [lk for lk in _g.glob(os.path.join(tdir, "tile_*.lock")) if not os.path.exists(lk[:-5] + ".json")]
+        print(json.dumps({"pool_round": "done", "tiles_done": done(), "stale": len(undone)}), flush=True)
+        if not undone and all(p_.returncode == 0 for p_ in procs):
+            break
+    logf.close()
+    clear_stale()
 
 
 def main(argv=None):

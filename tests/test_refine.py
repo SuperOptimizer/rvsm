@@ -1025,3 +1025,40 @@ def test_a_solve_split_into_strips_matches_the_whole_solve_on_a_smooth_band(monk
     monkeypatch.setattr(R, "MAX_GRAPH_NODES", H * W * Z // 4)
     strips, _ = R.cut_cropped(Cr, None, ok, (1, 1), pin=6)
     assert (whole[ok] == strips[ok]).mean() > 0.99
+
+
+def test_refine_slab_tile_pool_matches_the_sequential_run(tmp_path, has_volcomp):
+    """rvsm refine-slab --workers 2: two worker processes claim the tiles, the parent assembles; the surface and
+    the pooled numbers equal the one-process run's."""
+    if not has_volcomp:
+        pytest.skip("volcomp not available")
+    import tifffile
+
+    from rvsm import stores
+    o = np.array([128, 256, 384])
+    z, y, x = np.mgrid[:128, :128, :128].astype(np.float32)
+    yc = 60 + 0.1 * x
+    pdir = tmp_path / "pred"
+    pdir.mkdir()
+    stores.write(str(pdir / "recto.zarr"), stores.u8(np.exp(-0.5 * ((y - yc) / 1.5) ** 2)), o, q=0)
+    stores.write(str(pdir / "verso.zarr"), stores.u8(np.exp(-0.5 * ((y - (yc + 8)) / 1.5) ** 2)), o, q=0)
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": -20000, "x": 448}, {"z": 1000, "y": -20000, "x": 448}]}))
+    g = slanted_grid(H=34, W=22, step=6.0)
+    g[..., 1] = o[1] + 60 + 0.1 * (g[..., 2] - o[2]) + 3.0
+    write_tifxyz_raw(str(tmp_path / "paths" / "segB" / "segB-on-20260411134726-2.4um.tifxyz"), g)
+    nm = "segB-on-20260411134726-2.4um"
+    res = {}
+    for w in (1, 2):
+        out = tmp_path / f"slab{w}"
+        args = ["--pred-dir", str(pdir), "--paths", str(tmp_path / "paths"), "--umbilicus", str(umb), "--out",
+                str(out), "--z0", str(o[0] + 32), "--dz", "64", "--far", "8", "--thr", "0.3", "--taper", "4",
+                "--tile", "48", "--halo", "44", "--pitch", "3", "--slices", "1", "--workers", str(w),
+                "--worker-mem", "2G"]
+        assert R.slab_main(args) == 0
+        res[w] = (np.stack([tifffile.imread(str(out / nm / f"{c}.tif")) for c in "zyx"], -1),
+                  json.load(open(out / "refine_report.json")))
+    assert (tmp_path / "slab2" / "pool.log").exists()
+    np.testing.assert_allclose(res[1][0], res[2][0], atol=1e-4)
+    assert res[1][1]["pooled"] == res[2][1]["pooled"]
+    assert res[2][1]["geometry"]["verso_side"] == "outward"
