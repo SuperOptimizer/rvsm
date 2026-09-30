@@ -261,6 +261,35 @@ Measured on tile 1 (`--box 55552 13696 13312 128 1024 1024`) and the 6-tile stri
 PyMaxflow is the `refine` extra (`pip install 'rvsm[refine]'`); `--solver cut` fails at start-up with that hint
 when it is missing.
 
+## Speed and the production run (`rvsm refine-slab`)
+
+cProfile of tile 1 (fix3, 854 s wall): the no-crossing pairs 420 s (the neighbour search over every node, redone by
+`no_cross` in every guard / repair round and by `pair_stats` three times), max flow 252 s, the rest < 30 s each.
+Changes, every one leaving the output identical (tile 1: max |difference| 0.0 over 79 M written coordinates,
+identical pooled metrics and geometry):
+
+- `pair_index`: a tile's no-crossing pairs are found ONCE on the published grids and reused by every `no_cross`
+  round and `pair_stats` (the sampled pairs are a subset: the same as searching from the sampled nodes alone);
+- the kd-tree queries run on every core (`workers=-1`), and the per-sheet searches (`sheet_pairs`, each pass's
+  neighbour sheets) run in threads;
+- `cut_cropped`: each max-flow graph covers only the bounding rectangle of the nodes being solved plus one ring
+  (a piece's grid is the rectangle of a slanted band: mostly pinned nodes outside the tile);
+- the per-grid solves of a pass run in `--jobs` (4) forked workers (PyMaxflow holds the GIL);
+- the coupled solve no longer samples the unused single-surface profiles;
+- production flags: `--no-pictures`, `--no-before`, `--no-ridge-log`, `--no-revert-diag` (the extra recto-only
+  solve that splits held_by_coupling from held_by_slope), and per-stage timings in every tile's `tile_time` line
+  and in the report's `timings`.
+
+Not done, because they change results: fewer far-schedule passes when a pass moves little, skipping small
+pieces, fewer kd-tree neighbours.
+
+`rvsm refine-slab --z0 Z --dz 128 --pred-dir DIR --paths DIR --out DIR [--umbilicus U --transform T]` runs every
+tile of the prediction slab with the fix3 settings (tile 1024, halo 160, pitch 5, sigma 8) and the production
+flags, and writes one refined tifxyz per surface (the part inside the slab) plus `refine_report.json`. After each
+tile it saves what the tile added (`<out>/tiles/tile_NNN.pkl`, then `tile_NNN.json` as the done marker); a rerun
+replays finished tiles and computes the rest (`test_refine_slab_resumes_a_tile_run_to_the_same_result`). The
+verso side and the CT air level are measured on the first computed tile and carried in the checkpoints.
+
 ## Frames (the one thing that goes silently wrong)
 
 - The stores and the umbilicus are in the fine volume `20260411134726` (2.4 µm, rung 2) frame.

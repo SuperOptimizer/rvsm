@@ -38,9 +38,35 @@ import os
 import shutil
 import sys
 
+import time
+from contextlib import contextmanager
+
 import numpy as np
 
 from rvsm import evalsurf as E
+
+STAGES = {}   # wall-clock seconds per stage / hot function (inclusive), for the per-tile timing lines
+
+
+@contextmanager
+def timed(name):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        STAGES[name] = STAGES.get(name, 0.0) + time.perf_counter() - t0
+
+
+def _timed_fn(name):
+    def deco(f):
+        import functools
+
+        @functools.wraps(f)
+        def w(*a, **k):
+            with timed(name):
+                return f(*a, **k)
+        return w
+    return deco
 
 LEGACY_VOLUME = "20230205180739"   # PHerc Paris 4, 7.91 um: the frame the volpkg segments were traced in
 FINE_VOLUME = "20260411134726"     # PHerc Paris 4, 2.4 um: the frame every rvsm store is in
@@ -62,6 +88,7 @@ def sample(V, q):
     return out / 255.0 if V.dtype == np.uint8 else out
 
 
+@_timed_fn("profile")
 def profile(V, q, n, far):
     """Probability sampled along the normal: (2*far+1, N)."""
     ts = np.arange(-far, far + 1, dtype=np.float32)
@@ -125,6 +152,10 @@ def assign(pos, stren, below, above, alpha=0.08):
     return out
 
 
+QUERY_WORKERS = -1   # cKDTree queries on every core (identical results; the tile's no-cross pairs were 60% of its time)
+
+
+@_timed_fn("ray_neighbours")
 def ray_neighbours(q, n, others, R, lateral=3.0, k=48, return_index=False, min_sep=0.5):
     """Offsets along the normal of the nearest other-sheet points below (<0) and above (>0) each point, NaN if
     none (with return_index: also their indices into `others`, -1 if none). Vectorised over the k nearest
@@ -141,7 +172,7 @@ def ray_neighbours(q, n, others, R, lateral=3.0, k=48, return_index=False, min_s
     kk = min(int(k), len(others))
     for i in range(0, len(q), 200_000):
         sl = slice(i, i + 200_000)
-        dist, idx = tree.query(q[sl], k=kk, distance_upper_bound=R + lateral)
+        dist, idx = tree.query(q[sl], k=kk, distance_upper_bound=R + lateral, workers=QUERY_WORKERS)
         dist, idx = dist.reshape(len(dist), -1), idx.reshape(len(idx), -1)
         ok = np.isfinite(dist)
         idc = np.minimum(idx, len(others) - 1)
@@ -166,11 +197,12 @@ def sheet_pairs(P, n, gid, R, lateral, qmask=None, min_sep=0.5, dup=None):
     `qmask` ones: the nearest node of ANOTHER sheet (any node) above and below along its normal (within R,
     `lateral`, and at least `min_sep` away). dup: (K,K) bool, sheets that are traces of the same wrap
     (`duplicate_sheets`) are not each other's neighbours. Returns (i, j) index arrays."""
-    I, J = [], []
-    for g in np.unique(gid):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(g):
         sel = np.nonzero((gid == g) & (True if qmask is None else qmask))[0]
         if not len(sel):
-            continue
+            return []
         q = P[sel]
         pad = R + lateral + 1.0
         bl, bh = q.min(0) - pad, q.max(0) + pad
@@ -179,12 +211,16 @@ def sheet_pairs(P, n, gid, R, lateral, qmask=None, min_sep=0.5, dup=None):
             other &= ~dup[int(g)][gid]
         oth = np.nonzero(other & ((P >= bl) & (P <= bh)).all(-1))[0]
         if not len(oth):
-            continue
+            return []
         _, _, ib, ia = ray_neighbours(q, n[sel], P[oth], R, lateral=lateral, return_index=True, min_sep=min_sep)
-        for ix in (ib, ia):
-            k = ix >= 0
-            I.append(sel[k])
-            J.append(oth[ix[k]])
+        return [(sel[ix >= 0], oth[ix[ix >= 0]]) for ix in (ib, ia)]
+    I, J = [], []
+    gs = list(np.unique(gid))
+    with ThreadPoolExecutor(max(1, min(8, len(gs)))) as ex:   # numpy and the tree queries release the GIL
+        for res in ex.map(one, gs):                            # (in sheet order: the same pairs, the same order)
+            for a_, b_ in res:
+                I.append(a_)
+                J.append(b_)
     if not I:
         return np.zeros(0, np.int64), np.zeros(0, np.int64)
     return np.concatenate(I), np.concatenate(J)
@@ -197,6 +233,7 @@ def grid_stride_mask(shape, stride):
     return m
 
 
+@_timed_fn("duplicate_sheets")
 def duplicate_sheets(grids, dgap, stride=3, reach=2.5):
     """(K,K) bool: pairs of grids that are traces of the SAME wrap. Published segmentations overlap: two
     segments of one wrap run a few voxels apart, and treated as neighbours they wall each other off (and every
@@ -220,7 +257,7 @@ def duplicate_sheets(grids, dgap, stride=3, reach=2.5):
                 continue
             ds = []
             for a, b in ((j, k), (k, j)):
-                d, _ = trees[b].query(pts[a][1], distance_upper_bound=R)
+                d, _ = trees[b].query(pts[a][1], distance_upper_bound=R, workers=QUERY_WORKERS)
                 ds.append(d[np.isfinite(d)])
             d = np.concatenate(ds)
             if len(d) >= 10 and float(np.median(d)) < dgap:
@@ -228,12 +265,30 @@ def duplicate_sheets(grids, dgap, stride=3, reach=2.5):
     return dup
 
 
-def no_cross(grids_ref, grids_now, ns, dup=None, R=48.0, lateral=None, steps=6, return_masks=False):
+def pair_index(grids_ref, ns, dup=None, R=48.0, lateral=None):
+    """The no-crossing pairs of a tile, found ONCE on the published grids (they never change): every node's
+    nearest non-duplicate other-sheet node above and below along its normal. `no_cross` and `pair_stats`
+    take it instead of re-running the search (up to ~50 times per tile in the repair loop). Returns a dict
+    with the flattening masks, the concatenated points / normals / sheet ids and the pairs (i, j)."""
+    oks = [np.isfinite(a).all(-1) & np.isfinite(n).all(-1) for a, n in zip(grids_ref, ns)]
+    P = np.concatenate([a[k] for a, k in zip(grids_ref, oks)] or [np.zeros((0, 3), np.float32)])
+    N = np.concatenate([n[k] for n, k in zip(ns, oks)] or [np.zeros((0, 3), np.float32)])
+    G = np.concatenate([np.full(int(k.sum()), j) for j, k in enumerate(oks)] or [np.zeros(0, np.int64)])
+    lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_ref])))
+    i, j = sheet_pairs(P, N, G, R, lat, dup=dup) if len(P) else (np.zeros(0, np.int64), np.zeros(0, np.int64))
+    return {"oks": oks, "P": P, "N": N, "G": G, "i": i, "j": j, "R": float(R), "lateral": float(lat)}
+
+
+@_timed_fn("no_cross")
+def no_cross(grids_ref, grids_now, ns, dup=None, R=48.0, lateral=None, steps=6, return_masks=False, pairs=None):
     """Hard no-crossing: every node's nearest non-duplicate neighbour node above and below along its normal is
     found once on `grids_ref` (the published grids, which do not cross); a node pair whose side has flipped in
     `grids_now` has BOTH nodes' moves (grids_now - grids_ref) halved, up to `steps` times, then undone.
     Returns (grids, number of nodes pulled back)."""
     Rs, Ds, N, G, idx = [], [], [], [], []
+    if pairs is not None and not all(np.array_equal(pk, np.isfinite(a).all(-1) & np.isfinite(b).all(-1) & np.isfinite(n).all(-1))
+                                     for pk, a, b, n in zip(pairs["oks"], grids_ref, grids_now, ns)):
+        pairs = None   # a node became a hole: the cached layout no longer applies
     for k, (a, b, n) in enumerate(zip(grids_ref, grids_now, ns)):
         ok = np.isfinite(a).all(-1) & np.isfinite(b).all(-1) & np.isfinite(n).all(-1)
         Rs.append(a[ok])
@@ -245,8 +300,11 @@ def no_cross(grids_ref, grids_now, ns, dup=None, R=48.0, lateral=None, steps=6, 
         return ([g.copy() for g in grids_now], 0, [np.zeros(g.shape[:2], bool) for g in grids_now]) if return_masks \
             else ([g.copy() for g in grids_now], 0)
     Rr, D, N, G = (np.concatenate(x) for x in (Rs, Ds, N, G))
-    lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_ref])))
-    i, j = sheet_pairs(Rr, N, G, R, lat, dup=dup)
+    if pairs is not None:
+        i, j = pairs["i"], pairs["j"]
+    else:
+        lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_ref])))
+        i, j = sheet_pairs(Rr, N, G, R, lat, dup=dup)
     gr = np.sign(((Rr[j] - Rr[i]) * N[i]).sum(-1))
     t = np.ones(len(Rr), np.float32)
     ev = np.zeros(len(Rr), bool)
@@ -272,7 +330,7 @@ def no_cross(grids_ref, grids_now, ns, dup=None, R=48.0, lateral=None, steps=6, 
     return (out, int(ev.sum()), masks) if return_masks else (out, int(ev.sum()))
 
 
-def pair_stats(grids_ref, grids_now, ns, min_gap, R=None, lateral=None, stride=3, dup_gap=0.5, dup=None):
+def pair_stats(grids_ref, grids_now, ns, min_gap, R=None, lateral=None, stride=3, dup_gap=0.5, dup=None, pairs=None):
     """Adjacent-wrap spacing of a tile's sheets. The pairs are found on `grids_ref` (the published grids): from
     every `stride`-th node, the nearest node of another sheet along its normal that is at least `dup_gap` away
     (nearer ones are other traces of the same wrap: "coincident", counted separately). Each pair is then
@@ -296,7 +354,13 @@ def pair_stats(grids_ref, grids_now, ns, min_gap, R=None, lateral=None, stride=3
     # them (the refined pitch here let 4 pairs of the strip be counted that the guard never saw)
     lat = lateral if lateral is not None else max(3.0, 0.75 * float(np.nanmedian([pitch(g) for g in grids_ref])))
     R = float(R) if R is not None else 2.0 * max(float(min_gap), float(dup_gap)) + 8.0
-    if dup is not None:
+    if dup is not None and pairs is not None and pairs["R"] == R and pairs["lateral"] == lat and all(
+            np.array_equal(pk, np.isfinite(a).all(-1) & np.isfinite(b).all(-1) & np.isfinite(n).all(-1))
+            for pk, a, b, n in zip(pairs["oks"], grids_ref, grids_now, ns)):
+        keep = Qm[pairs["i"]]   # the cached pairs of the sampled nodes: the same as searching from them alone
+        i, j = pairs["i"][keep], pairs["j"][keep]
+        ncoin = int(np.triu(dup, 1).sum())
+    elif dup is not None:
         i, j = sheet_pairs(Rr, N, G, R, lat, qmask=Qm, dup=dup)
         ncoin = int(np.triu(dup, 1).sum())
     else:
@@ -697,6 +761,7 @@ def _minplus(A, caps, max_iter=100_000):
     return A
 
 
+@_timed_fn("slope_project")
 def slope_project(X, caps, fixed, iters=None):
     """Displacements X (H,W) (NaN = hole) made to satisfy |X_i - X_j| <= cap_ij on every grid edge EXACTLY,
     with the `fixed` nodes kept: free nodes are first clipped into the band the fixed nodes allow (geodesic
@@ -720,6 +785,7 @@ def slope_project(X, caps, fixed, iters=None):
     return out, slope_violations(out, caps)
 
 
+@_timed_fn("shrink_to_caps")
 def shrink_to_caps(X, caps, fixed, tol=0.01, max_iter=10_000):
     """X (H,W) made to obey |X_i - X_j| <= cap on every grid edge by moving nodes only TOWARD 0 (their published
     place): on a violated edge the end farther from 0 is set to the other end +- cap (to 0 at most, never past
@@ -920,6 +986,7 @@ def reparam(P, P0, w):
     return _reparam_rows(P.transpose(1, 0, 2), P0.transpose(1, 0, 2), w.T).transpose(1, 0, 2).copy()
 
 
+@_timed_fn("bad_nodes")
 def bad_nodes(P, P0, n0, min_sp):
     """Nodes of P (H,W,3) that fold or bunch relative to the rest grid P0: incident to a quad whose two
     triangles' orientation (cross of the u and v edges, dotted with the normal) has flipped against P0's, or
@@ -960,6 +1027,7 @@ def bad_nodes(P, P0, n0, min_sp):
     return bad
 
 
+@_timed_fn("fold_guard")
 def fold_guard(P_prev, P_new, P0, n0, min_sp, steps=4, max_strain=None, return_mask=False):
     """P_prev + t * (P_new - P_prev) with t = 1, except at nodes that fold or bunch (`bad_nodes`): their t is
     halved up to `steps` times, then 0 (the previous position, which passed). Returns (P, n pulled-back nodes)
@@ -1026,6 +1094,7 @@ def _offset_structure(off):
     return st
 
 
+@_timed_fn("maxflow")
 def two_surface_cut(Cr, Cw, dz, t_min=0, t_max=0, big=1e9):
     """EXACT joint optimum of two coupled terrain-like surfaces over an (H,W) grid (Li, Wu, Chen & Sonka 2006,
     'Optimal surface segmentation in volumetric images'; one minimum closed set by s-t min cut): per node a
@@ -1068,6 +1137,73 @@ def two_surface_cut(Cr, Cw, dz, t_min=0, t_max=0, big=1e9):
     return np.clip(idx[1], 0, Z - 1), np.clip(idx[0], 0, Z - 1)
 
 
+def cut_cropped(Cr, Cw, ok, dz, t_min=0, t_max=0, pin=0):
+    """`two_surface_cut` on the bounding rectangle of the solved nodes (`ok`, grown by one node: the pinned
+    neighbours that constrain them). A piece's grid is the bounding rectangle of a slanted band, mostly nodes
+    outside the tile that are pinned at depth `pin` and constrain nothing but each other; they stay at `pin`."""
+    from scipy.ndimage import binary_dilation
+    H, Wd = ok.shape
+    okd = binary_dilation(ok) if ok.any() else ok
+    if not okd.any():
+        r = np.full((H, Wd), pin, np.int64)
+        return r, (r.copy() if Cw is not None else None)
+    rows, cols = np.nonzero(okd.any(1))[0], np.nonzero(okd.any(0))[0]
+    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    if (r1 - r0) * (c1 - c0) == H * Wd:
+        return two_surface_cut(Cr, Cw, dz, t_min, t_max)
+    rc, wc = two_surface_cut(np.ascontiguousarray(Cr[r0:r1, c0:c1]),
+                             None if Cw is None else np.ascontiguousarray(Cw[r0:r1, c0:c1]), dz, t_min, t_max)
+    r = np.full((H, Wd), pin, np.int64)
+    r[r0:r1, c0:c1] = rc
+    w = None
+    if wc is not None:
+        w = np.full((H, Wd), pin, np.int64)
+        w[r0:r1, c0:c1] = wc
+    return r, w
+
+
+CUT_JOBS = 1          # worker processes for the per-grid cut solves of a pass (--jobs)
+_CUT_SHARED = {}      # the tile's stores, inherited by the forked workers (never pickled)
+
+
+def _cut_worker(ca):
+    """One grid's `_cut_move` in a worker (or in-process): the big arrays come from _CUT_SHARED."""
+    (g, qm, qi, nn, rest_j, n_rest_j, caps_j, fade_j, r, step, lo, hi, thr, vthr, snap, t_min, t_max, T_, far_total,
+     movable, lo_w, hi_r, last, ridge_reach, revert_thr, cut_prior) = ca
+    sh = _CUT_SHARED
+    st_, pi_ = {}, {}
+    info = {} if last else None
+    dd, conf, vmask = _cut_move(g, qm, qi, nn, rest_j, n_rest_j, caps_j, fade_j, sh["V"], sh["W"], sh["ctv"], r, step,
+                                lo, hi, thr, vthr, snap, t_min, t_max, T_, far_total, movable, st_, lo_w=lo_w,
+                                hi_r=hi_r, info=info, ridge_reach=ridge_reach, revert_thr=revert_thr, passinfo=pi_,
+                                ct_air=sh["ct_air"], move_prior=cut_prior)
+    return dd, conf, vmask, pi_, info, st_
+
+
+def run_cut_tasks(tasks, V, W, ctv, ct_air):
+    """The per-grid solves of a pass, in order: in CUT_JOBS forked workers (the stores are inherited copy-on-write,
+    each task's grids are pickled; PyMaxflow holds the GIL, so threads would not help), largest first."""
+    # under `python -m` this module is __main__: the workers must run (and see the globals of) the importable one
+    from rvsm.tools.refine import refine as M
+    M.REVERT_DIAG = REVERT_DIAG
+    M._CUT_SHARED.update(V=V, W=W, ctv=ctv, ct_air=ct_air)
+    try:
+        if CUT_JOBS <= 1 or len(tasks) < 2:
+            return [M._cut_worker(t) for t in tasks]
+        import multiprocessing as mp
+        order = sorted(range(len(tasks)), key=lambda i: -int(tasks[i][1].sum()))
+        out = [None] * len(tasks)
+        with mp.get_context("fork").Pool(min(CUT_JOBS, len(tasks))) as pool:
+            for i, res in zip(order, pool.imap(M._cut_worker, [tasks[i] for i in order], chunksize=1)):
+                out[i] = res
+        return out
+    finally:
+        M._CUT_SHARED.clear()
+
+
+REVERT_DIAG = True   # the extra recto-only solve that splits held_by_coupling / held_by_slope (--no-revert-diag)
+
+
 SNAP_MODES = ("recto", "verso", "mid", "contrast", "edge", "ct")
 
 
@@ -1085,6 +1221,7 @@ def mode_scores(Sr, Sw, Sc=None, sigma=1.0):
     return out
 
 
+@_timed_fn("mode_positions")
 def mode_positions(Sr, Sw, Sc=None, far=None):
     """Per node the free (per-node, unconstrained) choice of every snap mode: offsets (n,) along the normal of
     the profile's argmax (mid = the mean of the recto and verso argmaxes). NaN where a mode has no data."""
@@ -1119,8 +1256,10 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
     BIGC = np.float32(1e3)
     nr = np.nan_to_num(n_rest)
     Dcur = np.nan_to_num(((g - rest) * nr).sum(-1)).astype(np.float32)
-    Sr = profile(V, qi, nn, D)
-    Sw = profile(W, qi, nn, D) if W is not None else None
+    coupled = snap in ("recto", "verso", "mid") and W is not None
+    # the single-surface modes' own profiles (the coupled solve samples its wider Rf / Wf below instead)
+    Sr = None if coupled else profile(V, qi, nn, D)
+    Sw = profile(W, qi, nn, D) if (W is not None and not coupled) else None
     # the verso of a recto at depth d lies near d - T. The two label windows follow the node's current place:
     # recto window centred on the node for snap recto, T above it for verso (the node sits on the verso),
     # T/2 above for mid; the verso window is the recto's shifted inward by `shift`
@@ -1131,7 +1270,6 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
     R_ = D + shift
     Sc = profile(CTV, qi, nn, D) if (CTV is not None and snap == "ct") else None
     sub = np.round((ts + D)).astype(np.int64)
-    coupled = snap in ("recto", "verso", "mid") and Sw is not None
     ii = np.nonzero(ok)
     Dq = Dcur[ok]
     if far_total is not None and np.ndim(far_total):   # a per-node cap (evidence-gated, see refine_many)
@@ -1211,7 +1349,8 @@ def _cut_move(g, ok, qi, nn, rest, n_rest, caps, fade, V, W, CTV, D, step, lo, h
     for c in caps:
         m = float(np.nanmedian(c)) if np.isfinite(c).any() else step
         dz.append(max(1, int(np.floor(m / step + 1e-6))))
-    r_i, w_i = two_surface_cut(Cr, Cw, dz, int(np.ceil((t_min - shift) / step)), int(np.floor((t_max - shift) / step)))
+    r_i, w_i = cut_cropped(Cr, Cw, ok, dz, int(np.ceil((t_min - shift) / step)), int(np.floor((t_max - shift) / step)),
+                           pin=pin[1])
     r = tr[r_i] if coupled else ts[r_i]
     w = tw[w_i] if w_i is not None else None
     if snap == "verso" and coupled:
@@ -1309,12 +1448,14 @@ def _cut_info(info, ii, shape, r, v, Rf, R_, thr, reach, revert_thr, movable, lo
         pw = (pk > D) | (pk < -D)
         cat[rest & pw] = 8
         rest &= ~pw
-    if rest.any():   # the recto-only solve under the same caps and bounds: does it reach a ridge there?
+    if rest.any() and REVERT_DIAG:   # the recto-only solve under the same caps and bounds: a ridge there?
         r1, _ = two_surface_cut(Cr, None, dz)
         r1v = tr[r1[ii]]
         on1 = Rf_at(r1v) >= thr
         cat[rest & on1] = 6
         cat[rest & ~on1] = 7
+    elif rest.any():   # --no-revert-diag: coupling and slope are not told apart (one solve fewer per piece)
+        cat[rest] = 7
     C = np.zeros((H, Wd), np.int8)
     S = np.zeros((H, Wd), bool)
     C[ii] = cat
@@ -1593,7 +1734,26 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             st["thickness"] = round(float(Tg), 3)
         st["dup_gap"] = round(float(dgap), 3)
         moves, tot = [], 0
+        cut_tasks = []
         bbs = [(p.min(0), p.max(0)) if len(p) else None for p in pts]
+        # the neighbour-sheet queries of every grid of this pass, in threads (numpy and the tree queries release
+        # the GIL; each grid's query is independent), consumed in grid order below
+        rn_pre = {}
+        if not labelling:
+            def _rn(j):
+                g_, n_, ok_ = grids[j], ns[j], oks[j]
+                if not ok_.any():
+                    return j, None
+                q_ = g_[ok_]
+                pad_ = 2 * r + 2 + lateral + 1.0
+                bl_, bh_ = bbs[j][0] - pad_, bbs[j][1] + pad_
+                oth_ = [p[((p >= bl_) & (p <= bh_)).all(-1)] for k, p in enumerate(pts)
+                        if k != j and not dup[j, k] and bbs[k] is not None and (bbs[k][0] <= bh_).all() and (bbs[k][1] >= bl_).all()]
+                oth_ = np.concatenate([p for p in oth_ if len(p)] or [np.zeros((0, 3), np.float32)])
+                return j, ray_neighbours(q_, n_[ok_], oth_, 2 * r + 2, lateral=lateral)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max(1, min(8, len(grids)))) as ex_:
+                rn_pre = dict(ex_.map(_rn, range(len(grids))))
         for j, (g, n, ok, q) in enumerate(zip(grids, ns, oks, pts)):
             sk = strides[it] if labelling else 1
             qm = ok & grid_stride_mask(ok.shape, sk) if sk > 1 else ok
@@ -1612,38 +1772,23 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             nn = n[qm]
             # a move may not go past half-way to the nearest other sheet on the ray (else far). That sheet moves
             # too, by at most r, so every sheet within 2r + 2 bounds: two neighbours can then never cross
-            b2, a2 = ray_neighbours(q, nn, others, 2 * r + 2, lateral=lateral)
+            if rn_pre.get(j) is not None and sk == 1:
+                b2, a2 = rn_pre[j]
+            else:
+                b2, a2 = ray_neighbours(q, nn, others, 2 * r + 2, lateral=lateral)
             below = np.where(np.abs(b2) <= r, b2, np.nan).astype(np.float32)   # the nearest within r (assign)
             above = np.where(np.abs(a2) <= r, a2, np.nan).astype(np.float32)
             lo = np.where(np.isfinite(b2), np.maximum(b2 / 2.0, -float(r)), -float(r)).astype(np.float32)
             hi = np.where(np.isfinite(a2), np.minimum(a2 / 2.0, float(r)), float(r)).astype(np.float32)
             if cut:
-                dd, conf, vmask = _cut_move(
-                    g, qm, qi, nn, rest[j], n_rest[j], caps[j], fades[j], V, W, ctv, int(r),
-                    int(cut_steps[min(it, len(cut_steps) - 1)]), lo, hi, thr, vthr, snap, t_min, t_max,
-                    float(Tg) if Tg is not None else float("nan"),
-                    far_total, movables[j], st,
-                    lo_w=np.where(np.isfinite(b2), b2 / 2.0, -np.inf).astype(np.float32),
-                    hi_r=np.where(np.isfinite(a2), a2 / 2.0, np.inf).astype(np.float32),
-                    info=last_info[j] if it == iters - 1 else None, ridge_reach=ridge_reach, revert_thr=revert_thr,
-                    passinfo=(pi_ := {}), ct_air=ct_air, move_prior=cut_prior)
-                last_valid[j] = vmask
-                prg = pi_.get("pr", np.full(g.shape[:2], np.nan, np.float32))
-                mv_ = qm & (np.abs(dd) > 0.5) & movables[j]   # hole edges / borders carry no data: they follow
-                ev_ok[j] &= ~(mv_ & ~vmask)          # the placed feature (recto >= thr for snap recto) is real
-                pass_pr[j].append(np.where(qm, prg, np.nan).astype(np.float16))
-                st.setdefault("_pass_ridge", [0, 0])
-                st["_pass_ridge"][0] += int((mv_ & vmask).sum())
-                st["_pass_ridge"][1] += int(mv_.sum())
-                moves.append(dd)
-                st["points"] += int(qm.sum())
-                tot += len(q)
-                st["with_peak"] += float((conf > 0).sum())
-                st["capped"] += float((np.isfinite(below) | np.isfinite(above)).sum())
-                st["mean_abs_move"] += float(np.abs(dd[qm]).sum())
-                st["max_move"] = max(st["max_move"], float(np.abs(dd).max()))
-                if diag is not None and it == 0:
-                    diag["first_move"][j] = dd.astype(np.float32)
+                ca = (g, qm, qi, nn, rest[j], n_rest[j], caps[j], fades[j], int(r),
+                      int(cut_steps[min(it, len(cut_steps) - 1)]), lo, hi, thr, vthr, snap, t_min, t_max,
+                      float(Tg) if Tg is not None else float("nan"), far_total, movables[j],
+                      np.where(np.isfinite(b2), b2 / 2.0, -np.inf).astype(np.float32),
+                      np.where(np.isfinite(a2), a2 / 2.0, np.inf).astype(np.float32),
+                      it == iters - 1, ridge_reach, revert_thr, cut_prior)
+                cut_tasks.append((j, ca, below, above, q))
+                moves.append(None)
                 continue
             if labelling:
                 c_ = caps[j] if sk == 1 else edge_caps(rest[j][::sk, ::sk], eff_slope)
@@ -1710,6 +1855,37 @@ def refine_many(grids, V, origin, ax, far=12, sigma=2.0, iters=3, thr=0.5, ct=No
             st["max_move"] = max(st["max_move"], float(np.abs(dd).max()))
             if diag is not None and it == 0:
                 diag["first_move"][j] = dd.astype(np.float32)
+        if cut_tasks:   # the per-grid solves of this pass, in worker processes (--jobs) or here
+            with timed("cut_solves"):
+                res = run_cut_tasks([t[1] for t in cut_tasks], V, W, ctv, ct_air)
+            for (j, ca, below, above, q), (dd, conf, vmask, pi_, inf_, st_) in zip(cut_tasks, res):
+                g, qm = grids[j], ca[1]
+                if inf_ is not None:
+                    last_info[j].clear()
+                    last_info[j].update(inf_)
+                for k_, v_ in st_.items():   # the solve's own counters
+                    if isinstance(v_, list) and k_ == "_thick":
+                        st.setdefault(k_, []).extend(v_)
+                    elif isinstance(v_, list):
+                        a_ = st.setdefault(k_, [0] * len(v_))
+                        st[k_] = [x_ + y_ for x_, y_ in zip(a_, v_)]
+                last_valid[j] = vmask
+                prg = pi_.get("pr", np.full(g.shape[:2], np.nan, np.float32))
+                mv_ = qm & (np.abs(dd) > 0.5) & movables[j]   # hole edges / borders carry no data: they follow
+                ev_ok[j] &= ~(mv_ & ~vmask)          # the placed feature (recto >= thr for snap recto) is real
+                pass_pr[j].append(np.where(qm, prg, np.nan).astype(np.float16))
+                st.setdefault("_pass_ridge", [0, 0])
+                st["_pass_ridge"][0] += int((mv_ & vmask).sum())
+                st["_pass_ridge"][1] += int(mv_.sum())
+                moves[j] = dd
+                st["points"] += int(qm.sum())
+                tot += len(q)
+                st["with_peak"] += float((conf > 0).sum())
+                st["capped"] += float((np.isfinite(below) | np.isfinite(above)).sum())
+                st["mean_abs_move"] += float(np.abs(dd[qm]).sum())
+                st["max_move"] = max(st["max_move"], float(np.abs(dd).max()))
+                if diag is not None and it == 0:
+                    diag["first_move"][j] = dd.astype(np.float32)
         for j, (g, n, dd) in enumerate(zip(grids, ns, moves)):  # move all sheets after all were measured
             nz = np.where(np.isfinite(n), n, 0)
             new = g + dd[..., None] * nz
@@ -2300,6 +2476,7 @@ def find_surfaces(paths, prefer=("2.4um", "7.91um")):
     return out
 
 
+@_timed_fn("write_tifxyz")
 def write_tifxyz(src_dir, out_dir, g, note, up=1):
     """A tifxyz directory like `src_dir` with the points g (meta.json copied, bbox recomputed, scale x up)."""
     import tifffile
@@ -2360,6 +2537,7 @@ def store_box(path):
             int(at.get("rung", 2)))
 
 
+@_timed_fn("store_read")
 def read_box(path, lo, shape, near=None, reach=48, block=128, jobs=8):
     """The uint8 (Z,Y,X) of a store over the fine-frame box lo..lo+shape (0 outside the store).
 
@@ -2401,6 +2579,7 @@ def read_box(path, lo, shape, near=None, reach=48, block=128, jobs=8):
     return out
 
 
+@_timed_fn("ct_read")
 def read_ct(ct, lo, shape, down=1):
     """uint8 CT over a fine-frame box; None when there is no CT. down = 2^d reads the rung-(2+d) level (the
     box in fine voxels, the result in that level's voxels) -- an overview picture of an 8192^2 slab read at
@@ -2417,6 +2596,7 @@ def read_ct(ct, lo, shape, down=1):
 
 # ========================================================================================= metrics
 
+@_timed_fn("metrics")
 def surface_metrics(Vu, origin, g, ax, thr=0.5, far=40, win=16, r=4, um=2.4, chunk=200_000, mask=None):
     """evalsurf's per-surface numbers -- recall@r, offset bias/spread, merge_frac (E.metrics), continuity
     (E.continuity_one) and the expected run length (E.erl) -- for the grid g against a uint8 store over
@@ -2522,6 +2702,7 @@ def compare_png(path, ct, V, origin, before, after, crop=320, scale=3, slab=2.5,
     return path
 
 
+@_timed_fn("plane_segments")
 def plane_segments(g, z):
     """The polyline where the grid surface g (H,W,3 zyx) crosses the plane Z=z: (M, 2, 2) segments of (y, x)
     points, by marching squares over the grid cells (a cell with a hole corner is skipped)."""
@@ -2901,7 +3082,10 @@ def run(args):
     sp_bins = np.linspace(0, 3 * float(args.pitch), 61)
     sp_hist = {"before": np.zeros(60, np.int64), "after": np.zeros(60, np.int64)}
     tile_pairs = []
-    ncrop = 0 if args.no_surface_png else max(int(args.crops), 0)
+    pics = not args.no_pictures
+    globals()["REVERT_DIAG"] = bool(args.revert_diag)
+    globals()["CUT_JOBS"] = max(1, int(args.jobs))
+    ncrop = 0 if (args.no_surface_png or not pics) else max(int(args.crops), 0)
     cz_lo, cz_hi = lo[0] + args.taper + 4, lo[0] + shape[0] - args.taper - 4
     czs = [float(int(z)) + 0.5 for z in (np.linspace(cz_lo, cz_hi, ncrop) if ncrop > 1 and cz_hi > cz_lo
                                          else [lo[0] + shape[0] / 2] * min(ncrop, 1))]
@@ -2915,7 +3099,102 @@ def run(args):
              for x0 in range(int(lo[2]), int(lo[2] + shape[2]), tile)]
     log(json.dumps({"tiles": len(cores), "tile": tile, "halo": halo}))
     box_lo, box_hi = lo.astype(np.int64), (lo + shape).astype(np.int64)
+    # ---- per-tile checkpoints (--resume-dir): everything a tile adds to the run's accumulators is saved when
+    # the tile is done (tile_NN.pkl, then tile_NN.json = the done marker) and replayed instead of recomputed
+    LISTS = ("own_r", "own_c", "own_v", "own_f", "ridge_log")
+
+    def _snap():
+        return {"L": {x["name"]: {k: len(x.get(k) or []) for k in LISTS} for x in surf},
+                "mv": {k: len(v) for k, v in moves.items()}, "fi": {k: len(v) for k, v in first.items()},
+                "me": {k: (len(v["before"]), len(v["after"])) for k, v in met.items()},
+                "st": {k: len(v["strain"]) for k, v in diagn.items()},
+                "dn": {k: {kk: (dict(vv) if isinstance(vv, dict) else list(vv) if isinstance(vv, list) else vv)
+                           for kk, vv in v.items() if kk != "strain"} for k, v in diagn.items()},
+                "fd": {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in fdiag.items()},
+                "sh": {k: v.copy() for k, v in sp_hist.items()}, "n": (len(tile_pairs), len(stats), len(bf_acc))}
+
+    def _delta(s0):
+        d = {"surf": {x["name"]: {k: (x.get(k) or [])[s0["L"][x["name"]][k]:] for k in LISTS} for x in surf},
+             "moves": {k: v[s0["mv"][k]:] for k, v in moves.items()}, "first": {k: v[s0["fi"][k]:] for k, v in first.items()},
+             "met": {k: (v["before"][s0["me"][k][0]:], v["after"][s0["me"][k][1]:]) for k, v in met.items()},
+             "strain": {k: v["strain"][s0["st"][k]:] for k, v in diagn.items()}, "dn": {},
+             "fd": {k: v - s0["fd"][k] for k, v in fdiag.items()}, "sh": {k: v - s0["sh"][k] for k, v in sp_hist.items()},
+             "tp": tile_pairs[s0["n"][0]:], "stats": stats[s0["n"][1]:], "bf": bf_acc[s0["n"][2]:],
+             "verso_side": args.verso_side, "ct_air": args.ct_air}
+        for k, v in diagn.items():
+            b0 = s0["dn"][k]
+            dd = {}
+            for kk, vv in v.items():
+                if kk == "strain":
+                    continue
+                if isinstance(vv, dict):
+                    dd[kk] = {c: vv[c] - b0[kk].get(c, 0) for c in vv}
+                elif isinstance(vv, list):
+                    dd[kk] = [a_ - b_ for a_, b_ in zip(vv, b0[kk])]
+                else:
+                    dd[kk] = vv - b0.get(kk, 0)
+            d["dn"][k] = dd
+        return d
+
+    def _apply(d):
+        for x in surf:
+            for k in LISTS:
+                if d["surf"][x["name"]][k]:
+                    x.setdefault(k, []).extend(d["surf"][x["name"]][k])
+        for k, v in d["moves"].items():
+            moves[k].extend(v)
+        for k, v in d["first"].items():
+            first[k].extend(v)
+        for k, (b_, a_) in d["met"].items():
+            met[k]["before"].extend(b_)
+            met[k]["after"].extend(a_)
+        for k, v in d["strain"].items():
+            diagn[k]["strain"].extend(v)
+        for k, dd in d["dn"].items():
+            for kk, vv in dd.items():
+                if isinstance(vv, dict):
+                    for c, n_ in vv.items():
+                        diagn[k][kk][c] = diagn[k][kk].get(c, 0) + n_
+                elif isinstance(vv, list):
+                    diagn[k][kk] = [a_ + b_ for a_, b_ in zip(diagn[k][kk], vv)]
+                else:
+                    diagn[k][kk] = diagn[k].get(kk, 0) + vv
+        for k, v in d["fd"].items():
+            fdiag[k] = fdiag[k] + v
+        for k, v in d["sh"].items():
+            sp_hist[k] += v
+        tile_pairs.extend(d["tp"])
+        stats.extend(d["stats"])
+        bf_acc.extend(d["bf"])
+        if args.verso_side == "auto" and d.get("verso_side") not in (None, "auto"):
+            args.verso_side = d["verso_side"]
+        if args.ct_air is None and d.get("ct_air") is not None:
+            args.ct_air = d["ct_air"]
+
+    def _save(ti, s0, secs):
+        if not args.resume_dir:
+            return
+        import pickle
+        os.makedirs(args.resume_dir, exist_ok=True)
+        base = os.path.join(args.resume_dir, f"tile_{ti + 1:03d}")
+        with open(base + ".pkl.tmp", "wb") as f:
+            pickle.dump(_delta(s0), f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(base + ".pkl.tmp", base + ".pkl")
+        rec = {"tile": ti + 1, "core_yx": list(cores[ti]), "seconds": round(secs, 1),
+               "stats": stats[-1] if (len(stats) > s0["n"][1]) else None}
+        with open(base + ".json.tmp", "w") as f:
+            json.dump(rec, f, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
+        os.replace(base + ".json.tmp", base + ".json")
+
     for ti, (cy0, cy1, cx0, cx1) in enumerate(cores):
+        t_tile, st0 = time.perf_counter(), dict(STAGES)
+        if args.resume_dir and os.path.exists(os.path.join(args.resume_dir, f"tile_{ti + 1:03d}.json")):
+            import pickle
+            with open(os.path.join(args.resume_dir, f"tile_{ti + 1:03d}.pkl"), "rb") as f:
+                _apply(pickle.load(f))
+            log(json.dumps({"tile": ti + 1, "of": len(cores), "resumed": True}))
+            continue
+        snap0 = _snap() if args.resume_dir else None
         tlo = np.array([box_lo[0], max(cy0 - halo, box_lo[1]), max(cx0 - halo, box_lo[2])], np.int64)
         thi = np.array([box_hi[0], min(cy1 + halo, box_hi[1]), min(cx1 + halo, box_hi[2])], np.int64)
         # pieces: per surface, the column runs of its published crop that reach into this tile (each with its
@@ -2929,6 +3208,8 @@ def run(args):
                     continue
                 pieces.append({"si": si, "r0": r0, "c0": c0, "pub": dense})
         if not pieces:
+            if snap0 is not None:
+                _save(ti, snap0, time.perf_counter() - t_tile)
             continue
         rlo = np.array([box_lo[0], max(int(tlo[1]) - rpad, box_lo[1]), max(int(tlo[2]) - rpad, box_lo[2])], np.int64)
         rhi = np.array([box_hi[0], min(int(thi[1]) + rpad, box_hi[1]), min(int(thi[2]) + rpad, box_hi[2])], np.int64)
@@ -2967,6 +3248,7 @@ def run(args):
         sig = [sigma_vox / max(p, 1e-3) if np.isfinite(p) else 2.0 for p in pit]
         sig_f = [sigma_fin / max(p, 1e-3) if np.isfinite(p) else 1.0 for p in pit]
         dg = {}
+        t_solve = time.perf_counter()
         g1, st = refine_many(g0, V, rlo.astype(np.float32), ax, far=args.far_sched, sigma=sig,
                              iters=args.iters, thr=args.thr, ct=ct_mask, W=W, thick=thick, T=args.thickness,
                              verso_thr=args.verso_thr, verso_beta=args.verso_beta,
@@ -2989,6 +3271,7 @@ def run(args):
             args.verso_side = dg["verso_side"]   # measured once, on the first tile: every tile uses the same side
             log(json.dumps({"verso_side": args.verso_side, "verso_lag": dg.get("verso_lag"),
                             "verso_corr": dg.get("verso_corr"), "measured_on_tile": ti + 1}))
+        STAGES["solve"] = STAGES.get("solve", 0.0) + time.perf_counter() - t_solve
         folds = list(dg.get("folds", [0] * len(g1)))
         if st:
             bf_acc.append((st[-1].get("both_faces"), st[-1].get("verso_in_window"), st[-1].get("points", 0)))
@@ -2996,11 +3279,13 @@ def run(args):
         min_gap = max(float(Tt), min_sp)
         n_rest = [normals(g, ax) for g in g0]
         dgap = float(dg.get("dup_gap", min_sp))
+        with timed("pairs"):
+            pidx = pair_index(g0, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0)
         tp = {"tile": ti + 1, "min_gap": round(min_gap, 3), "dup_gap": round(dgap, 3),
               "wrap_spacing": dg.get("wrap_spacing"), "verso_side": dg.get("verso_side"),
               "verso_lag": dg.get("verso_lag"), "verso_corr": dg.get("verso_corr"),
-              "published": pair_stats(g0, g0, n_rest, min_gap, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0),
-              "snap": pair_stats(g0, g1, n_rest, min_gap, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0)}
+              "published": pair_stats(g0, g0, n_rest, min_gap, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0, pairs=pidx),
+              "snap": pair_stats(g0, g1, n_rest, min_gap, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0, pairs=pidx)}
         if args.mesh_opt:
             mov = []
             for g, h in zip(g1, holds):
@@ -3026,7 +3311,7 @@ def run(args):
         pulled_all = [np.zeros(g.shape[:2], bool) for g in g0]
         nrounds = 8 if args.iso else 1
         for rnd in range(nrounds):
-            g1, nc_, pulled = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0,
+            g1, nc_, pulled = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0, pairs=pidx,
                                        return_masks=True)
             ncx += nc_
             if rnd == 0:
@@ -3075,7 +3360,7 @@ def run(args):
                     if gone.any():               # (relaxation) goes too -- the node IS its published point
                         g1[j][gone] = g0[j][gone]
                 fold_fixed += nf_
-                g1, nc_, _ = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0,
+                g1, nc_, _ = no_cross(g0, g1, n_rest, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0, pairs=pidx,
                                       return_masks=True)
                 ncx += nc_
                 if not nc_ and not nf_ and not n_switch(g1):
@@ -3085,7 +3370,7 @@ def run(args):
         sw_stage["final"] = n_switch(g1)
         tp["switch_stages"] = sw_stage
         tp["no_cross_pulled"] = ncx
-        tp["final"] = pair_stats(g0, g1, n_rest, min_gap, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0)
+        tp["final"] = pair_stats(g0, g1, n_rest, min_gap, dup=dg.get("dup"), R=2.0 * float(args.far) + 8.0, pairs=pidx)
         tile_pairs.append(tp)
         stats.append({"tile": [cy0, cy1, cx0, cx1], "pieces": len(pieces), "iters": st, "pairs": tp})
         log(json.dumps({"tile": ti + 1, "of": len(cores), "core_yx": [cy0, cy1, cx0, cx1], "pieces": len(pieces),
@@ -3111,7 +3396,7 @@ def run(args):
                 rf, cf = np.nonzero(core & np.isfinite(b).all(-1))
                 x.setdefault("own_f", []).append(((rf + pz["r0"] * up).astype(np.int32), (cf + pz["c0"] * up).astype(np.int32),
                                                   b[rf, cf].astype(np.float32), a[rf, cf].astype(np.float32)))
-            if args.solver == "cut":        # the free per-node choice of every snap mode, for comparisons
+            if args.solver == "cut" and pics:   # the free per-node choice of every snap mode, for comparisons
                 n0m = normals(a, ax)
                 kk = core & np.isfinite(b).all(-1) & np.isfinite(n0m).all(-1)
                 if kk.any():
@@ -3150,9 +3435,9 @@ def run(args):
                 fdiag["radial_cos_lt03"] += int((fcore & (rc_ < 0.3)).sum())
             if ffin.any():
                 fdiag["final_seam"] += np.histogram(seam_dist(a[ffin]), FBINS)[0]
-            fc = fold_canv.setdefault(x["name"], np.zeros(cshape + (3,), np.uint8))
+            fc = fold_canv.setdefault(x["name"], np.zeros(cshape + (3,), np.uint8)) if pics else None
             for msk, col in ((core, (70, 70, 70)), (fcore, (255, 40, 40)), (ffin, (255, 200, 0))):
-                if msk.any():
+                if msk.any() and fc is not None:
                     iyx = ((a[msk][:, 1:] - ext_lo) // pstride).astype(np.int64)
                     iyx = np.clip(iyx, 0, np.array(cshape) - 1)
                     fc[iyx[:, 0], iyx[:, 1]] = col
@@ -3173,7 +3458,7 @@ def run(args):
                 dn["no_ridge"] += int((~ridge_at(V, b[mvd] - rlo, np.nan_to_num(n0)[mvd], args.thr, 2)).sum())
             dn["switches_free"] += int(dg.get("switches_free", [0] * len(g1))[pi_])
             ppr = dg.get("pass_pr", [None] * len(g1))[pi_]
-            if ppr:   # per core node: its recto at the placed recto in every pass, and the evidence flag
+            if ppr and not args.no_ridge_log:   # per core node: its recto at the placed recto in every pass, and the evidence flag
                 x.setdefault("ridge_log", []).append((a[core].astype(np.float32),
                                                       np.stack([p_[core] for p_ in ppr], 1).astype(np.float16),
                                                       dg["ev_ok"][pi_][core]))
@@ -3206,7 +3491,7 @@ def run(args):
                     dn[key][1] += float((e * e).sum())
                     dn[key][2] += int(len(e))
                     sp_hist[hk] += np.histogram(np.clip(e, 0, sp_bins[-1] - 1e-6), sp_bins)[0]
-            for z in czs:
+            for z in (czs if pics else ()):
                 cd = cdat[x["name"]][z]
                 for g, dst in ((a, cd[0]), (b, cd[1])):
                     sg = plane_segments(g, z)
@@ -3219,7 +3504,7 @@ def run(args):
                 if bk.any():
                     cd[2].append(a[bk][:, 1:].astype(np.float32))
                     cd[3].append(np.abs(dvg[bk]).astype(np.float32))
-            for z in zs:
+            for z in (zs if pics else ()):
                 for g, dst in ((a, segs_b), (b, segs_a)):
                     sg = plane_segments(g, z)
                     if len(sg):
@@ -3238,13 +3523,18 @@ def run(args):
         iy = np.arange(cshape[0]) * pstride + ext_lo[0]
         ix = np.arange(cshape[1]) * pstride + ext_lo[1]
         sy, sx = np.nonzero((iy >= cy0) & (iy < cy1))[0], np.nonzero((ix >= cx0) & (ix < cx1))[0]
-        if len(sy) and len(sx):
+        if len(sy) and len(sx) and pics:
             for z in zs:
                 zi = int(z - rlo[0])
                 for arr, c in ((V, 0), (W, 1)):
                     if arr is not None:
                         canv[z][c][np.ix_(sy, sx)] = arr[zi][np.ix_(iy[sy] - rlo[1], ix[sx] - rlo[2])]
         del V, W, thick, Ve, ct_mask, ctv, ct_air, g0, g1, pieces
+        STAGES["tile_total"] = STAGES.get("tile_total", 0.0) + time.perf_counter() - t_tile
+        log(json.dumps({"tile_time": ti + 1, "s": {k: round(v - st0.get(k, 0.0), 2) for k, v in STAGES.items()
+                                                    if v - st0.get(k, 0.0) > 0.005}}))
+        if snap0 is not None:
+            _save(ti, snap0, time.perf_counter() - t_tile)
 
     # ---- write: one full published grid in memory at a time
     os.makedirs(args.out, exist_ok=True)
@@ -3274,14 +3564,16 @@ def run(args):
             meta_x = {"crop_rc": [int(r0c), int(c0c)], "write_up": up, "write_pitch": "fine",
                       "source_grid_shape": list(src.shape[:2])}
             del src, new
-            write_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), before,
-                         {"unrefined_input": True, **meta_x}, up=up)
+            if not args.no_before:
+                write_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), before,
+                             {"unrefined_input": True, **meta_x}, up=up)
             write_tifxyz(x["dir"], os.path.join(args.out, x["name"]), fine, {**note, **meta_x}, up=up)
             del fine, before
         else:
             full = write_back(src, x["rc"], 1, x["crop"], new, x["frame"], inplace=True)
             del src, new
-            copy_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), {"unrefined_input": True})
+            if not args.no_before:
+                copy_tifxyz(x["dir"], os.path.join(args.out, x["name"] + ".before"), {"unrefined_input": True})
             write_tifxyz(x["dir"], os.path.join(args.out, x["name"]), full, note)
             del full
         if x.get("ridge_log"):
@@ -3300,8 +3592,10 @@ def run(args):
         log(json.dumps({"wrote": os.path.join(args.out, x["name"]), "mean_abs_move": float(np.abs(dv).mean()) if len(dv) else 0.0,
                         "p95_abs_move": float(np.percentile(np.abs(dv), 95)) if len(dv) else 0.0}))
 
-    # ---- pictures
+    # ---- pictures (--no-pictures: the refined tifxyz and the report only)
     png = args.png_dir or os.path.join(args.out, "png")
+    if not pics:
+        ncrop = 0
     os.makedirs(png, exist_ok=True)
     hist_png(os.path.join(png, "displacement_hist.png"), moves, args.far)
     from PIL import Image
@@ -3333,7 +3627,7 @@ def run(args):
     def plane_fn(z, stride):
         assert stride == pstride
         return canv[z][0].astype(np.float32) / 255.0, canv[z][1].astype(np.float32) / 255.0
-    for p in slab_pngs(png, zs, plane_fn, ct_fn, (ext_lo, ext_hi), segs_b, segs_a):
+    for p in (slab_pngs(png, zs, plane_fn, ct_fn, (ext_lo, ext_hi), segs_b, segs_a) if pics else ()):
         log(p)
     del canv, segs_b, segs_a
     if ncrop:
@@ -3500,7 +3794,7 @@ def run(args):
     tot_mv["duplicate_sheet_pairs"] = int(sum(tp.get("published", {}).get("coincident", 0) for tp in tile_pairs))
     log(json.dumps({"pooled": pooled, "circular": bool(circ), "geometry": tot_mv, "far_off": far_off}))
     with open(os.path.join(args.out, "refine_report.json"), "w") as f:
-        json.dump({"box": [*lo.tolist(), *shape.tolist()], "tile": tile, "halo": halo, "moves": move_rep,
+        json.dump({"timings": {k: round(v, 2) for k, v in STAGES.items()}, "box": [*lo.tolist(), *shape.tolist()], "tile": tile, "halo": halo, "moves": move_rep,
                    "geometry": tot_mv, "far_off": far_off, "tile_pairs": tile_pairs, "far": args.far_sched,
                    "sigma_vox": sigma_vox, "sigma_final_vox": sigma_fin, "stats": stats,
                    "pooled": pooled, "circular": bool(circ), "surfaces": [x["name"] for x in surf]}, f, indent=1)
@@ -3638,6 +3932,18 @@ def parser():
     ap.add_argument("--slices", type=int, default=4)
     ap.add_argument("--png-dir")
     ap.add_argument("--no-surface-png", action="store_true", help="no per-surface crops")
+    ap.add_argument("--no-pictures", action="store_true",
+                    help="production: no slab / crop / fold pictures and no mode_positions -- the refined tifxyz "
+                         "and the report only (also keeps the whole-slab memory flat)")
+    ap.add_argument("--jobs", type=int, default=4,
+                    help="worker processes for the per-grid max-flow solves of a pass (forked; the stores are shared "
+                         "copy-on-write, each worker holds one graph)")
+    ap.add_argument("--resume-dir", help="per-tile checkpoints: a tile whose tile_NNN.json is there is replayed, not "
+                                         "recomputed (rvsm refine-slab)")
+    ap.add_argument("--no-ridge-log", action="store_true", help="no ridge_passes/<surface>.npz (per-node per-pass log)")
+    ap.add_argument("--no-before", action="store_true", help="do not write the <surface>.before copies")
+    ap.add_argument("--revert-diag", action=argparse.BooleanOptionalAction, default=True,
+                    help="the extra recto-only solve per piece that splits held_by_coupling / held_by_slope")
     ap.add_argument("--crops", type=int, default=6,
                     help="per surface, comparison crops at different z / along-surface positions (densest and "
                          "largest-move places, alternately): png/<surface>_crop<k>.png")
@@ -3645,6 +3951,41 @@ def parser():
     ap.add_argument("--crop-scale", type=int, default=3, help="pixels per voxel in a crop")
     ap.add_argument("--crop-montage", action="store_true", help="also png/<surface>_crops.png: all crops stacked")
     return ap
+
+
+SLAB_USAGE = """rvsm refine-slab --z0 Z [--dz 128] --pred-dir DIR --paths DIR --out DIR [--umbilicus U]
+                 [--transform T] [--tile 1024] [--halo 160] [any rvsm refine option]
+
+The production run over a whole prediction slab: every 1024^2 tile of the stores in DIR (recto.zarr, verso.zarr,
+thickness.zarr) with its halo, every published surface under --paths that crosses the slab, one refined tifxyz
+per surface (the part inside the slab, at the refinement pitch) and refine_report.json. Resumable: each finished
+tile leaves <out>/tiles/tile_NNN.{pkl,json}; a rerun replays those and computes the rest. Pictures, the
+.before copies, the per-node ridge log and the diagnostic recto-only solve are off (add --pictures to keep them).
+Run it under a memory cap (systemd-run --user --scope -p MemoryMax=6G)."""
+
+
+def slab_main(argv=None):
+    """`rvsm refine-slab`: `run` over the whole slab with the production defaults and per-tile resume."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help"):
+        print(SLAB_USAGE)
+        return 0
+    sp = argparse.ArgumentParser(add_help=False)
+    sp.add_argument("--pred-dir", required=True)
+    sp.add_argument("--pictures", action="store_true")
+    a, rest = sp.parse_known_args(argv)
+    pd_ = a.pred_dir
+    base = ["--recto", os.path.join(pd_, "recto.zarr"), "--verso", os.path.join(pd_, "verso.zarr")]
+    if os.path.isdir(os.path.join(pd_, "thickness.zarr")):
+        base += ["--thickness-store", os.path.join(pd_, "thickness.zarr")]
+    out = rest[rest.index("--out") + 1] if "--out" in rest else None
+    if out is None:
+        raise SystemExit("--out is required")
+    base += ["--tile", "1024", "--halo", "160", "--pitch", "5", "--sigma-vox", "8", "--resume-dir",
+             os.path.join(out, "tiles")]
+    if not a.pictures:
+        base += ["--no-pictures", "--no-before", "--no-ridge-log", "--no-revert-diag", "--crops", "0"]
+    return main(base + rest)   # later options win: anything given explicitly overrides these defaults
 
 
 def main(argv=None):

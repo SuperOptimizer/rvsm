@@ -968,3 +968,44 @@ def test_bad_nodes_ignores_quads_the_published_grid_already_collapsed():
     fold = ok.copy()
     fold[2, 2, 2] += 1.6                                          # a real fold of a healthy quad is still caught
     assert R.bad_nodes(fold, ok, R.normals(ok, AX_Y), 0.001)[2, 2]
+
+
+def test_refine_slab_resumes_a_tile_run_to_the_same_result(tmp_path, has_volcomp):
+    """rvsm refine-slab: a 3x3-tile run, then the same run with one tile's checkpoint removed and the output
+    deleted: the resumed run replays 8 tiles, recomputes 1 and writes the same surface and pooled numbers."""
+    if not has_volcomp:
+        pytest.skip("volcomp not available")
+    import shutil
+
+    import tifffile
+
+    from rvsm import stores
+    o = np.array([128, 256, 384])
+    z, y, x = np.mgrid[:128, :128, :128].astype(np.float32)
+    yc = 60 + 0.1 * x
+    pdir = tmp_path / "pred"
+    pdir.mkdir()
+    stores.write(str(pdir / "recto.zarr"), stores.u8(np.exp(-0.5 * ((y - yc) / 1.5) ** 2)), o, q=0)
+    stores.write(str(pdir / "verso.zarr"), stores.u8(np.exp(-0.5 * ((y - (yc - 8)) / 1.5) ** 2)), o, q=0)
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": -20000, "x": 448}, {"z": 1000, "y": -20000, "x": 448}]}))
+    g = slanted_grid(H=34, W=22, step=6.0)
+    g[..., 1] = o[1] + 60 + 0.1 * (g[..., 2] - o[2]) + 3.0
+    write_tifxyz_raw(str(tmp_path / "paths" / "segB" / "segB-on-20260411134726-2.4um.tifxyz"), g)
+    out = tmp_path / "slab"
+    args = ["--pred-dir", str(pdir), "--paths", str(tmp_path / "paths"), "--umbilicus", str(umb), "--out", str(out),
+            "--z0", str(o[0] + 32), "--dz", "64", "--far", "8", "--thr", "0.3", "--thickness", "8", "--taper", "4",
+            "--tile", "48", "--halo", "44", "--pitch", "3", "--slices", "1"]
+    assert R.slab_main(args) == 0
+    nm = "segB-on-20260411134726-2.4um"
+    first = np.stack([tifffile.imread(str(out / nm / f"{c}.tif")) for c in "zyx"], -1)
+    rep1 = json.load(open(out / "refine_report.json"))
+    assert len(list((out / "tiles").glob("tile_*.json"))) == 9 and not (out / f"{nm}.before").exists()
+    (out / "tiles" / "tile_005.json").unlink()
+    shutil.rmtree(out / nm)
+    assert R.slab_main(args) == 0
+    second = np.stack([tifffile.imread(str(out / nm / f"{c}.tif")) for c in "zyx"], -1)
+    rep2 = json.load(open(out / "refine_report.json"))
+    np.testing.assert_allclose(first, second, atol=1e-4)
+    assert rep1["pooled"] == rep2["pooled"]
+    assert rep1["geometry"]["folds"] == rep2["geometry"]["folds"]

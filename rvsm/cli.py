@@ -22,11 +22,12 @@ USAGE = """rvsm <command> [options]
                                                                            (rvsm/store_gc.py)
   refine     --recto S [--verso S] --paths DIR --umbilicus U --out DIR [--z0 Z --dz 128] [--anchors F]
              (rvsm/tools/refine/refine.py; docs/refine.md)
+  refine-slab --z0 Z --dz 128 --pred-dir DIR --paths DIR --out DIR   (all tiles, resumable; docs/refine.md)
 """
 
 COMMANDS = ("run", "produce", "train", "eval", "export", "calibrate", "pretrain", "ladder",
             "status", "stop", "ledger", "umbilicus", "teachers", "verso", "grid-repack",
-            "store-gc", "refine")
+            "store-gc", "refine", "refine-slab")
 
 
 def _stack_dumps():
@@ -1194,3 +1195,9 @@ def refine(argv):
     """The `refine` subcommand: rvsm.tools.refine.refine's CLI (see docs/refine.md)."""
     from rvsm.tools.refine import refine as R
     return R.main(argv)
+
+
+def refine_slab(argv):
+    """The `refine-slab` subcommand: the whole-slab production run, resumable per tile (docs/refine.md)."""
+    from rvsm.tools.refine import refine as R
+    return R.slab_main(argv)
