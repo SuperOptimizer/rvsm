@@ -1162,6 +1162,22 @@ def cut_cropped(Cr, Cw, ok, dz, t_min=0, t_max=0, pin=0):
     return r, w
 
 
+SOLVE_MEM_GB = 2.0    # the estimated max-flow graph memory the concurrent workers may hold together (--solve-mem-gb)
+
+
+def _cut_graph_bytes(ca):
+    """The max-flow graph a task will build: the cropped rectangle x the labels (x 2 surfaces when coupled)."""
+    from scipy.ndimage import binary_dilation
+    qm, r, step, snap = ca[1], ca[8], ca[9], ca[14]
+    if not qm.any():
+        return 0.0
+    okd = binary_dilation(qm)
+    rows, cols = np.nonzero(okd.any(1))[0], np.nonzero(okd.any(0))[0]
+    Z = len(np.arange(-r, r + 1, step))
+    ns = 2 if snap in ("recto", "verso", "mid") else 1
+    return float((rows[-1] - rows[0] + 1) * (cols[-1] - cols[0] + 1) * max(Z - 1, 1) * ns * 450)
+
+
 CUT_JOBS = 1          # worker processes for the per-grid cut solves of a pass (--jobs)
 _CUT_SHARED = {}      # the tile's stores, inherited by the forked workers (never pickled)
 
@@ -1191,11 +1207,25 @@ def run_cut_tasks(tasks, V, W, ctv, ct_air):
         if CUT_JOBS <= 1 or len(tasks) < 2:
             return [M._cut_worker(t) for t in tasks]
         import multiprocessing as mp
-        order = sorted(range(len(tasks)), key=lambda i: -int(tasks[i][1].sum()))
+        est = [_cut_graph_bytes(t) for t in tasks]
+        order = sorted(range(len(tasks)), key=lambda i: -est[i])
         out = [None] * len(tasks)
+        budget = float(SOLVE_MEM_GB) * 2 ** 30
+        # memory-aware: tasks start largest first while the running ones' estimated graphs fit the budget
+        # (a graph is ~450 bytes per node; one over the budget runs alone)
         with mp.get_context("fork").Pool(min(CUT_JOBS, len(tasks))) as pool:
-            for i, res in zip(order, pool.imap(M._cut_worker, [tasks[i] for i in order], chunksize=1)):
-                out[i] = res
+            running, pending = {}, list(order)
+            while pending or running:
+                while pending and len(running) < CUT_JOBS and (
+                        not running or sum(est[i] for i in running) + est[pending[0]] <= budget):
+                    i = pending.pop(0)
+                    running[i] = pool.apply_async(M._cut_worker, (tasks[i],))
+                done = [i for i, h in running.items() if h.ready()]
+                if not done:
+                    time.sleep(0.01)
+                    continue
+                for i in done:
+                    out[i] = running.pop(i).get()
         return out
     finally:
         M._CUT_SHARED.clear()
@@ -3085,6 +3115,7 @@ def run(args):
     pics = not args.no_pictures
     globals()["REVERT_DIAG"] = bool(args.revert_diag)
     globals()["CUT_JOBS"] = max(1, int(args.jobs))
+    globals()["SOLVE_MEM_GB"] = float(args.solve_mem_gb)
     ncrop = 0 if (args.no_surface_png or not pics) else max(int(args.crops), 0)
     cz_lo, cz_hi = lo[0] + args.taper + 4, lo[0] + shape[0] - args.taper - 4
     czs = [float(int(z)) + 0.5 for z in (np.linspace(cz_lo, cz_hi, ncrop) if ncrop > 1 and cz_hi > cz_lo
@@ -3216,7 +3247,7 @@ def run(args):
         rs = rhi - rlo
         V = read_box(args.recto, rlo, rs)
         W = read_box(args.verso, rlo, rs) if args.verso else None
-        thick = read_box(args.thickness_store, rlo, rs) if args.thickness_store else None
+        thick = read_box(args.thickness_store, rlo, rs) if (args.thickness_store and args.solver != "cut") else None
         ct_mask = read_ct(ct, rlo, rs) if (ct and args.ct_mask) else None
         ctv = read_ct(ct, rlo, rs) if (ct and args.solver == "cut" and args.snap == "ct") else None
         ct_air = None
@@ -3938,6 +3969,8 @@ def parser():
     ap.add_argument("--jobs", type=int, default=4,
                     help="worker processes for the per-grid max-flow solves of a pass (forked; the stores are shared "
                          "copy-on-write, each worker holds one graph)")
+    ap.add_argument("--solve-mem-gb", type=float, default=2.0,
+                    help="budget for the max-flow graphs the --jobs workers hold at once (~450 bytes per graph node)")
     ap.add_argument("--resume-dir", help="per-tile checkpoints: a tile whose tile_NNN.json is there is replayed, not "
                                          "recomputed (rvsm refine-slab)")
     ap.add_argument("--no-ridge-log", action="store_true", help="no ridge_passes/<surface>.npz (per-node per-pass log)")
